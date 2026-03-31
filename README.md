@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="LiquidClash/design/icon.png" width="128" height="128" alt="LiquidClash Icon">
+  <img src="screenshots/icon.png" width="128" height="128" alt="LiquidClash Icon">
 </p>
 
 <h1 align="center">LiquidClash</h1>
