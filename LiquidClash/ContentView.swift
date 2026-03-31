@@ -1,59 +1,45 @@
-//
-//  ContentView.swift
-//  LiquidClash
-//
-//  Created by HESONG on 2026/3/29.
-//
-
 import SwiftUI
-import SwiftData
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @State private var selectedPage: AppPage = .dashboard
+    @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
 
     var body: some View {
-        NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
-                }
-                .onDelete(perform: deleteItems)
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-            .toolbar {
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
-            }
-        } detail: {
-            Text("Select an item")
-        }
-    }
+        ZStack {
+            MeshGradientBackground()
 
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
+            NavigationSplitView(columnVisibility: $columnVisibility) {
+                SidebarView(selectedPage: $selectedPage)
+                    .toolbar(removing: .sidebarToggle)
+                    .toolbar {
+                        ToolbarItem(placement: .automatic) {
+                            Color.clear.frame(width: 0, height: 0)
+                        }
+                    }
+            } detail: {
+                switch selectedPage {
+                case .dashboard:
+                    DashboardView()
+                case .proxies:
+                    ProxiesView()
+                case .rules:
+                    RulesView()
+                case .activity:
+                    ActivityView()
+                case .settings:
+                    SettingsView()
+                }
+            }
+            .navigationSplitViewStyle(.balanced)
+            .onChange(of: columnVisibility) {
+                columnVisibility = .doubleColumn
             }
         }
+        .background(.windowBackground)
     }
 }
 
 #Preview {
     ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
+        .frame(width: 900, height: 600)
 }

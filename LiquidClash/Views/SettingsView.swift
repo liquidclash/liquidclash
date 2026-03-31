@@ -1,0 +1,387 @@
+import SwiftUI
+
+struct SettingsView: View {
+    // General
+    @State private var launchAtStartup = true
+    @State private var selectedLanguage = "English"
+    @State private var subscriptionURL = ""
+
+    // Proxy Engine
+    @State private var mixedPort = "7890"
+    @State private var allowLAN = false
+    @State private var tunMode = false
+
+    // Appearance
+    @State private var themeMode = "Adaptive"
+    @State private var glassTransparency: Double = 45
+    @State private var liquidAnimation = true
+
+    // About
+    @State private var checkForUpdates = true
+
+    private let languages = ["English", "简体中文", "日本語"]
+    private let themes = ["Light", "Dark", "Adaptive"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Title
+            Text("Settings")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Color(hex: "383A76"))
+                .padding(.bottom, 24)
+
+            // 2×2 Grid
+            ScrollView {
+                Grid(horizontalSpacing: 24, verticalSpacing: 24) {
+                    GridRow {
+                        generalCard
+                        proxyEngineCard
+                    }
+                    GridRow {
+                        appearanceCard
+                        aboutCard
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+        }
+        .padding(.horizontal, 32)
+        .padding(.vertical, 16)
+        .padding(.bottom, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: - General Card
+
+    private var generalCard: some View {
+        SettingsCard(icon: "gearshape", title: "General") {
+            SettingToggleRow(
+                label: "Launch at Startup",
+                subtitle: "Start app when system boots",
+                isOn: $launchAtStartup
+            )
+
+            settingDivider
+
+            SettingRow(label: "Interface Language", subtitle: "System-wide display language") {
+                settingsPicker(selection: $selectedLanguage, options: languages)
+            }
+
+            settingDivider
+
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Subscription URL")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color(hex: "383A76"))
+                    Text("Import proxy nodes from remote config")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(hex: "A2A3C4"))
+                }
+
+                HStack(spacing: 12) {
+                    TextField("", text: $subscriptionURL)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .padding(10)
+                        .frame(maxWidth: .infinity)
+                        .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(.white.opacity(0.4), lineWidth: 0.5)
+                        )
+
+                    Button { } label: {
+                        Text("Update")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(Color(hex: "4B6EFF"), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    // MARK: - Proxy Engine Card
+
+    private var proxyEngineCard: some View {
+        SettingsCard(icon: "bolt", title: "Proxy Engine") {
+            SettingRow(label: "Mixed Port", subtitle: "HTTP/SOCKS listener port") {
+                TextField("", text: $mixedPort)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .multilineTextAlignment(.center)
+                    .frame(width: 72)
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 12)
+                    .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(.white.opacity(0.4), lineWidth: 0.5)
+                    )
+            }
+
+            settingDivider
+
+            SettingToggleRow(
+                label: "Allow LAN",
+                subtitle: "Accept connections from local network devices",
+                isOn: $allowLAN
+            )
+
+            settingDivider
+
+            SettingToggleRow(
+                label: "TUN Mode",
+                subtitle: "Virtual network adapter for system-wide proxy",
+                isOn: $tunMode
+            )
+        }
+    }
+
+    // MARK: - Appearance Card
+
+    private var appearanceCard: some View {
+        SettingsCard(icon: "paintpalette", title: "Appearance") {
+            SettingRow(label: "Theme Mode", subtitle: "Light, Dark or Liquid adaptive") {
+                settingsPicker(selection: $themeMode, options: themes)
+            }
+
+            settingDivider
+
+            SettingRow(label: "Glass Transparency", subtitle: "Adjust backdrop blur intensity") {
+                HStack(spacing: 8) {
+                    Slider(value: $glassTransparency, in: 0...100)
+                        .tint(Color(hex: "4B6EFF"))
+                        .frame(maxWidth: 140)
+                }
+            }
+
+            settingDivider
+
+            SettingToggleRow(
+                label: "Liquid Animation",
+                subtitle: "Enable background dynamics",
+                isOn: $liquidAnimation
+            )
+        }
+    }
+
+    // MARK: - About Card
+
+    private var aboutCard: some View {
+        VStack(spacing: 16) {
+            Spacer()
+
+            // App icon
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 64, height: 64)
+
+            Text("LiquidClash Desktop")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color(hex: "383A76"))
+
+            Text("Version 2.4.0 (Stable)")
+                .font(.system(size: 11))
+                .foregroundStyle(Color(hex: "A2A3C4"))
+
+            // Check for Updates row
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Check for Updates")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color(hex: "383A76"))
+                    Text("Auto update core binaries")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(hex: "A2A3C4"))
+                }
+                Spacer()
+                Toggle("", isOn: $checkForUpdates)
+                    .toggleStyle(.switch)
+                    .tint(Color(hex: "4B6EFF"))
+                    .labelsHidden()
+            }
+            .padding(.top, 8)
+
+            // Links
+            HStack(spacing: 12) {
+                linkButton(label: "Github")
+                linkButton(label: "Docs")
+            }
+            .padding(.top, 4)
+
+            Spacer()
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(hex: "4B6EFF").opacity(0.1),
+                    Color(hex: "FF6E52").opacity(0.1)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 24)
+        )
+        .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 24))
+        .overlay(
+            RoundedRectangle(cornerRadius: 24)
+                .strokeBorder(.white.opacity(0.7), lineWidth: 1)
+        )
+    }
+
+    // MARK: - Helpers
+
+    private var settingDivider: some View {
+        Divider()
+            .opacity(0.3)
+            .padding(.vertical, 2)
+    }
+
+    private func settingsPicker(selection: Binding<String>, options: [String]) -> some View {
+        Menu {
+            ForEach(options, id: \.self) { option in
+                Button {
+                    selection.wrappedValue = option
+                } label: {
+                    if selection.wrappedValue == option {
+                        Label(option, systemImage: "checkmark")
+                    } else {
+                        Text(option)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(selection.wrappedValue)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color(hex: "383A76"))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Color(hex: "7A7B9F"))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .background(.white.opacity(0.4), in: Capsule())
+            .overlay(Capsule().strokeBorder(.white.opacity(0.4), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func linkButton(label: String) -> some View {
+        Button { } label: {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Color(hex: "383A76"))
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+                .background(.white.opacity(0.4), in: Capsule())
+                .overlay(Capsule().strokeBorder(.white.opacity(0.4), lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Settings Card Container
+
+private struct SettingsCard<Content: View>: View {
+    let icon: String
+    let title: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            // Card header
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color(hex: "383A76"))
+                    .frame(width: 36, height: 36)
+                    .background(.white.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Color(hex: "383A76"))
+            }
+            .padding(.bottom, 4)
+
+            content
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 24))
+        .overlay(
+            RoundedRectangle(cornerRadius: 24)
+                .strokeBorder(.white.opacity(0.7), lineWidth: 1)
+        )
+    }
+}
+
+// MARK: - Setting Row
+
+private struct SettingRow<Trailing: View>: View {
+    let label: String
+    let subtitle: String
+    @ViewBuilder let trailing: Trailing
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color(hex: "383A76"))
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color(hex: "A2A3C4"))
+            }
+            Spacer()
+            trailing
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Setting Toggle Row
+
+private struct SettingToggleRow: View {
+    let label: String
+    let subtitle: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color(hex: "383A76"))
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color(hex: "A2A3C4"))
+            }
+            Spacer()
+            Toggle("", isOn: $isOn)
+                .toggleStyle(.switch)
+                .tint(Color(hex: "4B6EFF"))
+                .labelsHidden()
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Preview
+
+#Preview {
+    ZStack {
+        MeshGradientBackground()
+        SettingsView()
+    }
+    .frame(width: 800, height: 600)
+}

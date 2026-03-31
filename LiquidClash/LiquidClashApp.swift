@@ -1,32 +1,25 @@
-//
-//  LiquidClashApp.swift
-//  LiquidClash
-//
-//  Created by HESONG on 2026/3/29.
-//
-
 import SwiftUI
-import SwiftData
 
 @main
 struct LiquidClashApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if hasCompletedOnboarding {
+                ContentView()
+                    .frame(minWidth: 960, minHeight: 580)
+            } else {
+                WelcomeView {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        hasCompletedOnboarding = true
+                    }
+                }
+                .frame(minWidth: 700, minHeight: 550)
+            }
         }
-        .modelContainer(sharedModelContainer)
+        .defaultSize(width: hasCompletedOnboarding ? 1050 : 700, height: hasCompletedOnboarding ? 680 : 550)
+        .windowResizability(.contentSize)
+        .windowStyle(.hiddenTitleBar)
     }
 }
