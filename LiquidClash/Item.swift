@@ -2,7 +2,7 @@
 //  Item.swift
 //  LiquidClash
 //
-//  Created by HESONG on 2026/3/29.
+//  Created by LiquidClash on 2026/3/29.
 //
 
 import Foundation

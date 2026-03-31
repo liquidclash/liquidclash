@@ -27,17 +27,17 @@
 
 ## Screenshots
 
-| Dashboard | Proxies |
-|:---------:|:-------:|
-| ![Dashboard](screenshots/dashboard.png) | ![Proxies](screenshots/proxies.png) |
+| Dashboard | Dashboard (Connected) |
+|:---------:|:--------------------:|
+| ![Dashboard](screenshots/dashboard.jpg) | ![Dashboard Active](screenshots/dashboard_active.jpg) |
 
-| Rules | Activity |
-|:-----:|:--------:|
-| ![Rules](screenshots/rules.png) | ![Activity](screenshots/activity.png) |
+| Proxies | Rules |
+|:-------:|:-----:|
+| ![Proxies](screenshots/proxies.jpg) | ![Rules](screenshots/rules.jpg) |
 
-| Settings |
-|:--------:|
-| ![Settings](screenshots/setting.png) |
+| Activity | Settings |
+|:--------:|:--------:|
+| ![Activity](screenshots/activity.jpg) | ![Settings](screenshots/settings.jpg) |
 
 ## Tech Stack
 
