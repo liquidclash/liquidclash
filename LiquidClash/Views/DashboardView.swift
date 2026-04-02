@@ -88,7 +88,7 @@ struct DashboardView: View {
         let state = AppState()
         state.isConnected = true
         state.activeNode = mockProxyRegions.first?.nodes.first
-        state.networkInfo = NetworkInfo(ip: "103.152.220.42", networkType: "BGP / Residential", location: "Tokyo, JP")
+        state.networkInfo = NetworkInfo(ip: "192.0.2.1", networkType: "BGP / Residential", location: "Tokyo, JP")
         return state
     }())
 }
