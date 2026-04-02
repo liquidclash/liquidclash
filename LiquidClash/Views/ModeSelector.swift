@@ -13,7 +13,7 @@ struct ModeSelector: View {
                             selectedMode = mode
                         }
                     } label: {
-                        Text(mode.rawValue)
+                        Text(LocalizedStringKey(mode.rawValue))
                             .font(.system(size: 12.5, weight: .medium))
                             .fontWeight(.medium)
                             .foregroundStyle(

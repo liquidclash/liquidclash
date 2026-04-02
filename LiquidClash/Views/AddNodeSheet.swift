@@ -2,17 +2,19 @@ import SwiftUI
 
 struct AddNodeSheet: View {
     @Binding var isPresented: Bool
+    var onAdd: ((ProxyNode) -> Void)?
 
     @State private var nodeName = ""
     @State private var selectedType = "SOCKS5"
-    @State private var port = "5001"
+    @State private var port = "443"
     @State private var server = ""
     @State private var username = ""
     @State private var password = ""
     @State private var dialerProxy = ""
     @State private var enableUDP = true
+    @State private var validationError: String?
 
-    private let proxyTypes = ["SOCKS5", "HTTP", "Shadowsocks", "Vmess", "Trojan"]
+    private let proxyTypes = ["SOCKS5", "HTTP", "Shadowsocks", "Vmess", "Trojan", "VLESS", "Hysteria2"]
     private let dialerOptions: [(value: String, label: String)] = [
         ("", "None (Direct)"),
         ("japan-01", "🇯🇵 Japan | 01"),
@@ -34,7 +36,7 @@ struct AddNodeSheet: View {
                 HStack {
                     Text("Add Proxy Node")
                         .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(Color(hex: "383A76"))
+                        .foregroundStyle(.primary)
 
                     Spacer()
 
@@ -43,7 +45,7 @@ struct AddNodeSheet: View {
                     } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color(hex: "8E8EA0"))
+                            .foregroundStyle(.secondary)
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(.plain)
@@ -113,10 +115,17 @@ struct AddNodeSheet: View {
                             Toggle("Enable UDP", isOn: $enableUDP)
                                 .toggleStyle(.checkbox)
                                 .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(Color(hex: "383A76"))
+                                .foregroundStyle(.primary)
                                 .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
                         }
                     }
+                }
+
+                if let error = validationError {
+                    Text(error)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                        .padding(.top, 4)
                 }
 
                 // Footer
@@ -133,13 +142,13 @@ struct AddNodeSheet: View {
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color(hex: "8E8EA0"))
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 18)
                     .padding(.vertical, 9)
                     .glassEffect(.regular.tint(.white.opacity(0.06)), in: Capsule())
 
                     Button {
-                        close()
+                        addNode()
                     } label: {
                         Text("Add Node")
                             .font(.system(size: 13, weight: .semibold))
@@ -174,6 +183,51 @@ struct AddNodeSheet: View {
         }
     }
 
+    private func addNode() {
+        // Validation
+        guard !nodeName.trimmingCharacters(in: .whitespaces).isEmpty else {
+            validationError = String(localized: "Node name is required")
+            return
+        }
+        guard !server.trimmingCharacters(in: .whitespaces).isEmpty else {
+            validationError = String(localized: "Server address is required")
+            return
+        }
+        guard let portNum = Int(port), portNum > 0, portNum <= 65535 else {
+            validationError = String(localized: "Port must be between 1 and 65535")
+            return
+        }
+
+        let proxyType: ProxyType = switch selectedType {
+        case "SOCKS5": .socks5
+        case "HTTP": .http
+        case "Shadowsocks": .shadowsocks
+        case "Vmess": .vmess
+        case "Trojan": .trojan
+        case "VLESS": .vless
+        case "Hysteria2": .hysteria2
+        default: .trojan
+        }
+
+        let flag = ConfigParser.guessFlag(from: nodeName)
+
+        let node = ProxyNode(
+            id: UUID().uuidString,
+            flag: flag.isEmpty ? "🌐" : flag,
+            name: nodeName.trimmingCharacters(in: .whitespaces),
+            type: proxyType,
+            server: server.trimmingCharacters(in: .whitespaces),
+            port: portNum,
+            relay: dialerProxy.isEmpty ? "Direct" : dialerProxy,
+            password: password.isEmpty ? nil : password,
+            uuid: proxyType == .vmess || proxyType == .vless ? password : nil,
+            udp: enableUDP
+        )
+
+        onAdd?(node)
+        close()
+    }
+
     // MARK: - Glass Input Container
 
     private func glassInput<Content: View>(@ViewBuilder content: () -> Content) -> some View {
@@ -205,12 +259,12 @@ struct AddNodeSheet: View {
             HStack {
                 Text(options.first(where: { $0.0 == selection.wrappedValue })?.1 ?? "")
                     .font(.system(size: 13))
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
                 Spacer()
                 Image(systemName: "chevron.down")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color(hex: "8E8EA0"))
+                    .foregroundStyle(.secondary)
             }
             .padding(10)
             .background(.white.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
@@ -224,7 +278,7 @@ struct AddNodeSheet: View {
     @ViewBuilder
     private func formField<Content: View>(label: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Color(hex: "7A7B9F"))
             content()

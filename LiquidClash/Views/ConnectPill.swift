@@ -2,11 +2,16 @@ import SwiftUI
 
 struct ConnectPill: View {
     @Binding var isConnected: Bool
+    var isConnecting: Bool = false
     @State private var glowPhase = false
+    @AppStorage(SettingsKey.interfaceLanguage) private var interfaceLanguage = "English"
     @Environment(\.colorScheme) private var colorScheme
 
+    private var isCN: Bool { interfaceLanguage == "简体中文" }
+
     private var accentColor: Color {
-        isConnected ? Color(hex: "2ED573") : Color(hex: "E83B3B")
+        if isConnecting { return Color(hex: "FFD60A") }
+        return isConnected ? Color(hex: "2ED573") : Color(hex: "E83B3B")
     }
 
     var body: some View {
@@ -15,16 +20,17 @@ struct ConnectPill: View {
                 isConnected.toggle()
             }
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 0) {
                 iconWithGlow
+                    .frame(width: 80)
                 textBlock
-                Spacer(minLength: 0)
+                    .frame(width: 160)
+                    .offset(x: -20)
             }
-            .padding(.leading, 4)
-            .padding(.trailing, 16)
-            .frame(width: 300, height: 72)
+            .frame(width: 240, height: 72)
         }
         .buttonStyle(.plain)
+        .disabled(isConnecting)
         .glassEffect(
             .regular.tint(pillTint),
             in: Capsule()
@@ -89,26 +95,46 @@ struct ConnectPill: View {
 
     // MARK: - Text Block
 
+    private var statusText: String {
+        if isConnecting { return isCN ? "连接中…" : "Connecting…" }
+        return isConnected
+            ? (isCN ? "已连接" : "Connected")
+            : (isCN ? "连接" : "Connect")
+    }
+
+    private var statusSubtext: String {
+        if isConnecting { return isCN ? "正在启动核心" : "Starting core" }
+        return isConnected
+            ? (isCN ? "安全连接" : "Secure")
+            : (isCN ? "未连接" : "Not connected")
+    }
+
+    private var statusColor: Color {
+        if isConnecting { return Color(hex: "FFD60A") }
+        return isConnected ? Color(hex: "2ED573") : Color.primary
+    }
+
     private var textBlock: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(isConnected ? "Connected" : "Connect")
+        VStack(spacing: 3) {
+            Text(statusText)
                 .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(
-                    isConnected
-                        ? Color(hex: "2ED573")
-                        : Color.primary
-                )
+                .foregroundStyle(statusColor)
 
             HStack(spacing: 6) {
-                Circle()
-                    .fill(accentColor)
-                    .frame(width: 6, height: 6)
-                    .shadow(color: accentColor.opacity(0.5), radius: 3)
+                if isConnecting {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.7)
+                } else {
+                    Circle()
+                        .fill(accentColor)
+                        .frame(width: 6, height: 6)
+                        .shadow(color: accentColor.opacity(0.5), radius: 3)
+                }
 
-                Text(isConnected ? "Secure Node" : "Disconnected")
+                Text(statusSubtext)
                     .font(.system(size: 11, weight: .medium))
                     .kerning(1.1)
-                    .textCase(.uppercase)
                     .foregroundStyle(.secondary)
             }
         }

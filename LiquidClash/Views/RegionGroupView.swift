@@ -13,21 +13,27 @@ struct RegionGroupView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Region header
-            Button(action: onToggleExpand) {
-                HStack(spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(Color(hex: "A2A3C4"))
-                        .rotationEffect(.degrees(region.isExpanded ? 90 : 0))
+            // Region header — large hit area
+            HStack(spacing: 8) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(region.isExpanded ? 90 : 0))
 
-                    Text(region.name)
-                        .font(.system(size: 11, weight: .semibold))
-                        .kerning(1.0)
-                        .foregroundStyle(Color(hex: "A2A3C4"))
-                }
+                Text(region.name)
+                    .font(.system(size: 11, weight: .semibold))
+                    .kerning(1.0)
+                    .foregroundStyle(.secondary)
+
+                Text("\(region.nodes.count)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+
+                Spacer()
             }
-            .buttonStyle(.plain)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onToggleExpand)
 
             // Node cards grid
             if region.isExpanded {

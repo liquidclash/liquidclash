@@ -1,8 +1,12 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct RulesView: View {
-    @State private var rules: [RuleItem] = mockRules
+    @Environment(AppState.self) private var appState
+    @Environment(\.colorScheme) private var colorScheme
     @State private var showingAddRule = false
+    @State private var showingImporter = false
+    @State private var showingExporter = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -25,29 +29,43 @@ struct RulesView: View {
                         .frame(width: 60)
                 }
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color(hex: "A2A3C4"))
+                .foregroundStyle(.secondary)
                 .tracking(0.5)
                 .padding(.horizontal, 20)
                 .padding(.vertical, 14)
-                .background(.white.opacity(0.15))
+                .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.15))
 
                 Divider().opacity(0.3)
 
                 // Rules list
-                ScrollView {
-                    VStack(spacing: 4) {
-                        ForEach(rules) { rule in
-                            ruleRow(rule)
-                        }
+                if appState.rules.isEmpty {
+                    VStack(spacing: 8) {
+                        Spacer()
+                        Text("No rules loaded")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.secondary)
+                        Text("Import a subscription to load rules")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
                     }
-                    .padding(8)
+                    .frame(maxWidth: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 4) {
+                            ForEach(appState.rules) { rule in
+                                ruleRow(rule)
+                            }
+                        }
+                        .padding(8)
+                    }
+                    .scrollIndicators(.hidden)
                 }
-                .scrollIndicators(.hidden)
             }
-            .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 20))
+            .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: RoundedRectangle(cornerRadius: 20))
             .overlay(
                 RoundedRectangle(cornerRadius: 20)
-                    .strokeBorder(.white.opacity(0.7), lineWidth: 1)
+                    .strokeBorder(.white.opacity(colorScheme == .dark ? 0.12 : 0.7), lineWidth: 0.5)
             )
         }
         .padding(.horizontal, 32)
@@ -57,7 +75,7 @@ struct RulesView: View {
         .overlay {
             if showingAddRule {
                 AddRuleSheet(isPresented: $showingAddRule) { newRule in
-                    rules.append(newRule)
+                    appState.addRule(newRule)
                 }
                 .transition(.opacity)
             }
@@ -69,20 +87,66 @@ struct RulesView: View {
     private var headerRow: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Rules Editor")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(Color(hex: "383A76"))
+                HStack(spacing: 8) {
+                    Text("Rules Editor")
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(.primary)
 
-                Text("Define how traffic is routed based on hostname, IP, or geography.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Color(hex: "7A7B9F"))
+                    if !appState.rules.isEmpty {
+                        Text("\(appState.rules.count)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(.secondary.opacity(0.12), in: Capsule())
+                    }
+                }
+
+
             }
 
             Spacer()
 
             HStack(spacing: 10) {
-                actionButton(icon: "square.and.arrow.down", label: "Import")
-                actionButton(icon: "square.and.arrow.up", label: "Export")
+                Button {
+                    importRules()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "square.and.arrow.down")
+                            .font(.system(size: 11))
+                        Text("Import")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .fixedSize()
+                .glassEffect(
+                    .regular.tint(.white.opacity(0.08)),
+                    in: Capsule()
+                )
+
+                Button {
+                    exportRules()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 11))
+                        Text("Export")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .fixedSize()
+                .glassEffect(
+                    .regular.tint(.white.opacity(0.08)),
+                    in: Capsule()
+                )
 
                 Button {
                     withAnimation(.easeOut(duration: 0.25)) {
@@ -95,49 +159,73 @@ struct RulesView: View {
                         Text("Add Rule")
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
-                    .background(.white, in: Capsule())
+                    .background(
+                        LinearGradient(
+                            colors: [Color(hex: "FF6E52"), Color(hex: "C34AC2")],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        in: Capsule()
+                    )
                 }
                 .buttonStyle(.plain)
+                .shadow(color: Color(hex: "FF6E52").opacity(0.25), radius: 8, y: 3)
                 .fixedSize()
                 .shadow(color: .black.opacity(0.04), radius: 6, y: 2)
             }
         }
     }
 
-    // MARK: - Action Button
-
-    private func actionButton(icon: String, label: String) -> some View {
-        Button { } label: {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 12))
-                Text(label)
-                    .font(.system(size: 12, weight: .medium))
-            }
-            .foregroundStyle(Color(hex: "383A76"))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.white.opacity(0.4), in: Capsule())
-            .overlay(Capsule().strokeBorder(.white.opacity(0.7), lineWidth: 0.5))
-        }
-        .buttonStyle(.plain)
-        .fixedSize()
-    }
-
     // MARK: - Rule Row
 
     private func ruleRow(_ rule: RuleItem) -> some View {
-        RuleRowView(rule: rule)
+        RuleRowView(rule: rule) {
+            appState.deleteRule(rule.id)
+        }
+    }
+
+    // MARK: - Import / Export
+
+    private func importRules() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.yaml, .plainText]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        if let content = try? String(contentsOf: url, encoding: .utf8) {
+            let imported = ConfigParser.parseClashYAMLRules(content)
+            if !imported.isEmpty {
+                for rule in imported {
+                    appState.addRule(rule)
+                }
+            }
+        }
+    }
+
+    private func exportRules() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "rules.txt"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let content = "rules:\n" + appState.rules.map { "  - \($0.clashString)" }.joined(separator: "\n")
+        try? content.write(to: url, atomically: true, encoding: .utf8)
     }
 }
 
 // MARK: - Rule Row (独立 View 支持 hover)
 
 private struct RuleRowView: View {
+    @Environment(\.colorScheme) private var colorScheme
     let rule: RuleItem
+    var onDelete: () -> Void = {}
     @State private var isHovered = false
 
     var body: some View {
@@ -151,7 +239,7 @@ private struct RuleRowView: View {
                     }
                 }
             }
-            .foregroundStyle(Color(hex: "A2A3C4"))
+            .foregroundStyle(.secondary)
             .frame(width: 40)
 
             // Type badge
@@ -166,7 +254,7 @@ private struct RuleRowView: View {
             // Value
             Text(rule.value)
                 .font(.system(size: 13, design: .monospaced))
-                .foregroundStyle(Color(hex: "383A76"))
+                .foregroundStyle(.primary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -175,17 +263,18 @@ private struct RuleRowView: View {
                 Circle()
                     .fill(Color(hex: rule.policy.dotColor))
                     .frame(width: 8, height: 8)
-                Text(rule.policy.rawValue)
+                Text(rule.displayPolicy)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
             }
             .frame(width: 150, alignment: .leading)
 
             // Delete action — hover 时显示
-            Button { } label: {
+            Button { onDelete() } label: {
                 Image(systemName: "trash")
                     .font(.system(size: 13))
-                    .foregroundStyle(Color(hex: "A2A3C4"))
+                    .foregroundStyle(.secondary)
                     .frame(width: 32, height: 32)
                     .contentShape(Circle())
             }
@@ -196,7 +285,12 @@ private struct RuleRowView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .contentShape(Rectangle())
-        .background(isHovered ? .white.opacity(0.9) : .clear, in: RoundedRectangle(cornerRadius: 10))
+        .background(
+            isHovered
+                ? .white.opacity(colorScheme == .dark ? 0.15 : 0.9)
+                : .clear,
+            in: RoundedRectangle(cornerRadius: 10)
+        )
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
                 isHovered = hovering
@@ -211,4 +305,9 @@ private struct RuleRowView: View {
         RulesView()
     }
     .frame(width: 800, height: 600)
+    .environment({
+        let state = AppState()
+        state.loadMockData()
+        return state
+    }())
 }

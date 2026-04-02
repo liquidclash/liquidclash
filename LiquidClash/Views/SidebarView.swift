@@ -2,9 +2,15 @@ import SwiftUI
 
 struct SidebarView: View {
     @Binding var selectedPage: AppPage
+    @AppStorage(SettingsKey.logsEnabled) private var logsEnabled = true
 
-    // 主导航项（排除 settings）
-    private let mainPages: [AppPage] = [.dashboard, .proxies, .rules, .activity]
+    // 主导航项（排除 settings），根据 logsEnabled 动态过滤
+    private var mainPages: [AppPage] {
+        [.dashboard, .proxies, .rules, .activity, .logs].filter { page in
+            if page == .logs { return logsEnabled }
+            return true
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -14,7 +20,7 @@ struct SidebarView: View {
                     .frame(width: 22, height: 22)
                 Text("LiquidClash")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Color(hex: "4A4A6A"))
+                    .foregroundStyle(.primary)
             }
             .padding(.horizontal, 14)
             .padding(.top, 10)
@@ -32,37 +38,39 @@ struct SidebarView: View {
         }
         .padding(.bottom, 12)
         .padding(.horizontal, 6)
-        .navigationSplitViewColumnWidth(220)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 220, max: 280)
+        .onChange(of: logsEnabled) { _, newValue in
+            if !newValue && selectedPage == .logs {
+                selectedPage = .dashboard
+            }
+        }
     }
 
     @ViewBuilder
     private func navigationItem(for page: AppPage) -> some View {
+        let isSelected = selectedPage == page
         Button {
             selectedPage = page
         } label: {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Image(systemName: page.icon)
-                    .font(.system(size: 14))
-                    .frame(width: 20, alignment: .center)
-                Text(page.rawValue)
-                    .font(.system(size: 14, weight: selectedPage == page ? .semibold : .medium))
+                    .font(.system(size: 12))
+                    .frame(width: 18, alignment: .center)
+                Text(page.displayName)
+                    .font(.system(size: 13, weight: .regular))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
             .symbolRenderingMode(.monochrome)
-            .foregroundStyle(
-                selectedPage == page
-                    ? Color(hex: "4A4A6A")
-                    : Color(hex: "8E8EA0")
-            )
+            .foregroundStyle(isSelected ? .white : .primary)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
             .background(
-                selectedPage == page
-                    ? .white.opacity(0.5)
+                isSelected
+                    ? Color.accentColor
                     : .clear,
-                in: RoundedRectangle(cornerRadius: 8)
+                in: RoundedRectangle(cornerRadius: 6)
             )
         }
         .buttonStyle(.plain)

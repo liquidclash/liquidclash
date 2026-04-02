@@ -37,7 +37,7 @@ struct AddRuleSheet: View {
                 HStack {
                     Text("Add Rule")
                         .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(Color(hex: "383A76"))
+                        .foregroundStyle(.primary)
 
                     Spacer()
 
@@ -46,7 +46,7 @@ struct AddRuleSheet: View {
                     } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color(hex: "8E8EA0"))
+                            .foregroundStyle(.secondary)
                             .frame(width: 28, height: 28)
                     }
                     .buttonStyle(.plain)
@@ -91,7 +91,7 @@ struct AddRuleSheet: View {
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color(hex: "8E8EA0"))
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 18)
                     .padding(.vertical, 9)
                     .glassEffect(.regular.tint(.white.opacity(0.06)), in: Capsule())
@@ -170,11 +170,11 @@ struct AddRuleSheet: View {
                     .frame(width: 8, height: 8)
                 Text(selectedPolicy)
                     .font(.system(size: 13))
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.primary)
                 Spacer()
                 Image(systemName: "chevron.down")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color(hex: "8E8EA0"))
+                    .foregroundStyle(.secondary)
             }
             .padding(10)
             .background(.white.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
@@ -214,12 +214,12 @@ struct AddRuleSheet: View {
             HStack {
                 Text(options.first(where: { $0.0 == selection.wrappedValue })?.1 ?? "")
                     .font(.system(size: 13))
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
                 Spacer()
                 Image(systemName: "chevron.down")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color(hex: "8E8EA0"))
+                    .foregroundStyle(.secondary)
             }
             .padding(10)
             .background(.white.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
@@ -233,7 +233,7 @@ struct AddRuleSheet: View {
     @ViewBuilder
     private func formField<Content: View>(label: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label)
+            Text(LocalizedStringKey(label))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Color(hex: "7A7B9F"))
             content()

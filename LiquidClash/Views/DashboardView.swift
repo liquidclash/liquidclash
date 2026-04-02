@@ -1,19 +1,19 @@
 import SwiftUI
 
 struct DashboardView: View {
-    @State private var selectedMode: ProxyMode = .rule
-    @State private var isConnected: Bool
+    @Environment(AppState.self) private var appState
     @Namespace private var dashboardNS
 
-    init(initialConnected: Bool = false) {
-        _isConnected = State(initialValue: initialConnected)
-    }
-
     var body: some View {
+        @Bindable var appState = appState
+
         GlassEffectContainer(spacing: 24) {
             VStack(spacing: 0) {
                 // Top: ModeSelector
-                ModeSelector(selectedMode: $selectedMode)
+                ModeSelector(selectedMode: Binding(
+                    get: { appState.proxyMode },
+                    set: { appState.setProxyMode($0) }
+                ))
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.top, 2)
 
@@ -21,58 +21,50 @@ struct DashboardView: View {
                 Spacer()
 
                 VStack(spacing: 24) {
-                    ConnectPill(isConnected: $isConnected)
+                    ConnectPill(isConnected: Binding(
+                        get: { appState.isConnected },
+                        set: { newValue in
+                            if newValue { appState.connect() } else { appState.disconnect() }
+                        }
+                    ), isConnecting: appState.isConnecting)
                         .glassEffectID("pill", in: dashboardNS)
 
-                    if isConnected {
-                        ActiveNodeCard(node: mockActiveNode)
+                    if appState.isConnected, let node = appState.activeNode {
+                        ActiveNodeCard(node: node, onSwitch: {
+                            appState.selectedPage = .proxies
+                        })
                             .glassEffectID("card", in: dashboardNS)
                             .glassEffectTransition(.materialize)
                             .transition(.opacity)
                     }
+
+                    // Error message
+                    if let error = appState.errorMessage {
+                        Text(error)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 24)
+                    }
                 }
 
                 Spacer()
-
-                // Bottom: Network info glass capsule
-                networkInfoRow
-                    .padding(.bottom, 4)
             }
             .padding(.horizontal, 32)
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .contentShape(Rectangle())
-        .animation(.spring(duration: 0.5, bounce: 0.15), value: isConnected)
-        .animation(.spring(duration: 0.35, bounce: 0.12), value: selectedMode)
-    }
-
-    // MARK: - Network Info Row
-
-    private var networkInfoRow: some View {
-        HStack(spacing: 16) {
-            infoItem(icon: "globe", value: isConnected ? "103.152.220.42" : "--")
-            infoItem(icon: "antenna.radiowaves.left.and.right", value: isConnected ? "BGP / Residential" : "--")
-            infoItem(icon: "mappin", value: isConnected ? "Tokyo, JP" : "--")
-        }
-        .font(.system(size: 11, weight: .medium))
-        .foregroundStyle(.secondary.opacity(0.8))
-        .padding(.horizontal, 20)
-        .padding(.vertical, 8)
-        .glassEffect(
-            .regular.tint(.white.opacity(0.02)),
-            in: Capsule()
-        )
-    }
-
-    private func infoItem(icon: String, value: String) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.tertiary)
-            Text(value)
+        .animation(.spring(duration: 0.5, bounce: 0.15), value: appState.isConnected)
+        .animation(.spring(duration: 0.35, bounce: 0.12), value: appState.proxyMode)
+        .onChange(of: appState.isConnected) { _, connected in
+            if !connected {
+                appState.networkInfo = NetworkInfo()
+            }
         }
     }
+
+
 }
 
 // MARK: - Previews
@@ -83,12 +75,20 @@ struct DashboardView: View {
         DashboardView()
     }
     .frame(width: 680, height: 600)
+    .environment(AppState())
 }
 
 #Preview("Connected") {
     ZStack {
         MeshGradientBackground()
-        DashboardView(initialConnected: true)
+        DashboardView()
     }
     .frame(width: 680, height: 600)
+    .environment({
+        let state = AppState()
+        state.isConnected = true
+        state.activeNode = mockProxyRegions.first?.nodes.first
+        state.networkInfo = NetworkInfo(ip: "103.152.220.42", networkType: "BGP / Residential", location: "Tokyo, JP")
+        return state
+    }())
 }

@@ -1,14 +1,15 @@
 import SwiftUI
 
 struct ActivityView: View {
-    @State private var connections: [ConnectionEntry] = mockConnections
+    @Environment(AppState.self) private var appState
+    @Environment(\.colorScheme) private var colorScheme
     @State private var selectedFilter: String = "All"
 
     private let filters = ["All", "Proxied", "Direct", "Rejected"]
 
     private var filteredConnections: [ConnectionEntry] {
-        if selectedFilter == "All" { return connections }
-        return connections.filter { $0.type.rawValue == selectedFilter }
+        if selectedFilter == "All" { return appState.connections }
+        return appState.connections.filter { $0.type.rawValue == selectedFilter }
     }
 
     var body: some View {
@@ -25,7 +26,9 @@ struct ActivityView: View {
                     // Log entries
                     VStack(spacing: 14) {
                         ForEach(filteredConnections) { entry in
-                            LogEntryRow(entry: entry)
+                            LogEntryRow(entry: entry) {
+                                Task { await appState.closeConnection(entry.id) }
+                            }
                         }
                     }
                     .padding(.leading, 32)
@@ -43,7 +46,7 @@ struct ActivityView: View {
 
     private var timelineLine: some View {
         LinearGradient(
-            colors: [Color(hex: "4B6EFF"), Color(hex: "A2A3C4").opacity(0.3)],
+            colors: [Color(hex: "4B6EFF"), .secondary.opacity(0.3)],
             startPoint: .top,
             endPoint: .bottom
         )
@@ -58,7 +61,7 @@ struct ActivityView: View {
         HStack(alignment: .center) {
             Text("Connections")
                 .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(Color(hex: "383A76"))
+                .foregroundStyle(.primary)
 
             Spacer()
 
@@ -71,26 +74,46 @@ struct ActivityView: View {
                                 selectedFilter = filter
                             }
                         } label: {
-                            Text(filter)
+                            Text(LocalizedStringKey(filter))
                                 .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(selectedFilter == filter ? .white : Color(hex: "7A7B9F"))
+                                .foregroundStyle(selectedFilter == filter ? .white : .secondary)
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 6)
                                 .background(
                                     selectedFilter == filter
                                         ? Color(hex: "4B6EFF")
-                                        : .white.opacity(0.4),
+                                        : .white.opacity(colorScheme == .dark ? 0.08 : 0.4),
                                     in: Capsule()
                                 )
                                 .overlay(
                                     Capsule().strokeBorder(
-                                        selectedFilter == filter ? .clear : .white.opacity(0.7),
+                                        selectedFilter == filter ? .clear : .white.opacity(colorScheme == .dark ? 0.12 : 0.7),
                                         lineWidth: 0.5
                                     )
                                 )
                         }
                         .buttonStyle(.plain)
                     }
+                }
+
+                // Close All button
+                if !appState.connections.isEmpty {
+                    Button {
+                        Task { await appState.closeAllConnections() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "xmark.circle")
+                                .font(.system(size: 11))
+                            Text("Close All")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundStyle(Color(hex: "FF6E52"))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: Capsule())
+                        .overlay(Capsule().strokeBorder(Color(hex: "FF6E52").opacity(0.3), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -100,7 +123,9 @@ struct ActivityView: View {
 // MARK: - Log Entry Row
 
 private struct LogEntryRow: View {
+    @Environment(\.colorScheme) private var colorScheme
     let entry: ConnectionEntry
+    var onClose: (() -> Void)?
     @State private var isHovered = false
 
     private var dotColor: Color {
@@ -134,12 +159,12 @@ private struct LogEntryRow: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(entry.domain)
                         .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(Color(hex: "383A76"))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
 
                     Text("\(entry.protocolName) • rule: \(entry.rule)")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Color(hex: "A2A3C4"))
+                        .foregroundStyle(.secondary)
                         .textCase(.uppercase)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -152,7 +177,7 @@ private struct LogEntryRow: View {
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(
                             entry.type == .rejected
-                                ? Color(hex: "A2A3C4")
+                                ? .secondary
                                 : Color(hex: "7A7B9F")
                         )
                         .lineLimit(1)
@@ -171,10 +196,10 @@ private struct LogEntryRow: View {
                 } else {
                     Text("- -")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Color(hex: "A2A3C4"))
+                        .foregroundStyle(.secondary)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(.black.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+                        .background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
                         .frame(width: 80)
                 }
 
@@ -182,23 +207,38 @@ private struct LogEntryRow: View {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(entry.dataSize)
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color(hex: "383A76"))
+                        .foregroundStyle(.primary)
                     Text(entry.dataLabel)
                         .font(.system(size: 10))
-                        .foregroundStyle(Color(hex: "A2A3C4"))
+                        .foregroundStyle(.secondary)
                 }
                 .frame(width: 80, alignment: .trailing)
+
+                // Close button
+                Button {
+                    onClose?()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .opacity(isHovered ? 1 : 0)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 14)
         }
         .background(
-            isHovered ? .white.opacity(0.9) : .white.opacity(0.4),
+            isHovered
+                ? .white.opacity(colorScheme == .dark ? 0.15 : 0.9)
+                : .white.opacity(colorScheme == .dark ? 0.08 : 0.4),
             in: RoundedRectangle(cornerRadius: 18)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 18)
-                .strokeBorder(.white.opacity(0.7), lineWidth: 1)
+                .strokeBorder(.white.opacity(colorScheme == .dark ? 0.12 : 0.7), lineWidth: 1)
         )
         .contentShape(Rectangle())
         .onHover { hovering in
@@ -215,4 +255,9 @@ private struct LogEntryRow: View {
         ActivityView()
     }
     .frame(width: 900, height: 600)
+    .environment({
+        let state = AppState()
+        state.loadMockData()
+        return state
+    }())
 }

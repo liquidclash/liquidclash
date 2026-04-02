@@ -1,7 +1,8 @@
 import SwiftUI
 
 struct ActiveNodeCard: View {
-    let node: MockNode
+    let node: ProxyNode
+    var onSwitch: (() -> Void)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -12,7 +13,7 @@ struct ActiveNodeCard: View {
                     .foregroundStyle(Color(hex: "8E8E93"))
                     .kerning(0.6)
                 Spacer()
-                Button("Switch") { }
+                Button("Switch") { onSwitch?() }
                     .buttonStyle(.plain)
                     .font(.system(size: 12, weight: .medium))
                     .fontWeight(.medium)
@@ -32,14 +33,14 @@ struct ActiveNodeCard: View {
                         Text(node.name)
                             .font(.system(size: 13, weight: .semibold))
                             .fontWeight(.semibold)
-                            .foregroundStyle(Color(hex: "1D1D1F"))
-                        Text(node.type)
+                            .foregroundStyle(.primary)
+                        Text(node.protocolType)
                             .font(.system(size: 11))
                             .foregroundStyle(Color(hex: "8E8E93"))
                     }
                 }
                 Spacer()
-                Text("\(node.ping)ms")
+                Text("\(node.latency)ms")
                     .font(.system(size: 12, weight: .semibold))
                     .fontWeight(.semibold)
                     .foregroundStyle(Color(hex: "30D158"))
@@ -71,7 +72,7 @@ struct ActiveNodeCard: View {
 #Preview {
     ZStack {
         MeshGradientBackground()
-        ActiveNodeCard(node: mockActiveNode)
+        ActiveNodeCard(node: mockProxyRegions[0].nodes[0])
     }
     .frame(width: 900, height: 600)
 }

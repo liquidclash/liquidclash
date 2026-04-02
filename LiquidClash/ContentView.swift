@@ -1,45 +1,46 @@
 import SwiftUI
 
 struct ContentView: View {
-    @State private var selectedPage: AppPage = .dashboard
+    @Environment(AppState.self) private var appState
     @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
 
     var body: some View {
+        @Bindable var appState = appState
+
         ZStack {
             MeshGradientBackground()
 
             NavigationSplitView(columnVisibility: $columnVisibility) {
-                SidebarView(selectedPage: $selectedPage)
-                    .toolbar(removing: .sidebarToggle)
-                    .toolbar {
-                        ToolbarItem(placement: .automatic) {
-                            Color.clear.frame(width: 0, height: 0)
-                        }
-                    }
+                SidebarView(selectedPage: $appState.selectedPage)
+                    .navigationSplitViewColumnWidth(200)
             } detail: {
-                switch selectedPage {
-                case .dashboard:
-                    DashboardView()
-                case .proxies:
-                    ProxiesView()
-                case .rules:
-                    RulesView()
-                case .activity:
-                    ActivityView()
-                case .settings:
-                    SettingsView()
+                Group {
+                    switch appState.selectedPage {
+                    case .dashboard:
+                        DashboardView()
+                    case .proxies:
+                        ProxiesView()
+                    case .rules:
+                        RulesView()
+                    case .activity:
+                        ActivityView()
+                    case .logs:
+                        LogsView()
+                    case .settings:
+                        SettingsView()
+                    }
                 }
+                .frame(minWidth: 660, minHeight: 540)
             }
             .navigationSplitViewStyle(.balanced)
             .onChange(of: columnVisibility) {
                 columnVisibility = .doubleColumn
             }
         }
-        .background(.windowBackground)
     }
 }
 
 #Preview {
     ContentView()
-        .frame(width: 900, height: 600)
+        .environment(AppState())
 }

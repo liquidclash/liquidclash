@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct NodeCardView: View {
+    @Environment(\.colorScheme) private var colorScheme
     let node: ProxyNode
     let isSelected: Bool
     let onTap: () -> Void
@@ -12,31 +13,31 @@ struct NodeCardView: View {
                 Text(node.flag)
                     .font(.system(size: 15))
                     .frame(width: 32, height: 32)
-                    .background(.white.opacity(0.3), in: Circle())
+                    .background(.white.opacity(colorScheme == .dark ? 0.06 : 0.3), in: Circle())
 
                 // Node info
                 VStack(alignment: .leading, spacing: 2) {
                     Text(node.name)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Color(hex: "383A76"))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
 
                     Text("\(node.protocolType) \u{2022} \(node.relay)")
                         .font(.system(size: 11))
-                        .foregroundStyle(Color(hex: "8E8EA0"))
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
 
                 Spacer(minLength: 0)
 
                 // Latency badge
-                Text("\(node.latency)ms")
+                Text(node.latency > 0 ? "\(node.latency)ms" : "—")
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Color(hex: node.latencyColor.color))
+                    .foregroundStyle(node.latency > 0 ? Color(hex: node.latencyColor.color) : .secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
-                        Color(hex: node.latencyColor.bgColor).opacity(0.12),
+                        (node.latency > 0 ? Color(hex: node.latencyColor.bgColor).opacity(0.12) : Color.secondary.opacity(0.08)),
                         in: RoundedRectangle(cornerRadius: 6)
                     )
             }
@@ -49,7 +50,7 @@ struct NodeCardView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 14)
                 .strokeBorder(
-                    isSelected ? Color(hex: "4B6EFF").opacity(0.5) : .white.opacity(0.7),
+                    isSelected ? Color(hex: "4B6EFF").opacity(0.5) : .white.opacity(colorScheme == .dark ? 0.12 : 0.7),
                     lineWidth: 1
                 )
         )

@@ -1,23 +1,27 @@
 import SwiftUI
 
 struct SettingsView: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.colorScheme) private var colorScheme
+
     // General
-    @State private var launchAtStartup = true
-    @State private var selectedLanguage = "English"
-    @State private var subscriptionURL = ""
+    @AppStorage(SettingsKey.launchAtStartup) private var launchAtStartup = true
+    @AppStorage(SettingsKey.interfaceLanguage) private var selectedLanguage = "English"
+    @AppStorage(SettingsKey.logsEnabled) private var logsEnabled = true
 
     // Proxy Engine
-    @State private var mixedPort = "7890"
-    @State private var allowLAN = false
-    @State private var tunMode = false
+    @AppStorage(SettingsKey.mixedPort) private var mixedPort = "7890"
+    @AppStorage(SettingsKey.allowLAN) private var allowLAN = false
+    @AppStorage(SettingsKey.tunMode) private var tunMode = false
 
     // Appearance
-    @State private var themeMode = "Adaptive"
-    @State private var glassTransparency: Double = 45
-    @State private var liquidAnimation = true
+    @AppStorage(SettingsKey.themeMode) private var themeMode = "Adaptive"
+    @AppStorage(SettingsKey.glassTransparency) private var glassTransparency: Double = 50
 
     // About
-    @State private var checkForUpdates = true
+    @AppStorage(SettingsKey.checkForUpdates) private var checkForUpdates = true
+
+
 
     private let languages = ["English", "简体中文", "日本語"]
     private let themes = ["Light", "Dark", "Adaptive"]
@@ -27,7 +31,7 @@ struct SettingsView: View {
             // Title
             Text("Settings")
                 .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(Color(hex: "383A76"))
+                .foregroundStyle(.primary)
                 .padding(.bottom, 24)
 
             // 2×2 Grid
@@ -69,39 +73,11 @@ struct SettingsView: View {
 
             settingDivider
 
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Subscription URL")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color(hex: "383A76"))
-                    Text("Import proxy nodes from remote config")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color(hex: "A2A3C4"))
-                }
-
-                HStack(spacing: 12) {
-                    TextField("", text: $subscriptionURL)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .padding(10)
-                        .frame(maxWidth: .infinity)
-                        .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .strokeBorder(.white.opacity(0.4), lineWidth: 0.5)
-                        )
-
-                    Button { } label: {
-                        Text("Update")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 8)
-                            .background(Color(hex: "4B6EFF"), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+            SettingToggleRow(
+                label: "Enable Logs",
+                subtitle: "Show Logs page and record logs",
+                isOn: $logsEnabled
+            )
         }
     }
 
@@ -118,11 +94,18 @@ struct SettingsView: View {
                     .frame(width: 72)
                     .padding(.vertical, 6)
                     .padding(.horizontal, 12)
-                    .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+                    .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: RoundedRectangle(cornerRadius: 8))
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
-                            .strokeBorder(.white.opacity(0.4), lineWidth: 0.5)
+                            .strokeBorder(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), lineWidth: 0.5)
                     )
+                    .onSubmit {
+                        if let port = Int(mixedPort), (1024...65535).contains(port) {
+                            appState.applySettingChange(key: "mixed-port", value: port)
+                        } else {
+                            mixedPort = "7890" // Reset to default on invalid input
+                        }
+                    }
             }
 
             settingDivider
@@ -132,6 +115,9 @@ struct SettingsView: View {
                 subtitle: "Accept connections from local network devices",
                 isOn: $allowLAN
             )
+            .onChange(of: allowLAN) { _, newValue in
+                appState.applySettingChange(key: "allow-lan", value: newValue)
+            }
 
             settingDivider
 
@@ -140,6 +126,15 @@ struct SettingsView: View {
                 subtitle: "Virtual network adapter for system-wide proxy",
                 isOn: $tunMode
             )
+            .onChange(of: tunMode) { _, newValue in
+                // TUN requires reconnect — notify user if connected
+                if appState.isConnected {
+                    appState.errorMessage = newValue
+                        ? String(localized: "TUN mode will take effect after reconnecting.")
+                        : String(localized: "TUN mode disabled. Reconnect to apply.")
+                }
+            }
+
         }
     }
 
@@ -161,13 +156,6 @@ struct SettingsView: View {
                 }
             }
 
-            settingDivider
-
-            SettingToggleRow(
-                label: "Liquid Animation",
-                subtitle: "Enable background dynamics",
-                isOn: $liquidAnimation
-            )
         }
     }
 
@@ -185,21 +173,21 @@ struct SettingsView: View {
 
             Text("LiquidClash Desktop")
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Color(hex: "383A76"))
+                .foregroundStyle(.primary)
 
             Text("Version 2.4.0 (Stable)")
                 .font(.system(size: 11))
-                .foregroundStyle(Color(hex: "A2A3C4"))
+                .foregroundStyle(.secondary)
 
             // Check for Updates row
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Check for Updates")
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color(hex: "383A76"))
+                        .foregroundStyle(.primary)
                     Text("Auto update core binaries")
                         .font(.system(size: 11))
-                        .foregroundStyle(Color(hex: "A2A3C4"))
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Toggle("", isOn: $checkForUpdates)
@@ -211,8 +199,8 @@ struct SettingsView: View {
 
             // Links
             HStack(spacing: 12) {
-                linkButton(label: "Github")
-                linkButton(label: "Docs")
+                linkButton(label: "Github", url: "https://github.com/liquidclash/liquidclash")
+                linkButton(label: "Website", url: "https://liquidclash.github.io/liquidclash_web/web.html")
             }
             .padding(.top, 4)
 
@@ -231,10 +219,10 @@ struct SettingsView: View {
             ),
             in: RoundedRectangle(cornerRadius: 24)
         )
-        .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 24))
+        .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: RoundedRectangle(cornerRadius: 24))
         .overlay(
             RoundedRectangle(cornerRadius: 24)
-                .strokeBorder(.white.opacity(0.7), lineWidth: 1)
+                .strokeBorder(.white.opacity(colorScheme == .dark ? 0.12 : 0.7), lineWidth: 1)
         )
     }
 
@@ -261,38 +249,44 @@ struct SettingsView: View {
             }
         } label: {
             HStack(spacing: 8) {
-                Text(selection.wrappedValue)
+                Text(LocalizedStringKey(selection.wrappedValue))
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.primary)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Color(hex: "7A7B9F"))
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
-            .background(.white.opacity(0.4), in: Capsule())
-            .overlay(Capsule().strokeBorder(.white.opacity(0.4), lineWidth: 0.5))
+            .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: Capsule())
+            .overlay(Capsule().strokeBorder(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), lineWidth: 0.5))
         }
         .buttonStyle(.plain)
     }
 
-    private func linkButton(label: String) -> some View {
-        Button { } label: {
-            Text(label)
+    private func linkButton(label: String, url: String) -> some View {
+        Button {
+            if let url = URL(string: url) {
+                NSWorkspace.shared.open(url)
+            }
+        } label: {
+            Text(LocalizedStringKey(label))
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Color(hex: "383A76"))
+                .foregroundStyle(.primary)
                 .padding(.horizontal, 20)
                 .padding(.vertical, 8)
-                .background(.white.opacity(0.4), in: Capsule())
-                .overlay(Capsule().strokeBorder(.white.opacity(0.4), lineWidth: 0.5))
+                .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: Capsule())
+                .overlay(Capsule().strokeBorder(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), lineWidth: 0.5))
         }
         .buttonStyle(.plain)
     }
+
 }
 
 // MARK: - Settings Card Container
 
 private struct SettingsCard<Content: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
     let icon: String
     let title: String
     @ViewBuilder let content: Content
@@ -303,13 +297,13 @@ private struct SettingsCard<Content: View>: View {
             HStack(spacing: 12) {
                 Image(systemName: icon)
                     .font(.system(size: 14))
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.primary)
                     .frame(width: 36, height: 36)
-                    .background(.white.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                    .background(.white.opacity(colorScheme == .dark ? 0.1 : 0.5), in: RoundedRectangle(cornerRadius: 10))
 
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Color(hex: "383A76"))
+                    .foregroundStyle(.primary)
             }
             .padding(.bottom, 4)
 
@@ -317,10 +311,10 @@ private struct SettingsCard<Content: View>: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(.white.opacity(0.4), in: RoundedRectangle(cornerRadius: 24))
+        .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: RoundedRectangle(cornerRadius: 24))
         .overlay(
             RoundedRectangle(cornerRadius: 24)
-                .strokeBorder(.white.opacity(0.7), lineWidth: 1)
+                .strokeBorder(.white.opacity(colorScheme == .dark ? 0.12 : 0.7), lineWidth: 1)
         )
     }
 }
@@ -335,12 +329,12 @@ private struct SettingRow<Trailing: View>: View {
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text(label)
+                Text(LocalizedStringKey(label))
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color(hex: "383A76"))
-                Text(subtitle)
+                    .foregroundStyle(.primary)
+                Text(LocalizedStringKey(subtitle))
                     .font(.system(size: 11))
-                    .foregroundStyle(Color(hex: "A2A3C4"))
+                    .foregroundStyle(.secondary)
             }
             Spacer()
             trailing
@@ -359,12 +353,12 @@ private struct SettingToggleRow: View {
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text(label)
+                Text(LocalizedStringKey(label))
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color(hex: "383A76"))
-                Text(subtitle)
+                    .foregroundStyle(.primary)
+                Text(LocalizedStringKey(subtitle))
                     .font(.system(size: 11))
-                    .foregroundStyle(Color(hex: "A2A3C4"))
+                    .foregroundStyle(.secondary)
             }
             Spacer()
             Toggle("", isOn: $isOn)
@@ -384,4 +378,5 @@ private struct SettingToggleRow: View {
         SettingsView()
     }
     .frame(width: 800, height: 600)
+    .environment(AppState())
 }
