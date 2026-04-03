@@ -84,7 +84,7 @@ struct ConfigEditorSheet: View {
     }
 }
 
-/// NSTextView wrapper for performant monospaced text editing
+/// NSTextView wrapper with YAML syntax highlighting
 struct YAMLTextEditor: NSViewRepresentable {
     @Binding var text: String
 
@@ -99,6 +99,7 @@ struct YAMLTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.isRichText = false
+        textView.usesFontPanel = false
 
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         textView.textColor = .labelColor
@@ -108,6 +109,9 @@ struct YAMLTextEditor: NSViewRepresentable {
         textView.string = text
         textView.delegate = context.coordinator
 
+        // Apply initial syntax highlighting
+        YAMLHighlighter.highlight(textView.textStorage!)
+
         return scrollView
     }
 
@@ -115,6 +119,7 @@ struct YAMLTextEditor: NSViewRepresentable {
         let textView = nsView.documentView as! NSTextView
         if textView.string != text {
             textView.string = text
+            YAMLHighlighter.highlight(textView.textStorage!)
         }
     }
 
@@ -132,6 +137,81 @@ struct YAMLTextEditor: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             text.wrappedValue = textView.string
+            // Re-highlight the edited range efficiently
+            YAMLHighlighter.highlight(textView.textStorage!)
         }
+    }
+}
+
+// MARK: - YAML Syntax Highlighter
+
+private enum YAMLHighlighter {
+    static let baseFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+
+    // Colors (work in both light and dark mode)
+    static let keyColor = NSColor.systemBlue
+    static let stringColor = NSColor.systemGreen
+    static let commentColor = NSColor.systemGray
+    static let numberColor = NSColor.systemOrange
+    static let boolColor = NSColor.systemPurple
+    static let defaultColor = NSColor.labelColor
+
+    // Regex patterns (compiled once)
+    static let commentPattern = try! NSRegularExpression(pattern: "#.*$", options: .anchorsMatchLines)
+    static let keyPattern = try! NSRegularExpression(pattern: "^(\\s*-?\\s*)([\\w][\\w\\s.-]*)(?=\\s*:)", options: .anchorsMatchLines)
+    static let stringDoublePattern = try! NSRegularExpression(pattern: "\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"")
+    static let stringSinglePattern = try! NSRegularExpression(pattern: "'[^']*'")
+    static let numberPattern = try! NSRegularExpression(pattern: "(?<=:\\s)\\d+(?:\\.\\d+)?\\s*$", options: .anchorsMatchLines)
+    static let boolPattern = try! NSRegularExpression(pattern: "(?<=:\\s)(true|false|yes|no|null)\\s*$", options: [.anchorsMatchLines, .caseInsensitive])
+
+    static func highlight(_ textStorage: NSTextStorage) {
+        let fullRange = NSRange(location: 0, length: textStorage.length)
+        let string = textStorage.string
+
+        textStorage.beginEditing()
+
+        // Reset to default
+        textStorage.addAttributes([
+            .font: baseFont,
+            .foregroundColor: defaultColor,
+        ], range: fullRange)
+
+        // Keys (before colon)
+        keyPattern.enumerateMatches(in: string, range: fullRange) { match, _, _ in
+            guard let match, match.numberOfRanges > 2 else { return }
+            textStorage.addAttribute(.foregroundColor, value: keyColor, range: match.range(at: 2))
+        }
+
+        // Double-quoted strings
+        stringDoublePattern.enumerateMatches(in: string, range: fullRange) { match, _, _ in
+            guard let match else { return }
+            textStorage.addAttribute(.foregroundColor, value: stringColor, range: match.range)
+        }
+
+        // Single-quoted strings
+        stringSinglePattern.enumerateMatches(in: string, range: fullRange) { match, _, _ in
+            guard let match else { return }
+            textStorage.addAttribute(.foregroundColor, value: stringColor, range: match.range)
+        }
+
+        // Numbers (after colon)
+        numberPattern.enumerateMatches(in: string, range: fullRange) { match, _, _ in
+            guard let match else { return }
+            textStorage.addAttribute(.foregroundColor, value: numberColor, range: match.range)
+        }
+
+        // Booleans/null (after colon)
+        boolPattern.enumerateMatches(in: string, range: fullRange) { match, _, _ in
+            guard let match else { return }
+            textStorage.addAttribute(.foregroundColor, value: boolColor, range: match.range)
+        }
+
+        // Comments (last — overrides everything)
+        commentPattern.enumerateMatches(in: string, range: fullRange) { match, _, _ in
+            guard let match else { return }
+            textStorage.addAttribute(.foregroundColor, value: commentColor, range: match.range)
+        }
+
+        textStorage.endEditing()
     }
 }

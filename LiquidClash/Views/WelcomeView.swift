@@ -170,7 +170,7 @@ struct WelcomeView: View {
         Task {
             do {
                 let manager = SubscriptionManager()
-                let (regions, rawYAML) = try await manager.fetchAndOrganize(url: subscriptionURL)
+                let (regions, rawYAML, _) = try await manager.fetchAndOrganize(url: subscriptionURL)
 
                 await MainActor.run {
                     // Save to storage

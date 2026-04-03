@@ -9,6 +9,72 @@ struct SubscriptionInfo: Codable, Identifiable {
     var lastUpdate: Date?
     var nodeCount: Int = 0
     var isEnabled: Bool = true
+
+    // Traffic info from subscription-userinfo header
+    var upload: Int64?
+    var download: Int64?
+    var total: Int64?
+    var expire: TimeInterval?
+
+    var usedBytes: Int64 { (upload ?? 0) + (download ?? 0) }
+    var usageRatio: Double {
+        guard let t = total, t > 0 else { return 0 }
+        return Double(usedBytes) / Double(t)
+    }
+    var expiryDate: Date? {
+        guard let e = expire, e > 0 else { return nil }
+        return Date(timeIntervalSince1970: e)
+    }
+
+    // Custom decoder to handle missing fields from older JSON
+    init(id: String = UUID().uuidString, url: String, name: String, lastUpdate: Date? = nil, nodeCount: Int = 0, isEnabled: Bool = true,
+         upload: Int64? = nil, download: Int64? = nil, total: Int64? = nil, expire: TimeInterval? = nil) {
+        self.id = id; self.url = url; self.name = name; self.lastUpdate = lastUpdate
+        self.nodeCount = nodeCount; self.isEnabled = isEnabled
+        self.upload = upload; self.download = download; self.total = total; self.expire = expire
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        url = try c.decode(String.self, forKey: .url)
+        name = try c.decode(String.self, forKey: .name)
+        lastUpdate = try c.decodeIfPresent(Date.self, forKey: .lastUpdate)
+        nodeCount = try c.decodeIfPresent(Int.self, forKey: .nodeCount) ?? 0
+        isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        upload = try c.decodeIfPresent(Int64.self, forKey: .upload)
+        download = try c.decodeIfPresent(Int64.self, forKey: .download)
+        total = try c.decodeIfPresent(Int64.self, forKey: .total)
+        expire = try c.decodeIfPresent(TimeInterval.self, forKey: .expire)
+    }
+}
+
+// MARK: - Subscription User Info (from HTTP header)
+
+struct SubscriptionUserInfo {
+    var upload: Int64 = 0
+    var download: Int64 = 0
+    var total: Int64 = 0
+    var expire: TimeInterval = 0
+
+    /// Parse "upload=xxx; download=xxx; total=xxx; expire=xxx"
+    static func parse(_ headerValue: String) -> SubscriptionUserInfo? {
+        var info = SubscriptionUserInfo()
+        var found = false
+        for pair in headerValue.split(separator: ";") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2, let value = Int64(kv[1].trimmingCharacters(in: .whitespaces)) else { continue }
+            found = true
+            switch kv[0].trimmingCharacters(in: .whitespaces).lowercased() {
+            case "upload": info.upload = value
+            case "download": info.download = value
+            case "total": info.total = value
+            case "expire": info.expire = TimeInterval(value)
+            default: break
+            }
+        }
+        return found ? info : nil
+    }
 }
 
 // MARK: - Subscription Manager
@@ -31,22 +97,19 @@ actor SubscriptionManager {
     ///   4. Direct URLSession
     ///   5. Direct curl
     ///   6. python3 urllib (different TLS fingerprint)
-    func downloadContent(url: String, proxyPort: Int? = nil) async throws -> String {
+    func downloadContent(url: String, proxyPort: Int? = nil) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         guard URL(string: url) != nil else {
             throw SubscriptionError.invalidURL
         }
 
-        // Track the most specific error (don't let generic errors overwrite specific ones)
         var bestError: Error = SubscriptionError.downloadFailed
 
         func recordError(_ error: Error) {
             if let sub = error as? SubscriptionError {
                 switch sub {
                 case .serverReturnedHTML, .blockedByServer, .downloadHTTPError:
-                    // Always keep server-specific errors — highest priority
                     bestError = error
                 case .downloadFailed, .invalidContent:
-                    // Only replace if we have nothing better
                     break
                 default:
                     if case SubscriptionError.downloadFailed = bestError {
@@ -54,7 +117,6 @@ actor SubscriptionManager {
                     }
                 }
             }
-            // Non-SubscriptionError (e.g. URLError) never overwrites SubscriptionError
         }
 
         // 1. System proxy
@@ -74,9 +136,10 @@ actor SubscriptionManager {
         }
 
         // 3. curl through common local proxy ports (parallel)
+        typealias CurlResult = (content: String, userInfo: SubscriptionUserInfo?)?
         let commonPorts = [7897, 7890, 7891, 1080, 10808, 10809]
             .filter { $0 != proxyPort }
-        let proxyResult: String? = await withTaskGroup(of: String?.self) { group in
+        let proxyResult: CurlResult = await withTaskGroup(of: CurlResult.self) { group in
             for port in commonPorts {
                 group.addTask { [self] in
                     try? await downloadWithCurlSingleProxy(
@@ -88,14 +151,14 @@ actor SubscriptionManager {
                 }
             }
             for await result in group {
-                if let content = result {
+                if let r = result {
                     group.cancelAll()
-                    return content
+                    return r
                 }
             }
             return nil
         }
-        if let content = proxyResult { return content }
+        if let result = proxyResult { return result }
 
         // 4. Direct curl (with DoH DNS to bypass pollution)
         do { return try await downloadWithCurl(url: url) }
@@ -114,8 +177,8 @@ actor SubscriptionManager {
             }
         }
 
-        // 6. WKWebView — last resort for Cloudflare JS challenges
-        do { return try await WebViewDownloader.download(url: url) }
+        // 6. WKWebView — last resort (no header capture)
+        do { return (try await WebViewDownloader.download(url: url), nil) }
         catch { recordError(error) }
 
         throw bestError
@@ -147,18 +210,15 @@ actor SubscriptionManager {
     // MARK: - curl with proxy (single attempt)
 
     /// Try downloading via curl through a specific proxy. Fast timeout for probing.
-    /// No DoH here — the proxy server handles DNS resolution.
-    private func downloadWithCurlSingleProxy(url: String, proxy: String, timeout: Int = 10) async throws -> String {
+    private func downloadWithCurlSingleProxy(url: String, proxy: String, timeout: Int = 10) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         let args = ["-sSL", "--compressed", "--max-time", "\(timeout)", "--proxy", proxy,
                     "-H", "User-Agent: clash-verge/v2.4.7",
                     url]
         return try await runCurl(args: args)
     }
 
-    /// Direct curl download. Tries DoH first (bypass DNS pollution),
-    /// then plain curl (works under TUN mode where DNS is handled by the tunnel).
-    private func downloadWithCurl(url: String) async throws -> String {
-        // Try with DoH (bypasses DNS pollution when no proxy/TUN is active)
+    /// Direct curl download. Tries DoH first, then plain curl.
+    private func downloadWithCurl(url: String) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         do {
             return try await runCurl(args: [
                 "-sSL", "--compressed", "--max-time", "10",
@@ -168,7 +228,6 @@ actor SubscriptionManager {
             ])
         } catch {}
 
-        // Fallback: plain curl (works under TUN mode where the tunnel handles DNS)
         return try await runCurl(args: [
             "-sSL", "--compressed", "--max-time", "10",
             "-H", "User-Agent: clash-verge/v2.4.7",
@@ -176,8 +235,8 @@ actor SubscriptionManager {
         ])
     }
 
-    /// Native URLSession direct download (uses system DNS — may fail with DNS pollution)
-    private func downloadWithURLSession(url: String) async throws -> String {
+    /// Native URLSession direct download
+    private func downloadWithURLSession(url: String) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         var request = URLRequest(url: URL(string: url)!)
         request.timeoutInterval = 15
         request.setValue("clash-verge/v2.4.7", forHTTPHeaderField: "User-Agent")
@@ -194,20 +253,30 @@ actor SubscriptionManager {
             throw SubscriptionError.invalidContent
         }
 
-        return content
+        // Parse subscription-userinfo from response headers
+        var userInfo: SubscriptionUserInfo?
+        if let httpResponse = response as? HTTPURLResponse,
+           let headerValue = httpResponse.value(forHTTPHeaderField: "subscription-userinfo") {
+            userInfo = SubscriptionUserInfo.parse(headerValue)
+        }
+
+        return (content, userInfo)
     }
 
     // MARK: - Shared curl runner
 
-    /// Run curl with given arguments and return output as String.
+    /// Run curl with given arguments and return output as String + optional subscription user info.
     /// Validates that the response is not an HTML error page.
-    /// Checks output for HTML even on non-zero exit (partial transfer may contain 403 page).
-    private func runCurl(args: [String]) async throws -> String {
+    private func runCurl(args: [String]) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
+                let headerFile = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent(UUID().uuidString + ".headers")
+                defer { try? FileManager.default.removeItem(at: headerFile) }
+
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                process.arguments = args
+                process.arguments = ["-D", headerFile.path] + args
 
                 let outputPipe = Pipe()
                 process.standardOutput = outputPipe
@@ -218,14 +287,11 @@ actor SubscriptionManager {
                     return
                 }
 
-                // Read output BEFORE waitUntilExit to avoid pipe buffer deadlock
                 let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
 
                 let content = String(data: data, encoding: .utf8) ?? ""
 
-                // Always check for HTML error pages first, even on non-zero exit
-                // (server may send 403 HTML then close connection → curl exits non-zero)
                 let lower = content.prefix(500).lowercased()
                 if lower.contains("<!doctype") || lower.contains("<html") {
                     continuation.resume(throwing: SubscriptionError.serverReturnedHTML(
@@ -246,24 +312,35 @@ actor SubscriptionManager {
                     return
                 }
 
-                continuation.resume(returning: content)
+                // Parse subscription-userinfo from response headers
+                var userInfo: SubscriptionUserInfo?
+                if let headers = try? String(contentsOf: headerFile, encoding: .utf8) {
+                    for line in headers.components(separatedBy: .newlines) {
+                        if line.lowercased().hasPrefix("subscription-userinfo:") {
+                            let value = String(line.dropFirst("subscription-userinfo:".count))
+                                .trimmingCharacters(in: .whitespaces)
+                            userInfo = SubscriptionUserInfo.parse(value)
+                            break
+                        }
+                    }
+                }
+
+                continuation.resume(returning: (content, userInfo))
             }
         }
     }
 
     /// Download and parse subscription from URL
-    func fetchSubscription(url: String, proxyPort: Int? = nil) async throws -> (nodes: [ProxyNode], rawContent: String) {
-        let content = try await downloadContent(url: url, proxyPort: proxyPort)
+    func fetchSubscription(url: String, proxyPort: Int? = nil) async throws -> (nodes: [ProxyNode], rawContent: String, userInfo: SubscriptionUserInfo?) {
+        let (content, userInfo) = try await downloadContent(url: url, proxyPort: proxyPort)
 
-        // Resolve actual content (may be base64 encoded)
         let resolved = resolveContent(content)
 
         let nodes = ConfigParser.parseSubscription(resolved)
         guard !nodes.isEmpty else {
-            // Show what the server actually returned for diagnosis
             let preview = String(resolved.prefix(200))
                 .replacingOccurrences(of: "\n", with: " ")
-                .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression) // strip HTML tags
+                .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespaces)
             let trimmedStart = resolved.prefix(500).lowercased()
             if trimmedStart.contains("<!doctype") || trimmedStart.contains("<html") {
@@ -272,7 +349,7 @@ actor SubscriptionManager {
             throw SubscriptionError.parseFailedWithPreview(preview)
         }
 
-        return (nodes, resolved)
+        return (nodes, resolved, userInfo)
     }
 
     /// Resolve content that may be base64-encoded
@@ -294,9 +371,9 @@ actor SubscriptionManager {
     }
 
     /// Fetch and organize nodes into regions
-    func fetchAndOrganize(url: String, proxyPort: Int? = nil) async throws -> ([ProxyRegion], String) {
-        let (nodes, rawContent) = try await fetchSubscription(url: url, proxyPort: proxyPort)
-        return (organizeIntoRegions(nodes), rawContent)
+    func fetchAndOrganize(url: String, proxyPort: Int? = nil) async throws -> ([ProxyRegion], String, SubscriptionUserInfo?) {
+        let (nodes, rawContent, userInfo) = try await fetchSubscription(url: url, proxyPort: proxyPort)
+        return (organizeIntoRegions(nodes), rawContent, userInfo)
     }
 
     // MARK: - Organize Nodes
@@ -346,14 +423,19 @@ actor SubscriptionManager {
 
         for i in updatedSubs.indices where updatedSubs[i].isEnabled {
             do {
-                let (nodes, rawContent) = try await fetchSubscription(url: updatedSubs[i].url, proxyPort: proxyPort)
+                let (nodes, rawContent, userInfo) = try await fetchSubscription(url: updatedSubs[i].url, proxyPort: proxyPort)
                 allNodes.append(contentsOf: nodes)
                 allRawContents.append(rawContent)
                 updatedSubs[i].lastUpdate = Date()
                 updatedSubs[i].nodeCount = nodes.count
+                if let info = userInfo {
+                    updatedSubs[i].upload = info.upload
+                    updatedSubs[i].download = info.download
+                    updatedSubs[i].total = info.total
+                    updatedSubs[i].expire = info.expire
+                }
             } catch {
                 lastError = error
-                // Continue trying other subscriptions
             }
         }
 

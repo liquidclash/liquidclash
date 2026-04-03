@@ -52,6 +52,7 @@ final class AppState {
     // Subscriptions
     var subscriptions: [SubscriptionInfo] = []
     private var autoUpdateTimer: Timer?
+    private var proxyGuardTimer: Timer?
 
     // Clash config
     var config: ClashConfig = ClashConfig()
@@ -93,18 +94,19 @@ final class AppState {
         config.mixedPort = port
         config.port = port
         config.socksPort = port
-        config.allowLan = UserDefaults.standard.bool(forKey: SettingsKey.allowLAN)
         config.tunEnabled = UserDefaults.standard.bool(forKey: SettingsKey.tunMode)
+        config.allowLan = config.tunEnabled && UserDefaults.standard.bool(forKey: SettingsKey.allowLAN)
 
         // Populate proxies from regions
         let allNodes = proxyRegions.flatMap(\.nodes)
         config.proxies = allNodes
 
-        // Build proxy groups: a GLOBAL select group containing all node names
+        // Build proxy groups
         let nodeNames = allNodes.map(\.name)
+        let proxyGroup = ProxyGroup(name: "Proxy", type: .select, proxies: nodeNames + ["DIRECT"])
         config.proxyGroups = [
-            ProxyGroup(name: "GLOBAL", type: .select, proxies: ["DIRECT"] + nodeNames),
-            ProxyGroup(name: "Proxy", type: .select, proxies: nodeNames + ["DIRECT"]),
+            ProxyGroup(name: "GLOBAL", type: .select, proxies: ["Proxy", "DIRECT"] + nodeNames),
+            proxyGroup,
         ]
 
         // Build config rules from current rules
@@ -175,12 +177,14 @@ final class AppState {
         // Stop core
         clashManager.stop()
 
-        // Disable system proxy
-        do {
-            try SystemProxy.disable()
-        } catch {
-            // Show warning to user so they know system proxy may still be active
-            errorMessage = "系统代理关闭失败，请在系统设置 > 网络中手动关闭代理"
+        // Stop proxy guard and restore system proxy
+        stopProxyGuard()
+        if SystemProxy.didSetProxy {
+            do {
+                try SystemProxy.disable()
+            } catch {
+                errorMessage = "系统代理关闭失败，请在系统设置 > 网络中手动关闭代理"
+            }
         }
 
         // Reset state
@@ -194,10 +198,11 @@ final class AppState {
     private func onCoreStarted(api: ClashAPI) {
         clashAPI = api
 
-        // Enable system proxy (skip for TUN mode — TUN handles routing itself)
+        // Auto-enable system proxy (skip for TUN mode — TUN handles routing itself)
         if !config.tunEnabled {
             do {
                 try SystemProxy.enable(httpPort: config.mixedPort, socksPort: config.mixedPort)
+                startProxyGuard()
             } catch {
                 errorMessage = "System proxy: \(error.localizedDescription)"
             }
@@ -251,7 +256,7 @@ final class AppState {
         // Set the active proxy in mihomo if a node is selected
         if let node = activeNode {
             Task {
-                try? await api.selectProxy(group: "GLOBAL", proxy: node.name)
+                try? await api.selectProxy(group: "GLOBAL", proxy: "Proxy")
                 try? await api.selectProxy(group: "Proxy", proxy: node.name)
             }
         }
@@ -484,16 +489,17 @@ final class AppState {
     }
 
     func updateSubscription(url: String) async throws {
-        let (regions, rawYAML) = try await subscriptionManager.fetchAndOrganize(url: url, proxyPort: activeProxyPort)
+        let (regions, rawYAML, _) = try await subscriptionManager.fetchAndOrganize(url: url, proxyPort: activeProxyPort)
         await MainActor.run {
             self.proxyRegions = regions
             self.selectedNodeId = regions.first?.nodes.first?.id
             self.activeNode = regions.first?.nodes.first
-            // Parse rules from subscription YAML
+            // Merge rules: keep user rules, replace subscription rules
             if rawYAML.contains("rules:") {
-                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML)
+                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription)
                 if !parsedRules.isEmpty {
-                    self.rules = parsedRules
+                    let userRules = self.rules.filter { $0.source == .user }
+                    self.rules = userRules + parsedRules
                 }
             }
             self.saveState()
@@ -557,18 +563,18 @@ final class AppState {
             self.proxyRegions = regions
             self.selectedNodeId = regions.first?.nodes.first?.id
             self.activeNode = regions.first?.nodes.first
-            // Parse rules from subscription YAML
+            // Merge rules: keep user rules, replace subscription rules
             if rawYAML.contains("rules:") {
-                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML)
+                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription)
                 if !parsedRules.isEmpty {
-                    self.rules = parsedRules
+                    let userRules = self.rules.filter { $0.source == .user }
+                    self.rules = userRules + parsedRules
                 }
             }
             self.saveState()
         }
         await subscriptionManager.saveSubscriptions(updatedSubs)
 
-        // Save raw YAML for mihomo to use directly
         if !rawYAML.isEmpty {
             ConfigStorage.shared.saveRawSubscriptionYAML(rawYAML)
         }
@@ -587,6 +593,24 @@ final class AppState {
     func stopAutoUpdate() {
         autoUpdateTimer?.invalidate()
         autoUpdateTimer = nil
+    }
+
+    // MARK: - Proxy Guard
+
+    /// Periodically verify system proxy hasn't been tampered with by other software.
+    private func startProxyGuard() {
+        stopProxyGuard()
+        proxyGuardTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            guard self?.isConnected == true, SystemProxy.didSetProxy else { return }
+            if !SystemProxy.verifyProxyIntact() {
+                try? SystemProxy.reapply()
+            }
+        }
+    }
+
+    private func stopProxyGuard() {
+        proxyGuardTimer?.invalidate()
+        proxyGuardTimer = nil
     }
 
     // MARK: - Apply Setting Changes at Runtime
@@ -763,9 +787,10 @@ final class AppState {
         // Re-parse rules from subscription YAML if rules are empty or missing policyName
         let needsReParse = rules.isEmpty || rules.contains(where: { $0.policyName == nil && $0.policy == .proxy })
         if needsReParse, let yaml = rawYAML, yaml.contains("rules:") {
-            let parsed = ConfigParser.parseClashYAMLRules(yaml)
+            let parsed = ConfigParser.parseClashYAMLRules(yaml, source: .subscription)
             if !parsed.isEmpty {
-                rules = parsed
+                let userRules = rules.filter { $0.source == .user }
+                rules = userRules + parsed
                 storage.saveRules(rules)
             }
         }

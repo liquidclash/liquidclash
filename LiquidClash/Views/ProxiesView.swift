@@ -4,7 +4,6 @@ import UniformTypeIdentifiers
 struct ProxiesView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.colorScheme) private var colorScheme
-    @AppStorage(SettingsKey.interfaceLanguage) private var interfaceLanguage = "English"
     @State private var showingAddNode = false
     @State private var isTesting = false
 
@@ -19,8 +18,6 @@ struct ProxiesView: View {
     @State private var toastMessage: String?
     @State private var showAddInput = false
     @State private var showConfigEditor = false
-
-    private var isCN: Bool { interfaceLanguage == "简体中文" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -86,7 +83,7 @@ struct ProxiesView: View {
     private var headerRow: some View {
         HStack(alignment: .center) {
             HStack(spacing: 12) {
-                Text(isCN ? "代理" : "Proxies")
+                Text("Proxies")
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(.primary)
 
@@ -99,7 +96,7 @@ struct ProxiesView: View {
                     HStack(spacing: 5) {
                         Image(systemName: "antenna.radiowaves.left.and.right")
                             .font(.system(size: 11))
-                        Text(isCN ? "订阅" : "Subs")
+                        Text("Subs")
                             .font(.system(size: 12, weight: .semibold))
                     }
                     .foregroundStyle(.white)
@@ -126,7 +123,7 @@ struct ProxiesView: View {
                     HStack(spacing: 5) {
                         Image(systemName: "plus")
                             .font(.system(size: 11, weight: .bold))
-                        Text(isCN ? "添加节点" : "Add Node")
+                        Text("Add Node")
                             .font(.system(size: 12, weight: .semibold))
                     }
                     .foregroundStyle(.white)
@@ -148,7 +145,7 @@ struct ProxiesView: View {
                 Button {
                     guard !isTesting else { return }
                     guard appState.isConnected else {
-                        withAnimation { toastMessage = isCN ? "需要先连接才能测速" : "Connect first to test latency" }
+                        withAnimation { toastMessage = String(localized: "Connect first to test latency") }
                         Task {
                             try? await Task.sleep(for: .seconds(3))
                             await MainActor.run { withAnimation { toastMessage = nil } }
@@ -169,7 +166,7 @@ struct ProxiesView: View {
                             Image(systemName: "bolt.fill")
                                 .font(.system(size: 11))
                         }
-                        Text(isCN ? "全部测速" : "Test All")
+                        Text("Test All")
                             .font(.system(size: 12, weight: .semibold))
                     }
                     .foregroundStyle(Color(hex: "4B6EFF"))
@@ -192,11 +189,11 @@ struct ProxiesView: View {
         VStack(alignment: .leading, spacing: 12) {
             // Header: title + Update All
             HStack {
-                Text(isCN ? "订阅管理" : "Subscriptions")
+                Text("Subscriptions")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.primary)
 
-                Text(isCN ? "\(appState.subscriptions.count) 个来源" : "\(appState.subscriptions.count) sources")
+                Text("\(appState.subscriptions.count) sources")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
 
@@ -213,7 +210,7 @@ struct ProxiesView: View {
                             HStack(spacing: 4) {
                                 Image(systemName: "arrow.clockwise")
                                     .font(.system(size: 10, weight: .semibold))
-                                Text(isCN ? "全部更新" : "Update All")
+                                Text("Update All")
                                     .font(.system(size: 11, weight: .medium))
                             }
                             .foregroundStyle(Color(hex: "4B6EFF"))
@@ -226,53 +223,84 @@ struct ProxiesView: View {
 
             // Existing subscriptions list
             ForEach(appState.subscriptions) { sub in
-                HStack(spacing: 8) {
-                    // Status dot: green = has nodes, red = failed/empty
-                    Circle()
-                        .fill(sub.nodeCount > 0 ? Color(hex: "30D158") : Color(hex: "FF3B30"))
-                        .frame(width: 6, height: 6)
-                    VStack(alignment: .leading, spacing: 1) {
-                        // Editable name — click to edit
-                        if editingSubscriptionId == sub.id {
-                            TextField(isCN ? "名称" : "Name", text: $editingSubscriptionName, onCommit: {
-                                appState.renameSubscription(sub.id, name: editingSubscriptionName)
-                                editingSubscriptionId = nil
-                            })
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 12, weight: .medium))
-                            .onExitCommand { editingSubscriptionId = nil }
-                        } else {
-                            Text(sub.name)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(sub.nodeCount > 0 ? Color(hex: "30D158") : Color(hex: "FF3B30"))
+                            .frame(width: 6, height: 6)
+                        VStack(alignment: .leading, spacing: 1) {
+                            if editingSubscriptionId == sub.id {
+                                TextField("Name", text: $editingSubscriptionName, onCommit: {
+                                    appState.renameSubscription(sub.id, name: editingSubscriptionName)
+                                    editingSubscriptionId = nil
+                                })
+                                .textFieldStyle(.plain)
                                 .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(.primary)
-                                .onTapGesture {
-                                    editingSubscriptionId = sub.id
-                                    editingSubscriptionName = sub.name
-                                }
+                                .onExitCommand { editingSubscriptionId = nil }
+                            } else {
+                                Text(sub.name)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .onTapGesture {
+                                        editingSubscriptionId = sub.id
+                                        editingSubscriptionName = sub.name
+                                    }
+                            }
+                            Text("\(sub.nodeCount) nodes")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
                         }
-                        Text(isCN ? "\(sub.nodeCount) 个节点" : "\(sub.nodeCount) nodes")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button {
-                        showConfigEditor = true
-                    } label: {
-                        Image(systemName: "doc.text")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(isCN ? "编辑配置文件" : "Edit config file")
+                        Spacer()
+                        Button {
+                            showConfigEditor = true
+                        } label: {
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Edit config file")
 
-                    Button {
-                        appState.removeSubscription(sub.id)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.secondary)
+                        Button {
+                            appState.removeSubscription(sub.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+
+                    // Traffic usage bar
+                    if let total = sub.total, total > 0 {
+                        VStack(alignment: .leading, spacing: 3) {
+                            GeometryReader { geo in
+                                ZStack(alignment: .leading) {
+                                    Capsule()
+                                        .fill(Color.primary.opacity(0.08))
+                                    Capsule()
+                                        .fill(sub.usageRatio > 0.9 ? Color(hex: "FF3B30") :
+                                              sub.usageRatio > 0.7 ? Color(hex: "FF9F0A") :
+                                              Color(hex: "4B6EFF"))
+                                        .frame(width: geo.size.width * min(sub.usageRatio, 1.0))
+                                }
+                            }
+                            .frame(height: 4)
+
+                            HStack {
+                                Text("\(Self.formatBytes(sub.usedBytes)) / \(Self.formatBytes(total))")
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if let expiry = sub.expiryDate {
+                                    Text(expiry, style: .date)
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(expiry < Date() ? Color(hex: "FF3B30") : .secondary)
+                                }
+                            }
+                        }
+                        .padding(.leading, 14)
+                    }
                 }
                 .padding(8)
                 .background(.white.opacity(colorScheme == .dark ? 0.06 : 0.3), in: RoundedRectangle(cornerRadius: 8))
@@ -287,7 +315,7 @@ struct ProxiesView: View {
                     HStack(spacing: 4) {
                         Image(systemName: "trash")
                             .font(.system(size: 10))
-                        Text(isCN ? "清空所有节点" : "Clear All")
+                        Text("Clear All Nodes")
                             .font(.system(size: 11, weight: .medium))
                     }
                     .foregroundStyle(.red.opacity(0.8))
@@ -298,7 +326,7 @@ struct ProxiesView: View {
             // Add new subscription — show input directly when empty, otherwise toggle
             if appState.subscriptions.isEmpty || showAddInput {
                 HStack(spacing: 8) {
-                    TextField(isCN ? "订阅链接" : "Subscription URL", text: $subscriptionURL)
+                    TextField("Subscription URL", text: $subscriptionURL)
                         .textFieldStyle(.plain)
                         .font(.system(size: 12))
                         .padding(8)
@@ -318,7 +346,7 @@ struct ProxiesView: View {
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 6)
                         } else {
-                            Text(isCN ? "添加" : "Add")
+                            Text("Add")
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 18)
@@ -347,7 +375,7 @@ struct ProxiesView: View {
                             .padding(8)
                     }
                     .buttonStyle(.plain)
-                    .help(isCN ? "从文件导入 YAML 配置" : "Import YAML config from file")
+                    .help("Import YAML config from file")
                 }
                 .fileImporter(
                     isPresented: $showingFilePicker,
@@ -368,7 +396,7 @@ struct ProxiesView: View {
                         HStack(spacing: 5) {
                             Image(systemName: "arrow.down.circle")
                                 .font(.system(size: 11))
-                            Text(isCN ? "从 Clash Verge 导入" : "Import from Clash Verge")
+                            Text("Import from Clash Verge")
                                 .font(.system(size: 11, weight: .medium))
                         }
                         .foregroundStyle(Color(hex: "4B6EFF"))
@@ -386,7 +414,7 @@ struct ProxiesView: View {
                     HStack(spacing: 5) {
                         Image(systemName: "plus")
                             .font(.system(size: 10, weight: .bold))
-                        Text(isCN ? "添加订阅" : "Add Subscription")
+                        Text("Add Subscription")
                             .font(.system(size: 11, weight: .medium))
                     }
                     .foregroundStyle(Color(hex: "4B6EFF"))
@@ -423,7 +451,7 @@ struct ProxiesView: View {
                 try await appState.updateAllSubscriptions()
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = self.isCN ? "✓ 已更新 \(appState.totalNodes) 个节点" : "✓ Updated \(appState.totalNodes) nodes"
+                    subscriptionStatus = String(localized: "✓ Updated \(appState.totalNodes) nodes")
                     subscriptionURL = ""
                     withAnimation(.easeInOut(duration: 0.2)) { showAddInput = false }
                 }
@@ -466,7 +494,7 @@ struct ProxiesView: View {
                     ConfigStorage.shared.saveProxyRegions(regions)
                     ConfigStorage.shared.saveRawSubscriptionYAML(content)
                     isUpdatingSubscription = false
-                    subscriptionStatus = self.isCN ? "✓ 已导入 \(nodes.count) 个节点" : "✓ Imported \(nodes.count) nodes"
+                    subscriptionStatus = String(localized: "✓ Imported \(nodes.count) nodes")
                 }
             } catch {
                 await MainActor.run {
@@ -507,7 +535,7 @@ struct ProxiesView: View {
                     ConfigStorage.shared.saveProxyRegions(regions)
                     ConfigStorage.shared.saveRawSubscriptionYAML(content)
                     isUpdatingSubscription = false
-                    subscriptionStatus = self.isCN ? "✓ 从 Clash Verge 导入 \(nodes.count) 个节点" : "✓ Imported \(nodes.count) nodes from Clash Verge"
+                    subscriptionStatus = String(localized: "✓ Imported \(nodes.count) nodes from Clash Verge")
                 }
             } catch {
                 await MainActor.run {
@@ -561,6 +589,14 @@ struct ProxiesView: View {
         return nil
     }
 
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / 1_073_741_824
+        if gb >= 1 { return String(format: "%.1f GB", gb) }
+        let mb = Double(bytes) / 1_048_576
+        if mb >= 1 { return String(format: "%.0f MB", mb) }
+        return String(format: "%.0f KB", Double(bytes) / 1024)
+    }
+
     private func updateAllSubscriptions() {
         isUpdatingSubscription = true
         subscriptionStatus = nil
@@ -570,7 +606,7 @@ struct ProxiesView: View {
                 try await appState.updateAllSubscriptions()
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = self.isCN ? "✓ 已更新 \(appState.totalNodes) 个节点" : "✓ Updated \(appState.totalNodes) nodes"
+                    subscriptionStatus = String(localized: "✓ Updated \(appState.totalNodes) nodes")
                 }
             } catch {
                 await MainActor.run {

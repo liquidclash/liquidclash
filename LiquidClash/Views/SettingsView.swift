@@ -11,9 +11,8 @@ struct SettingsView: View {
 
     // Proxy Engine
     @AppStorage(SettingsKey.mixedPort) private var mixedPort = "7890"
-    @AppStorage(SettingsKey.allowLAN) private var allowLAN = false
     @AppStorage(SettingsKey.tunMode) private var tunMode = false
-
+    @AppStorage(SettingsKey.allowLAN) private var allowLAN = false
     // Appearance
     @AppStorage(SettingsKey.themeMode) private var themeMode = "Adaptive"
     @AppStorage(SettingsKey.glassTransparency) private var glassTransparency: Double = 50
@@ -111,28 +110,30 @@ struct SettingsView: View {
             settingDivider
 
             SettingToggleRow(
-                label: "Allow LAN",
-                subtitle: "Accept connections from local network devices",
-                isOn: $allowLAN
-            )
-            .onChange(of: allowLAN) { _, newValue in
-                appState.applySettingChange(key: "allow-lan", value: newValue)
-            }
-
-            settingDivider
-
-            SettingToggleRow(
                 label: "TUN Mode",
                 subtitle: "Virtual network adapter for system-wide proxy",
                 isOn: $tunMode
             )
             .onChange(of: tunMode) { _, newValue in
-                // TUN requires reconnect — notify user if connected
+                if !newValue { allowLAN = false }
                 if appState.isConnected {
                     appState.errorMessage = newValue
                         ? String(localized: "TUN mode will take effect after reconnecting.")
                         : String(localized: "TUN mode disabled. Reconnect to apply.")
                 }
+            }
+
+            settingDivider
+
+            SettingToggleRow(
+                label: "Allow LAN",
+                subtitle: "Let LAN devices connect through your proxy",
+                isOn: $allowLAN
+            )
+            .disabled(!tunMode)
+            .opacity(tunMode ? 1.0 : 0.4)
+            .onChange(of: allowLAN) { _, newValue in
+                appState.applySettingChange(key: "allow-lan", value: newValue)
             }
 
         }
@@ -162,22 +163,26 @@ struct SettingsView: View {
     // MARK: - About Card
 
     private var aboutCard: some View {
-        VStack(spacing: 16) {
-            Spacer()
+        VStack(spacing: 10) {
+            // App icon + info
+            HStack(spacing: 12) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 48, height: 48)
 
-            // App icon
-            Image(nsImage: NSApp.applicationIconImage)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 64, height: 64)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("LiquidClash Desktop")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text("Version 2.4.0 (Stable)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text("LiquidClash Desktop")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.primary)
-
-            Text("Version 2.4.0 (Stable)")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            settingDivider
 
             // Check for Updates row
             HStack {
@@ -195,19 +200,17 @@ struct SettingsView: View {
                     .tint(Color(hex: "4B6EFF"))
                     .labelsHidden()
             }
-            .padding(.top, 8)
+
+            settingDivider
 
             // Links
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 linkButton(label: "Github", url: "https://github.com/liquidclash/liquidclash")
                 linkButton(label: "Website", url: "https://liquidclash.github.io/liquidclash_web/web.html")
             }
-            .padding(.top, 4)
-
-            Spacer()
         }
         .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(
             LinearGradient(
                 colors: [
@@ -271,10 +274,10 @@ struct SettingsView: View {
             }
         } label: {
             Text(LocalizedStringKey(label))
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.primary)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 5)
                 .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: Capsule())
                 .overlay(Capsule().strokeBorder(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), lineWidth: 0.5))
         }

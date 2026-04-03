@@ -267,6 +267,14 @@ private struct RuleRowView: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
+                if rule.source == .subscription {
+                    Text("SUB")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.primary.opacity(0.06), in: Capsule())
+                }
             }
             .frame(width: 150, alignment: .leading)
 

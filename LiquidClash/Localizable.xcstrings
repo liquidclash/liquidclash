@@ -10,6 +10,26 @@
     "—" : {
 
     },
+    "%@ / %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ / %2$@"
+          }
+        }
+      }
+    },
+    "%@ %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ %2$@"
+          }
+        }
+      }
+    },
     "%@ • %@" : {
       "localizations" : {
         "en" : {
@@ -32,23 +52,6 @@
     },
     "%lld" : {
 
-    },
-    "%lld active" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%lld アクティブ"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%lld 活跃"
-          }
-        }
-      }
     },
     "%lld entries" : {
       "localizations" : {
@@ -98,54 +101,62 @@
         }
       }
     },
-    "%lld 个来源" : {
-
-    },
-    "%lld 个节点" : {
-
-    },
     "%lldms" : {
 
+    },
+    "✓ Imported %lld nodes" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "✓ %lld ノードインポート完了"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "✓ 已导入 %lld 个节点"
+          }
+        }
+      }
+    },
+    "✓ Imported %lld nodes from Clash Verge" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "✓ Clash Vergeから%lld ノードインポート完了"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "✓ 从 Clash Verge 导入 %lld 个节点"
+          }
+        }
+      }
+    },
+    "✓ Updated %lld nodes" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "✓ %lld ノード更新完了"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "✓ 已更新 %lld 个节点"
+          }
+        }
+      }
     },
     "5001" : {
 
     },
-    "About" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "バージョン情報"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "关于"
-          }
-        }
-      }
-    },
-    "Accept connections from local network devices" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ローカルネットワークからの接続を許可"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "接受来自局域网设备的连接"
-          }
-        }
-      }
-    },
     "Active" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -195,7 +206,7 @@
       }
     },
     "Adaptive" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -276,10 +287,26 @@
       }
     },
     "Add Subscription" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "サブスクリプション追加"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "添加订阅"
+          }
+        }
+      }
+    },
+    "Add subscription from URL?\n%@" : {
 
     },
     "Adjust backdrop blur intensity" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -296,7 +323,7 @@
       }
     },
     "All" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -318,7 +345,7 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "LAN 接続を許可"
+            "value" : "LAN許可"
           }
         },
         "zh-Hans" : {
@@ -330,7 +357,7 @@
       }
     },
     "Appearance" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -357,24 +384,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "自动更新核心组件"
-          }
-        }
-      }
-    },
-    "Automatically check on launch" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "起動時に自動確認"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "启动时自动检查"
+            "value" : "自动更新核心文件"
           }
         }
       }
@@ -427,11 +437,37 @@
         }
       }
     },
-    "Clear All" : {
-
+    "Clear All Nodes" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全ノード削除"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "清空所有节点"
+          }
+        }
+      }
     },
     "Close" : {
-
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "閉じる"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭"
+          }
+        }
+      }
     },
     "Close All" : {
       "localizations" : {
@@ -450,13 +486,38 @@
       }
     },
     "Coming Soon" : {
-
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "近日公開"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "即将推出"
+          }
+        }
+      }
     },
     "Config Editor" : {
-
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "設定エディタ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配置编辑器"
+          }
+        }
+      }
     },
     "Connect" : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -472,8 +533,24 @@
         }
       }
     },
+    "Connect first to test latency" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "テストするには先に接続してください"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要先连接才能测速"
+          }
+        }
+      }
+    },
     "Connect to see activity" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -490,7 +567,7 @@
       }
     },
     "Connect to see logs" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -507,18 +584,33 @@
       }
     },
     "Connected" : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "接続済み"
+            "value" : "接続中"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "已连接"
+          }
+        }
+      }
+    },
+    "Connecting…" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続中…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连接中…"
           }
         }
       }
@@ -540,7 +632,7 @@
       }
     },
     "Dark" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -567,30 +659,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "仪表盘"
-          }
-        }
-      }
-    },
-    "Define how traffic is routed based on hostname, IP, or geography." : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ホスト名、IP、地域に基づくトラフィックルーティングを定義します。"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "定义基于域名、IP 或地理位置的流量路由规则。"
+            "value" : "概览"
           }
         }
       }
     },
     "Dialer Proxy" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -607,7 +682,7 @@
       }
     },
     "Direct" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -619,57 +694,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "直连"
-          }
-        }
-      }
-    },
-    "Disconnected" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "未接続"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "未连接"
-          }
-        }
-      }
-    },
-    "Docs" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ドキュメント"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "文档"
-          }
-        }
-      }
-    },
-    "Download" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ダウンロード"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "下载"
           }
         }
       }
@@ -694,44 +718,23 @@
 
     },
     "Edit config file" : {
-
-    },
-    "Enable animated mesh gradient" : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "メッシュグラデーションアニメーション"
+            "value" : "設定ファイルを編集"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "启用动态网格渐变"
-          }
-        }
-      }
-    },
-    "Enable background dynamics" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "背景ダイナミクスを有効化"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "启用背景动态效果"
+            "value" : "编辑配置文件"
           }
         }
       }
     },
     "Enable Logs" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -812,7 +815,7 @@
       }
     },
     "General" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -828,8 +831,25 @@
         }
       }
     },
-    "Glass Transparency" : {
+    "Github" : {
       "extractionState" : "stale",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Github"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Github"
+          }
+        }
+      }
+    },
+    "Glass Transparency" : {
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -846,7 +866,7 @@
       }
     },
     "Global" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -863,7 +883,7 @@
       }
     },
     "HTTP/SOCKS listener port" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -896,26 +916,38 @@
       }
     },
     "Import a subscription to load rules" : {
-
-    },
-    "Import Configuration" : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "設定をインポート"
+            "value" : "ルールを読み込むにはサブスクリプションをインポート"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "导入配置"
+            "value" : "导入订阅以加载规则"
           }
         }
       }
     },
     "Import from Clash Verge" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Clash Vergeからインポート"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从 Clash Verge 导入"
+          }
+        }
+      }
+    },
+    "Import Subscription" : {
 
     },
     "Import successful! Launching app..." : {
@@ -935,7 +967,20 @@
       }
     },
     "Import YAML config from file" : {
-
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ファイルからYAML設定をインポート"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从文件导入 YAML 配置"
+          }
+        }
+      }
     },
     "Import your proxy configuration to get started." : {
       "localizations" : {
@@ -954,7 +999,7 @@
       }
     },
     "Inactive" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -971,7 +1016,7 @@
       }
     },
     "Interface Language" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -988,7 +1033,7 @@
       }
     },
     "Launch at Startup" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1000,6 +1045,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "开机启动"
+          }
+        }
+      }
+    },
+    "Let LAN devices connect through your proxy" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LANデバイスからのプロキシ接続を許可"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许局域网设备通过你的代理上网"
           }
         }
       }
@@ -1021,7 +1083,7 @@
       }
     },
     "Light" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1038,7 +1100,7 @@
       }
     },
     "Light, Dark or Liquid adaptive" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1054,45 +1116,11 @@
         }
       }
     },
-    "Liquid Animation" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "リキッドアニメーション"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "液体动画"
-          }
-        }
-      }
-    },
     "LiquidClash" : {
 
     },
     "LiquidClash Desktop" : {
 
-    },
-    "Location" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ロケーション"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "位置"
-          }
-        }
-      }
     },
     "Logs" : {
       "localizations" : {
@@ -1127,7 +1155,7 @@
       }
     },
     "Mixed Port" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1144,44 +1172,23 @@
       }
     },
     "Name" : {
-
-    },
-    "Network" : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ネットワーク"
+            "value" : "名前"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "网络"
-          }
-        }
-      }
-    },
-    "No active connections" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "アクティブな接続なし"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "无活动连接"
+            "value" : "名称"
           }
         }
       }
     },
     "No logs matching filter" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1213,25 +1220,21 @@
         }
       }
     },
-    "No proxy nodes available. Import a subscription first." : {
-      "extractionState" : "stale",
+    "No rules loaded" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "利用可能なプロキシノードがありません。まずサブスクリプションをインポートしてください。"
+            "value" : "ルールなし"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "没有可用的代理节点。请先导入订阅。"
+            "value" : "暂无规则"
           }
         }
       }
-    },
-    "No rules loaded" : {
-
     },
     "Node Name" : {
       "localizations" : {
@@ -1265,42 +1268,24 @@
         }
       }
     },
-    "None (Direct)" : {
-      "extractionState" : "stale",
+    "Not connected" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "なし（ダイレクト）"
+            "value" : "未接続"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "无（直连）"
-          }
-        }
-      }
-    },
-    "Open Dashboard" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ダッシュボードを開く"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "打开面板"
+            "value" : "未连接"
           }
         }
       }
     },
     "Password" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1316,25 +1301,8 @@
         }
       }
     },
-    "POLICY" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ポリシー"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "策略"
-          }
-        }
-      }
-    },
     "Port" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1367,7 +1335,7 @@
       }
     },
     "Proxied" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1388,19 +1356,19 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ノード"
+            "value" : "プロキシ"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "节点"
+            "value" : "代理"
           }
         }
       }
     },
     "Proxy" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1417,7 +1385,7 @@
       }
     },
     "Proxy Engine" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1429,23 +1397,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "代理引擎"
-          }
-        }
-      }
-    },
-    "Proxy Mode" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "プロキシモード"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "代理模式"
           }
         }
       }
@@ -1483,7 +1434,7 @@
       }
     },
     "Reject" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1500,7 +1451,7 @@
       }
     },
     "Rejected" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1517,7 +1468,7 @@
       }
     },
     "Rule" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1567,61 +1518,39 @@
       }
     },
     "Save" : {
-
-    },
-    "Search nodes..." : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "ノードを検索..."
+            "value" : "保存"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "搜索节点..."
+            "value" : "保存"
           }
         }
       }
     },
-    "Secure Node" : {
-      "extractionState" : "stale",
+    "Secure" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "セキュアノード"
+            "value" : "セキュア"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "安全节点"
-          }
-        }
-      }
-    },
-    "Select Node" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ノードを選択"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "选择节点"
+            "value" : "安全连接"
           }
         }
       }
     },
     "Server" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1686,7 +1615,7 @@
       }
     },
     "Show Logs page and record logs" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1698,23 +1627,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "显示日志页面并记录日志"
-          }
-        }
-      }
-    },
-    "Skip" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "スキップ"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "跳过"
           }
         }
       }
@@ -1736,7 +1648,7 @@
       }
     },
     "Start app when system boots" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1752,12 +1664,31 @@
         }
       }
     },
+    "Starting core" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "コア起動中"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在启动核心"
+          }
+        }
+      }
+    },
+    "SUB" : {
+
+    },
     "Subs" : {
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "購読"
+            "value" : "サブスク"
           }
         },
         "zh-Hans" : {
@@ -1773,7 +1704,7 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "サブスクリプション URL"
+            "value" : "サブスクリプションURL"
           }
         },
         "zh-Hans" : {
@@ -1836,7 +1767,7 @@
       }
     },
     "System-wide display language" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1852,8 +1783,24 @@
         }
       }
     },
+    "System-wide traffic capture" : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "システム全体のトラフィックキャプチャ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "虚拟网卡全局接管流量"
+          }
+        }
+      }
+    },
     "Target Policy" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1896,30 +1843,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "全部测试"
-          }
-        }
-      }
-    },
-    "Theme" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "テーマ"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "主题"
+            "value" : "全部测速"
           }
         }
       }
     },
     "Theme Mode" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -1951,30 +1881,12 @@
         }
       }
     },
-    "Traffic" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "トラフィック"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "流量"
-          }
-        }
-      }
-    },
     "TUN Mode" : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "TUN モード"
+            "value" : "TUNモード"
           }
         },
         "zh-Hans" : {
@@ -1986,24 +1898,33 @@
       }
     },
     "TUN mode disabled. Reconnect to apply." : {
-
-    },
-    "TUN mode will take effect after reconnecting." : {
-
-    },
-    "Type" : {
-      "extractionState" : "stale",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "タイプ"
+            "value" : "TUNモード無効。再接続して適用してください。"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "类型"
+            "value" : "TUN 模式已关闭，重新连接后生效。"
+          }
+        }
+      }
+    },
+    "TUN mode will take effect after reconnecting." : {
+      "localizations" : {
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TUNモードは再接続後に有効になります。"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TUN 模式将在重新连接后生效。"
           }
         }
       }
@@ -2029,30 +1950,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "すべて更新"
+            "value" : "全て更新"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "全部更新"
-          }
-        }
-      }
-    },
-    "Upload" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "アップロード"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "上传"
           }
         }
       }
@@ -2074,7 +1978,7 @@
       }
     },
     "Value" : {
-      "extractionState" : "stale",
+      "extractionState" : "manual",
       "localizations" : {
         "ja" : {
           "stringUnit" : {
@@ -2102,23 +2006,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "值"
-          }
-        }
-      }
-    },
-    "Version" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "バージョン"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "版本"
           }
         }
       }
@@ -2161,13 +2048,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "システムワイドプロキシ用仮想アダプタ"
+            "value" : "システム全体のプロキシ用仮想ネットワークアダプター"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "系统级虚拟网络适配器"
+            "value" : "虚拟网卡全局代理"
           }
         }
       }
@@ -2178,30 +2065,13 @@
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "公式サイト"
+            "value" : "ウェブサイト"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "官网"
-          }
-        }
-      }
-    },
-    "Welcome to" : {
-      "extractionState" : "stale",
-      "localizations" : {
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ようこそ"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "欢迎使用"
           }
         }
       }
@@ -2221,48 +2091,6 @@
           }
         }
       }
-    },
-    "从 Clash Verge 导入" : {
-
-    },
-    "从文件导入 YAML 配置" : {
-
-    },
-    "代理" : {
-
-    },
-    "全部更新" : {
-
-    },
-    "全部测速" : {
-
-    },
-    "名称" : {
-
-    },
-    "添加" : {
-
-    },
-    "添加节点" : {
-
-    },
-    "添加订阅" : {
-
-    },
-    "清空所有节点" : {
-
-    },
-    "编辑配置文件" : {
-
-    },
-    "订阅" : {
-
-    },
-    "订阅管理" : {
-
-    },
-    "订阅链接" : {
-
     }
   },
   "version" : "1.0"

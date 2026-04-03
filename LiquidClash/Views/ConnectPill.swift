@@ -4,10 +4,7 @@ struct ConnectPill: View {
     @Binding var isConnected: Bool
     var isConnecting: Bool = false
     @State private var glowPhase = false
-    @AppStorage(SettingsKey.interfaceLanguage) private var interfaceLanguage = "English"
     @Environment(\.colorScheme) private var colorScheme
-
-    private var isCN: Bool { interfaceLanguage == "简体中文" }
 
     private var accentColor: Color {
         if isConnecting { return Color(hex: "FFD60A") }
@@ -57,30 +54,32 @@ struct ConnectPill: View {
 
     private var iconWithGlow: some View {
         ZStack {
-            // Pulsing glow behind icon
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [
-                            accentColor.opacity(0.7),
-                            accentColor.opacity(0.5),
-                            accentColor.opacity(0.2),
-                            .clear,
-                        ],
-                        center: .center,
-                        startRadius: 12,
-                        endRadius: 44
+            // Pulsing glow behind icon (only when connected or connecting)
+            if isConnected || isConnecting {
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                accentColor.opacity(0.7),
+                                accentColor.opacity(0.5),
+                                accentColor.opacity(0.2),
+                                .clear,
+                            ],
+                            center: .center,
+                            startRadius: 12,
+                            endRadius: 44
+                        )
                     )
-                )
-                .frame(width: 96, height: 96)
-                .opacity(glowPhase ? 0.9 : 0.4)
-                .scaleEffect(glowPhase ? 1.2 : 0.9)
-                .blur(radius: 12)
-                .blendMode(colorScheme == .dark ? .plusLighter : .normal)
-                .animation(
-                    .easeInOut(duration: 3).repeatForever(autoreverses: true),
-                    value: glowPhase
-                )
+                    .frame(width: 96, height: 96)
+                    .opacity(glowPhase ? 0.9 : 0.4)
+                    .scaleEffect(glowPhase ? 1.2 : 0.9)
+                    .blur(radius: 12)
+                    .blendMode(colorScheme == .dark ? .plusLighter : .normal)
+                    .animation(
+                        .easeInOut(duration: 3).repeatForever(autoreverses: true),
+                        value: glowPhase
+                    )
+            }
 
             // Clash logo
             LiquidClashLogo(isConnected: isConnected)
@@ -96,17 +95,17 @@ struct ConnectPill: View {
     // MARK: - Text Block
 
     private var statusText: String {
-        if isConnecting { return isCN ? "连接中…" : "Connecting…" }
+        if isConnecting { return String(localized: "Connecting…") }
         return isConnected
-            ? (isCN ? "已连接" : "Connected")
-            : (isCN ? "连接" : "Connect")
+            ? String(localized: "Connected")
+            : String(localized: "Connect")
     }
 
     private var statusSubtext: String {
-        if isConnecting { return isCN ? "正在启动核心" : "Starting core" }
+        if isConnecting { return String(localized: "Starting core") }
         return isConnected
-            ? (isCN ? "安全连接" : "Secure")
-            : (isCN ? "未连接" : "Not connected")
+            ? String(localized: "Secure")
+            : String(localized: "Not connected")
     }
 
     private var statusColor: Color {

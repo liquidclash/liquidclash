@@ -21,18 +21,7 @@ enum AppPage: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var displayName: String {
-        let lang = UserDefaults.standard.string(forKey: SettingsKey.interfaceLanguage) ?? "English"
-        if lang == "简体中文" {
-            switch self {
-            case .dashboard: return "概览"
-            case .proxies:   return "代理"
-            case .rules:     return "规则"
-            case .activity:  return "活动"
-            case .logs:      return "日志"
-            case .settings:  return "设置"
-            }
-        }
-        return rawValue
+        String(localized: String.LocalizationValue(rawValue))
     }
 
     var icon: String {

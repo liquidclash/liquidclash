@@ -17,7 +17,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Handle SIGTERM (kill command) - clean up proxy before exit
         signal(SIGTERM) { _ in
-            try? SystemProxy.disable()
+            if SystemProxy.didSetProxy {
+                try? SystemProxy.disable()
+            }
             exit(0)
         }
     }
@@ -83,6 +85,8 @@ struct LiquidClashApp: App {
     @AppStorage(SettingsKey.themeMode) private var themeMode = "Adaptive"
     @AppStorage(SettingsKey.interfaceLanguage) private var interfaceLanguage = "English"
     @State private var appState = AppState()
+    @State private var pendingSubscriptionURL: String?
+    @State private var showImportAlert = false
 
     init() {
         // CRITICAL: Purge saved window frames BEFORE SwiftUI's scene management
@@ -146,6 +150,23 @@ struct LiquidClashApp: App {
             }
             .preferredColorScheme(preferredScheme)
             .environment(\.locale, appLocale)
+            .onOpenURL { url in
+                handleIncomingURL(url)
+            }
+            .alert("Import Subscription", isPresented: $showImportAlert) {
+                Button("Import") {
+                    if let subURL = pendingSubscriptionURL {
+                        appState.addSubscription(url: subURL, name: "")
+                        Task { try? await appState.updateAllSubscriptions() }
+                    }
+                    pendingSubscriptionURL = nil
+                }
+                Button("Cancel", role: .cancel) {
+                    pendingSubscriptionURL = nil
+                }
+            } message: {
+                Text("Add subscription from URL?\n\(pendingSubscriptionURL ?? "")")
+            }
         }
         .defaultSize(width: 920, height: 600)
         .windowResizability(.contentMinSize)
@@ -164,5 +185,25 @@ struct LiquidClashApp: App {
                 .aspectRatio(contentMode: .fit)
         }
         .menuBarExtraStyle(.window)
+    }
+
+    /// Handle clash:// or liquidclash:// URLs
+    /// Format: clash://install-config?url=<encoded_url>
+    private func handleIncomingURL(_ url: URL) {
+        guard let scheme = url.scheme?.lowercased(),
+              (scheme == "clash" || scheme == "liquidclash") else { return }
+
+        guard url.host == "install-config" else { return }
+
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let subURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
+              !subURL.isEmpty else { return }
+
+        // Show confirmation alert
+        pendingSubscriptionURL = subURL
+        showImportAlert = true
+
+        // Bring app to front
+        NSApp.activate(ignoringOtherApps: true)
     }
 }

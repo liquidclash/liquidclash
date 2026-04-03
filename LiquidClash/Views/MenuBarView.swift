@@ -74,41 +74,40 @@ struct MenuBarView: View {
             .padding(.vertical, 10)
 
             // MARK: Node Selector
-            Button {
-                NSApp.activate(ignoringOtherApps: true)
-                if let window = NSApp.windows.first(where: { $0.identifier?.rawValue != "menu-bar" }) {
-                    window.makeKeyAndOrderFront(nil)
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.primary.opacity(0.08))
-                            .frame(width: 22, height: 22)
-                        Image(systemName: "shield.checkered")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.primary)
-                    }
-                    Text(appState.activeNode.map { $0.name } ?? String(localized: "No Node Selected"))
+            NodeSelectorMenu(appState: appState)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+
+            menuDivider
+
+            // MARK: TUN Mode Toggle
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("TUN Mode")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Spacer()
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.tertiary)
+                    Text("System-wide traffic capture")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14)
-                        .stroke(Color.primary.opacity(0.03), lineWidth: 0.5)
-                )
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: SettingsKey.tunMode) },
+                    set: { newValue in
+                        UserDefaults.standard.set(newValue, forKey: SettingsKey.tunMode)
+                        if appState.isConnected {
+                            appState.errorMessage = newValue
+                                ? String(localized: "TUN mode will take effect after reconnecting.")
+                                : String(localized: "TUN mode disabled. Reconnect to apply.")
+                        }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.mini)
             }
-            .buttonStyle(.plain)
             .padding(.horizontal, 16)
-            .padding(.bottom, 10)
+            .padding(.vertical, 8)
 
             menuDivider
 
@@ -146,6 +145,7 @@ struct MenuBarView: View {
                     .padding(.vertical, 8)
                     .background(Color.primary.opacity(0.06), in: Capsule())
                     .foregroundStyle(.primary)
+                    .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
 
@@ -162,6 +162,7 @@ struct MenuBarView: View {
                     .padding(.vertical, 8)
                     .background(Color.primary.opacity(0.06), in: Capsule())
                     .foregroundStyle(.primary)
+                    .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
             }
@@ -180,5 +181,68 @@ struct MenuBarView: View {
             .fill(Color.primary.opacity(0.06))
             .frame(height: 0.5)
             .padding(.horizontal, 16)
+    }
+}
+
+// MARK: - Node Selector Menu
+
+private struct NodeSelectorMenu: View {
+    var appState: AppState
+
+    var body: some View {
+        Menu {
+            ForEach(appState.proxyRegions) { region in
+                Section(region.name) {
+                    ForEach(region.nodes) { node in
+                        Button {
+                            appState.selectNode(node.id)
+                        } label: {
+                            HStack {
+                                Text("\(node.flag) \(node.name)")
+                                if node.id == appState.selectedNodeId {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            nodeSelectorLabel
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+    }
+
+    private var nodeSelectorLabel: some View {
+        HStack(spacing: 8) {
+            ZStack {
+                Circle()
+                    .fill(Color.primary.opacity(0.08))
+                    .frame(width: 28, height: 28)
+                Image(systemName: "shield.checkered")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.primary)
+            }
+            Text(appState.activeNode.map { "\($0.flag) \($0.name)" } ?? String(localized: "No Node Selected"))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Spacer()
+            Image(systemName: "chevron.down")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background {
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.primary.opacity(0.05))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+        }
+        .contentShape(Rectangle())
     }
 }

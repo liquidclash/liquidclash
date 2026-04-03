@@ -372,7 +372,7 @@ struct ConfigParser {
 
     // MARK: - Parse Clash YAML Rules
 
-    static func parseClashYAMLRules(_ yaml: String) -> [RuleItem] {
+    static func parseClashYAMLRules(_ yaml: String, source: RuleSource = .subscription) -> [RuleItem] {
         let lines = yaml.components(separatedBy: .newlines)
         var rules: [RuleItem] = []
         var inRules = false
@@ -391,7 +391,7 @@ struct ConfigParser {
 
             guard inRules, trimmed.hasPrefix("- ") else { continue }
             let ruleStr = String(trimmed.dropFirst(2))
-            if let rule = RuleItem.from(clashString: ruleStr) {
+            if let rule = RuleItem.from(clashString: ruleStr, source: source) {
                 rules.append(rule)
             }
         }
