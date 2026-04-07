@@ -82,14 +82,9 @@ struct MenuBarView: View {
 
             // MARK: TUN Mode Toggle
             HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("TUN Mode")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.primary)
-                    Text("System-wide traffic capture")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
+                Text("TUN Mode")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary)
                 Spacer()
                 Toggle("", isOn: Binding(
                     get: { UserDefaults.standard.bool(forKey: SettingsKey.tunMode) },
@@ -191,15 +186,33 @@ private struct NodeSelectorMenu: View {
 
     var body: some View {
         Menu {
-            ForEach(appState.proxyRegions) { region in
-                Section(region.name) {
-                    ForEach(region.nodes) { node in
+            // Show Selector groups and their members
+            ForEach(appState.proxyService.groups.filter(\.isSelector)) { group in
+                Section(group.name) {
+                    ForEach(group.all, id: \.self) { member in
                         Button {
-                            appState.selectNode(node.id)
+                            appState.selectNode(member)
+                        } label: {
+                            HStack {
+                                Text(member)
+                                if member == group.now {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Individual nodes
+            if !appState.proxyService.nodes.isEmpty {
+                Section("Nodes") {
+                    ForEach(appState.proxyService.nodes) { node in
+                        Button {
+                            appState.selectNode(node.name)
                         } label: {
                             HStack {
                                 Text("\(node.flag) \(node.name)")
-                                if node.id == appState.selectedNodeId {
+                                if node.name == appState.proxyService.activeNodeName {
                                     Image(systemName: "checkmark")
                                 }
                             }
@@ -208,41 +221,31 @@ private struct NodeSelectorMenu: View {
                 }
             }
         } label: {
-            nodeSelectorLabel
+            HStack(spacing: 0) {
+                Text(appState.proxyService.activeNodeName ?? String(localized: "No Node Selected"))
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.trailing, 4)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-    }
-
-    private var nodeSelectorLabel: some View {
-        HStack(spacing: 8) {
-            ZStack {
-                Circle()
-                    .fill(Color.primary.opacity(0.08))
-                    .frame(width: 28, height: 28)
-                Image(systemName: "shield.checkered")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.primary)
-            }
-            Text(appState.activeNode.map { "\($0.flag) \($0.name)" } ?? String(localized: "No Node Selected"))
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-            Spacer()
-            Image(systemName: "chevron.down")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background {
+        .frame(maxWidth: .infinity, minHeight: 42)
+        .background(
             RoundedRectangle(cornerRadius: 14)
                 .fill(Color.primary.opacity(0.05))
-        }
-        .overlay {
+        )
+        .overlay(
             RoundedRectangle(cornerRadius: 14)
                 .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
-        }
-        .contentShape(Rectangle())
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 14))
     }
 }

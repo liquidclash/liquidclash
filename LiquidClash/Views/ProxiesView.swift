@@ -5,44 +5,43 @@ struct ProxiesView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.colorScheme) private var colorScheme
     @State private var showingAddNode = false
+    @State private var editingNode: ProxyNode?
     @State private var isTesting = false
 
     // Subscription management
     @AppStorage(SettingsKey.subscriptionURL) private var subscriptionURL = ""
     @State private var isUpdatingSubscription = false
     @State private var subscriptionStatus: String?
-    @State private var showSubscriptionBar = false
     @State private var showingFilePicker = false
     @State private var editingSubscriptionId: String?
     @State private var editingSubscriptionName = ""
-    @State private var toastMessage: String?
+
     @State private var showAddInput = false
     @State private var showConfigEditor = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerRow
-                .padding(.bottom, showSubscriptionBar ? 16 : 24)
+                .padding(.bottom, 16)
 
-            // Collapsible subscription panel
-            if showSubscriptionBar {
-                subscriptionPanel
-                    .padding(.bottom, 16)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            // Toast hint (e.g. "需要先连接才能测速")
-            if let toast = toastMessage {
-                Text(toast)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.orange)
-                    .padding(.bottom, 8)
-                    .transition(.opacity)
-            }
+            // Subscription management panel — always visible
+            subscriptionPanel
+                .padding(.bottom, 16)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    ForEach(appState.proxyRegions) { region in
+                    // Proxy Groups from mihomo API
+                    if !appState.proxyService.groups.isEmpty {
+                        proxyGroupsSection
+                    }
+
+                    // Individual nodes from mihomo API, organized by region
+                    if !appState.proxyService.nodes.isEmpty {
+                        nodesSection
+                    }
+
+                    // Legacy local regions (custom nodes)
+                    ForEach(appState.proxyRegions.filter { $0.id == "custom" }) { region in
                         RegionGroupView(
                             region: region,
                             selectedNodeId: appState.selectedNodeId,
@@ -55,6 +54,15 @@ struct ProxiesView: View {
                                 withAnimation(.easeInOut(duration: 0.2)) {
                                     appState.selectNode(node.id)
                                 }
+                            },
+                            onDeleteNode: { node in
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    appState.deleteNode(node.id)
+                                }
+                            },
+                            onEditNode: { node in
+                                editingNode = node
+                                showingAddNode = true
                             }
                         )
                     }
@@ -65,11 +73,18 @@ struct ProxiesView: View {
         .padding(.horizontal, 32)
         .padding(.vertical, 16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: showingAddNode) { _, showing in
+            if !showing { editingNode = nil }
+        }
         .overlay {
             if showingAddNode {
-                AddNodeSheet(isPresented: $showingAddNode) { node in
-                    appState.addNode(node)
-                }
+                AddNodeSheet(isPresented: $showingAddNode, onAdd: { node in
+                    if editingNode != nil {
+                        appState.updateNode(node)
+                    } else {
+                        appState.addNode(node)
+                    }
+                }, editingNode: editingNode)
                 .transition(.opacity)
             }
         }
@@ -78,39 +93,154 @@ struct ProxiesView: View {
         }
     }
 
+    // MARK: - Proxy Groups (from mihomo API)
+
+    private let serviceIcons: [String: String] = [
+        "YouTube": "play.rectangle.fill", "Netflix": "film.fill", "Disney": "sparkles",
+        "Spotify": "music.note", "Telegram": "paperplane.fill", "Google": "magnifyingglass",
+        "OpenAI": "brain.head.profile.fill", "Apple": "apple.logo", "Microsoft": "desktopcomputer",
+        "Steam": "gamecontroller.fill",
+    ]
+
+    private var proxyGroupsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("PROXY GROUPS")
+                .font(.system(size: 11, weight: .semibold))
+                .kerning(1.0)
+                .foregroundStyle(.secondary)
+
+            let columns = [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(appState.proxyService.groups) { group in
+                    let icon = serviceIcons[group.name] ?? (group.isSelector ? "square.grid.2x2.fill" : "bolt.fill")
+                    let target = group.now ?? (group.isSelector ? "Select" : "Auto")
+                    Button {
+                        // For Selector groups, this could open a sub-menu
+                        // For now, just select the group's current node in parent selectors
+                        if let now = group.now {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                appState.selectNode(now)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: icon)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 16)
+                            Text(group.name)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            Text(target)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(.white.opacity(appState.proxyService.activeGroupName == group.name ? 0.7 : 0.35),
+                                    in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(
+                                    appState.proxyService.activeGroupName == group.name
+                                        ? Color(hex: "4B6EFF").opacity(0.5)
+                                        : .white.opacity(colorScheme == .dark ? 0.1 : 0.5),
+                                    lineWidth: 0.5
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    // MARK: - Nodes Section (from mihomo API, organized by flag)
+
+    private var nodesSection: some View {
+        let grouped = Dictionary(grouping: appState.proxyService.nodes, by: \.flag)
+        let sortedFlags = grouped.keys.sorted()
+
+        return VStack(alignment: .leading, spacing: 16) {
+            Text("NODES")
+                .font(.system(size: 11, weight: .semibold))
+                .kerning(1.0)
+                .foregroundStyle(.secondary)
+
+            let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
+            ForEach(sortedFlags, id: \.self) { flag in
+                if let nodes = grouped[flag] {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("\(flag) \(nodes.count) nodes")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+
+                        LazyVGrid(columns: columns, spacing: 12) {
+                            ForEach(nodes) { node in
+                                nodeCard(node)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func nodeCard(_ node: ProxyService.MihomoNode) -> some View {
+        let isActive = appState.proxyService.activeNodeName == node.name
+        return Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                appState.selectNode(node.name)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(node.flag)
+                    .font(.system(size: 14))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ConfigParser.extractFlag(from: node.name).cleanName)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(node.type)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+                if node.latency > 0 {
+                    Text("\(node.latency)ms")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(node.latency < 200 ? Color(hex: "30D158") :
+                                        node.latency < 500 ? Color(hex: "FF9F0A") :
+                                        Color(hex: "FF3B30"))
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(.white.opacity(isActive ? 0.7 : 0.35),
+                        in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(
+                        isActive
+                            ? Color(hex: "4B6EFF").opacity(0.5)
+                            : .white.opacity(colorScheme == .dark ? 0.1 : 0.5),
+                        lineWidth: 0.5
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - Header
 
     private var headerRow: some View {
         HStack(alignment: .center) {
-            HStack(spacing: 12) {
-                Text("Proxies")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(.primary)
-
-                // Subscriptions toggle
-                Button {
-                    withAnimation(.easeInOut(duration: 0.25)) {
-                        showSubscriptionBar.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                            .font(.system(size: 11))
-                        Text("Subs")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(
-                        Color(hex: showSubscriptionBar ? "3A5AE0" : "4B6EFF"),
-                        in: Capsule()
-                    )
-                    .shadow(color: Color(hex: "4B6EFF").opacity(0.3), radius: 4, y: 2)
-                }
-                .buttonStyle(.plain)
-                .fixedSize()
-            }
+            Text("Proxies")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.primary)
 
             Spacer()
 
@@ -144,17 +274,9 @@ struct ProxiesView: View {
 
                 Button {
                     guard !isTesting else { return }
-                    guard appState.isConnected else {
-                        withAnimation { toastMessage = String(localized: "Connect first to test latency") }
-                        Task {
-                            try? await Task.sleep(for: .seconds(3))
-                            await MainActor.run { withAnimation { toastMessage = nil } }
-                        }
-                        return
-                    }
                     isTesting = true
                     Task {
-                        await appState.testAllLatency()
+                        await appState.proxyService.testAllLatency()
                         isTesting = false
                     }
                 } label: {
@@ -306,23 +428,6 @@ struct ProxiesView: View {
                 .background(.white.opacity(colorScheme == .dark ? 0.06 : 0.3), in: RoundedRectangle(cornerRadius: 8))
             }
 
-            // Clear all nodes button (visible when nodes exist)
-            if !appState.proxyRegions.isEmpty {
-                Button {
-                    appState.clearAllNodes()
-                    subscriptionStatus = nil
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "trash")
-                            .font(.system(size: 10))
-                        Text("Clear All Nodes")
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    .foregroundStyle(.red.opacity(0.8))
-                }
-                .buttonStyle(.plain)
-            }
-
             // Add new subscription — show input directly when empty, otherwise toggle
             if appState.subscriptions.isEmpty || showAddInput {
                 HStack(spacing: 8) {
@@ -451,14 +556,18 @@ struct ProxiesView: View {
                 try await appState.updateAllSubscriptions()
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = String(localized: "✓ Updated \(appState.totalNodes) nodes")
+                    let rulesCount = appState.rules.count
+                    let msg = rulesCount > 0
+                        ? String(localized: "✓ \(appState.totalNodes) nodes, \(rulesCount) rules")
+                        : String(localized: "✓ \(appState.totalNodes) nodes (no rules in subscription)")
+                    showTemporaryStatus(msg)
                     subscriptionURL = ""
                     withAnimation(.easeInOut(duration: 0.2)) { showAddInput = false }
                 }
             } catch {
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = error.localizedDescription
+                    showTemporaryStatus(error.localizedDescription)
                 }
             }
         }
@@ -482,24 +591,27 @@ struct ProxiesView: View {
                 let manager = SubscriptionManager()
                 let regions = await manager.organizeIntoRegions(nodes)
 
-                // Parse rules from YAML
-                let parsedRules = content.contains("rules:") ? ConfigParser.parseClashYAMLRules(content) : []
+                // Parse rules from YAML — merge with user rules
+                let parsedRules = content.contains("rules:") ? ConfigParser.parseClashYAMLRules(content, source: .subscription) : []
 
                 await MainActor.run {
                     appState.proxyRegions = regions
                     appState.selectedNodeId = regions.first?.nodes.first?.id
                     appState.activeNode = regions.first?.nodes.first
-                    if !parsedRules.isEmpty { appState.rules = parsedRules }
+                    if !parsedRules.isEmpty {
+                        let userRules = appState.rules.filter { $0.source == .user }
+                        appState.rules = userRules + parsedRules
+                    }
                     appState.saveState()
                     ConfigStorage.shared.saveProxyRegions(regions)
                     ConfigStorage.shared.saveRawSubscriptionYAML(content)
                     isUpdatingSubscription = false
-                    subscriptionStatus = String(localized: "✓ Imported \(nodes.count) nodes")
+                    showTemporaryStatus(String(localized: "✓ Imported \(nodes.count) nodes"))
                 }
             } catch {
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = error.localizedDescription
+                    showTemporaryStatus(error.localizedDescription)
                 }
             }
         }
@@ -523,24 +635,27 @@ struct ProxiesView: View {
                 let manager = SubscriptionManager()
                 let regions = await manager.organizeIntoRegions(nodes)
 
-                // Parse rules from YAML
-                let parsedRules = content.contains("rules:") ? ConfigParser.parseClashYAMLRules(content) : []
+                // Parse rules from YAML — merge with user rules
+                let parsedRules = content.contains("rules:") ? ConfigParser.parseClashYAMLRules(content, source: .subscription) : []
 
                 await MainActor.run {
                     appState.proxyRegions = regions
                     appState.selectedNodeId = regions.first?.nodes.first?.id
                     appState.activeNode = regions.first?.nodes.first
-                    if !parsedRules.isEmpty { appState.rules = parsedRules }
+                    if !parsedRules.isEmpty {
+                        let userRules = appState.rules.filter { $0.source == .user }
+                        appState.rules = userRules + parsedRules
+                    }
                     appState.saveState()
                     ConfigStorage.shared.saveProxyRegions(regions)
                     ConfigStorage.shared.saveRawSubscriptionYAML(content)
                     isUpdatingSubscription = false
-                    subscriptionStatus = String(localized: "✓ Imported \(nodes.count) nodes from Clash Verge")
+                    showTemporaryStatus(String(localized: "✓ Imported \(nodes.count) nodes from Clash Verge"))
                 }
             } catch {
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = error.localizedDescription
+                    showTemporaryStatus(error.localizedDescription)
                 }
             }
         }
@@ -606,14 +721,26 @@ struct ProxiesView: View {
                 try await appState.updateAllSubscriptions()
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = String(localized: "✓ Updated \(appState.totalNodes) nodes")
+                    let rulesCount = appState.rules.count
+                    let msg = rulesCount > 0
+                        ? String(localized: "✓ \(appState.totalNodes) nodes, \(rulesCount) rules")
+                        : String(localized: "✓ \(appState.totalNodes) nodes")
+                    showTemporaryStatus(msg)
                 }
             } catch {
                 await MainActor.run {
                     isUpdatingSubscription = false
-                    subscriptionStatus = error.localizedDescription
+                    showTemporaryStatus(error.localizedDescription)
                 }
             }
+        }
+    }
+
+    private func showTemporaryStatus(_ message: String) {
+        withAnimation { subscriptionStatus = message }
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            await MainActor.run { withAnimation { subscriptionStatus = nil } }
         }
     }
 }
