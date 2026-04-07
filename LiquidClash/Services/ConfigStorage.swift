@@ -63,18 +63,30 @@ final class ConfigStorage {
         }
     }
 
-    // MARK: - Raw Subscription YAML
+    // MARK: - Runtime Config Path
 
-    /// Save the raw YAML content downloaded from subscriptions for mihomo to use directly
-    func saveRawSubscriptionYAML(_ yaml: String) {
-        let url = appSupportDirectory.appendingPathComponent("subscription_raw.yaml")
-        try? yaml.write(to: url, atomically: true, encoding: .utf8)
+    var runtimeConfigPath: URL {
+        appSupportDirectory.appendingPathComponent("config", isDirectory: true)
+            .appendingPathComponent("config.yaml")
     }
 
-    func loadRawSubscriptionYAML() -> String? {
-        let url = appSupportDirectory.appendingPathComponent("subscription_raw.yaml")
-        return try? String(contentsOf: url, encoding: .utf8)
+    // MARK: - Subscription YAML (immutable, stored as-is)
+
+    var subscriptionYAMLPath: URL {
+        appSupportDirectory.appendingPathComponent("subscription_raw.yaml")
     }
+
+    func saveSubscriptionYAML(_ yaml: String) {
+        try? yaml.write(to: subscriptionYAMLPath, atomically: true, encoding: .utf8)
+    }
+
+    func loadSubscriptionYAML() -> String? {
+        try? String(contentsOf: subscriptionYAMLPath, encoding: .utf8)
+    }
+
+    /// Legacy aliases for compatibility during migration
+    func saveRawSubscriptionYAML(_ yaml: String) { saveSubscriptionYAML(yaml) }
+    func loadRawSubscriptionYAML() -> String? { loadSubscriptionYAML() }
 
     // MARK: - Rules
 
