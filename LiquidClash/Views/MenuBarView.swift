@@ -230,8 +230,8 @@ private struct NodeSelectorMenu: View {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.tertiary)
-                    .padding(.trailing, 4)
             }
+            .frame(maxWidth: .infinity)
             .padding(.horizontal, 14)
             .padding(.vertical, 6)
         }

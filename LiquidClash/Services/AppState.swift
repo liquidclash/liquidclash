@@ -782,78 +782,73 @@ final class AppState {
         }
     }
 
+    /// URLSession configured to route through mihomo proxy
+    private func makeProxySession(port: Int) -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [
+            kCFNetworkProxiesHTTPEnable: true,
+            kCFNetworkProxiesHTTPProxy: "127.0.0.1",
+            kCFNetworkProxiesHTTPPort: port,
+            kCFNetworkProxiesHTTPSEnable: true,
+            kCFNetworkProxiesHTTPSProxy: "127.0.0.1",
+            kCFNetworkProxiesHTTPSPort: port,
+        ]
+        config.timeoutIntervalForRequest = 5
+        return URLSession(configuration: config)
+    }
+
     private func fetchNetworkInfo() async {
-        // Use curl through mihomo proxy to get IP (URLSession proxy config is unreliable)
         let port = config.mixedPort
+        let session = makeProxySession(port: port)
+
+        // Retry until proxy is ready (providers loading)
         var ip = ""
-        var city = "--"
-        var country = ""
-        var asType = "--"
-
-        // Helper: run curl through proxy and parse JSON
-        func curlJSON(_ urlString: String) -> [String: Any]? {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            proc.arguments = ["-s", "--max-time", "8", "-x", "http://127.0.0.1:\(port)", urlString]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = FileHandle.nullDevice
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                guard proc.terminationStatus == 0 else { return nil }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                return try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            } catch { return nil }
-        }
-
-        // Retry with increasing delay — providers may need time to load
-        for delay in [5, 8, 12] {
-            try? await Task.sleep(for: .seconds(delay))
+        for attempt in 1...8 {
+            try? await Task.sleep(for: .seconds(2))
             guard isConnected, !Task.isCancelled else { return }
 
-            if let json = curlJSON("https://ipwho.is/"),
-               let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
-                ip = fetchedIP
-                city = json["city"] as? String ?? "--"
-                country = json["country_code"] as? String ?? ""
-                let conn = json["connection"] as? [String: Any]
-                asType = conn?["org"] as? String ?? "--"
-                print("[LiquidClash] IP fetch OK via ipwho.is: \(ip) \(city), \(country)")
-                break
-            } else if let json = curlJSON("https://api.ip.sb/geoip"),
-                      let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
-                ip = fetchedIP
-                city = json["city"] as? String ?? "--"
-                country = json["country_code"] as? String ?? ""
-                asType = json["organization"] as? String ?? "--"
-                print("[LiquidClash] IP fetch OK via ip.sb: \(ip) \(city), \(country)")
+            // Fast: plain text IP
+            if let (data, _) = try? await session.data(from: URL(string: "https://ifconfig.me")!),
+               let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !result.isEmpty, !result.contains("<") {
+                ip = result
                 break
             }
-            print("[LiquidClash] IP fetch attempt failed, retrying in \(delay)s...")
-        }
 
-        guard !ip.isEmpty, isConnected, !Task.isCancelled else {
-            print("[LiquidClash] Failed to get IP from all sources")
-            return
-        }
-
-        let cityDisplay = country.isEmpty ? city : "\(city), \(country)"
-        await MainActor.run {
-            self.networkInfo.ip = ip
-            self.networkInfo.city = cityDisplay
-        }
-
-        // Step 2: Get actual AS type from ipapi.is
-        if let json = curlJSON("https://api.ipapi.is/?q=\(ip)"),
-           let asnObj = json["asn"] as? [String: Any],
-           let type = asnObj["type"] as? String, !type.isEmpty {
-            await MainActor.run {
-                self.networkInfo.asType = type.uppercased()
+            if attempt >= 3 {
+                if let (data, _) = try? await session.data(from: URL(string: "https://ipwho.is/")!),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
+                    ip = fetchedIP
+                    let city = json["city"] as? String ?? "--"
+                    let country = json["country_code"] as? String ?? ""
+                    let conn = json["connection"] as? [String: Any]
+                    let org = conn?["org"] as? String ?? "--"
+                    await MainActor.run {
+                        self.networkInfo.ip = ip
+                        self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
+                        self.networkInfo.asType = org.uppercased()
+                    }
+                    return
+                }
             }
-        } else {
+        }
+
+        guard !ip.isEmpty, isConnected, !Task.isCancelled else { return }
+
+        // Show IP immediately
+        await MainActor.run { self.networkInfo.ip = ip }
+
+        // Enrich with geo data
+        if let (data, _) = try? await session.data(from: URL(string: "https://ipwho.is/")!),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let city = json["city"] as? String ?? "--"
+            let country = json["country_code"] as? String ?? ""
+            let conn = json["connection"] as? [String: Any]
+            let org = conn?["org"] as? String ?? json["organization"] as? String ?? "--"
             await MainActor.run {
-                self.networkInfo.asType = asType.uppercased()
+                self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
+                self.networkInfo.asType = org.uppercased()
             }
         }
     }
