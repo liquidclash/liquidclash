@@ -135,6 +135,8 @@ struct ProxiesView: View {
                 ForEach(groups) { group in
                     let icon = serviceIcons[group.name] ?? (group.isSelector ? "square.grid.2x2.fill" : "bolt.fill")
                     let target = group.now ?? (group.isSelector ? "Select" : "Auto")
+                    let isActive = group.name == appState.proxyService.activeGroupName
+                                || group.name == appState.proxyService.activeNodeName
                     Button {
                         if let now = group.now {
                             withAnimation(.easeInOut(duration: 0.2)) {
@@ -159,12 +161,12 @@ struct ProxiesView: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 7)
-                        .background(.white.opacity(appState.proxyService.activeGroupName == group.name ? 0.7 : 0.35),
+                        .background(.white.opacity(isActive ? 0.7 : 0.35),
                                     in: RoundedRectangle(cornerRadius: 8))
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
                                 .strokeBorder(
-                                    appState.proxyService.activeGroupName == group.name
+                                    isActive
                                         ? Color(hex: "4B6EFF").opacity(0.5)
                                         : .white.opacity(colorScheme == .dark ? 0.1 : 0.5),
                                     lineWidth: 0.5

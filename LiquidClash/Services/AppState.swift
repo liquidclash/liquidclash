@@ -839,16 +839,23 @@ final class AppState {
         // Show IP immediately
         await MainActor.run { self.networkInfo.ip = ip }
 
-        // Enrich with geo data
+        // Enrich: city from ipwho.is, AS type from ipapi.is
         if let (data, _) = try? await session.data(from: URL(string: "https://ipwho.is/")!),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             let city = json["city"] as? String ?? "--"
             let country = json["country_code"] as? String ?? ""
-            let conn = json["connection"] as? [String: Any]
-            let org = conn?["org"] as? String ?? json["organization"] as? String ?? "--"
             await MainActor.run {
                 self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
-                self.networkInfo.asType = org.uppercased()
+            }
+        }
+
+        // AS type (hosting/isp/business) from ipapi.is
+        if let (data, _) = try? await session.data(from: URL(string: "https://api.ipapi.is/?q=\(ip)")!),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let asnObj = json["asn"] as? [String: Any],
+           let type = asnObj["type"] as? String, !type.isEmpty {
+            await MainActor.run {
+                self.networkInfo.asType = type.uppercased()
             }
         }
     }
