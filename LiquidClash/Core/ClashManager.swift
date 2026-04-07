@@ -75,10 +75,21 @@ final class ClashManager {
         }
     }
 
+    // MARK: - Write Runtime Config
+
+    /// Write runtime config using ConfigPipeline
+    func writeRuntimeConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
+        try ConfigPipeline.generateRuntime(
+            subscriptionYAML: subscriptionYAML,
+            overlay: overlay,
+            outputPath: configFilePath
+        )
+    }
+
     // MARK: - Start
 
-    /// Start mihomo with raw subscription YAML (preferred) or generated config
-    func start(config: ClashConfig, rawSubscriptionYAML: String? = nil) throws {
+    /// Start mihomo with subscription YAML + overlay
+    func start(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
         guard !isRunning else { return }
 
         guard let binary = findBinary() else {
@@ -86,13 +97,7 @@ final class ClashManager {
         }
 
         ensureGeodataFiles()
-
-        // Write config file: prefer raw YAML with settings overlay
-        if let rawYAML = rawSubscriptionYAML, !rawYAML.isEmpty {
-            try writeConfigFromRawYAML(rawYAML, config: config)
-        } else {
-            try writeConfigYAML(config)
-        }
+        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay)
 
         let proc = Process()
         proc.executableURL = binary
@@ -130,7 +135,7 @@ final class ClashManager {
     // MARK: - Start with Privileges (for TUN mode)
 
     /// Start mihomo with root privileges via osascript (required for TUN)
-    func startWithPrivileges(config: ClashConfig, rawSubscriptionYAML: String? = nil) throws {
+    func startWithPrivileges(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
         guard !isRunning else { return }
 
         guard let binary = findBinary() else {
@@ -139,14 +144,10 @@ final class ClashManager {
 
         ensureGeodataFiles()
 
-        // Write config file with TUN enabled
-        var tunConfig = config
-        tunConfig.tunEnabled = true
-        if let rawYAML = rawSubscriptionYAML, !rawYAML.isEmpty {
-            try writeConfigFromRawYAML(rawYAML, config: tunConfig)
-        } else {
-            try writeConfigYAML(tunConfig)
-        }
+        // Write config file with TUN enabled overlay
+        var tunOverlay = overlay
+        tunOverlay.tunEnabled = true
+        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: tunOverlay)
 
         // Launch with admin privileges via osascript
         let binaryPath = binary.path.replacingOccurrences(of: "'", with: "'\\''")
@@ -222,180 +223,10 @@ final class ClashManager {
 
     /// Rewrite config.yaml on disk without restarting the process.
     /// Used together with ClashAPI.reloadConfig() for hot reloading.
-    func rewriteConfig(config: ClashConfig, rawSubscriptionYAML: String? = nil) throws {
-        if let rawYAML = rawSubscriptionYAML, !rawYAML.isEmpty {
-            try writeConfigFromRawYAML(rawYAML, config: config)
-        } else {
-            try writeConfigYAML(config)
-        }
+    func rewriteConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
+        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay)
     }
 
-    // MARK: - Write Config from Raw Subscription YAML
-
-    /// Merge raw subscription YAML with local settings and write to config file.
-    /// The raw YAML already has proxies, proxy-groups, and rules from the subscription.
-    /// We only override network settings (port, allow-lan, external-controller, mode).
-    private func writeConfigFromRawYAML(_ rawYAML: String, config: ClashConfig) throws {
-        var lines = rawYAML.components(separatedBy: .newlines)
-
-        // Settings to override in the raw YAML
-        let overrides: [String: String] = [
-            "port": "\(config.port)",
-            "socks-port": "\(config.socksPort)",
-            "mixed-port": "\(config.mixedPort)",
-            "allow-lan": "\(config.allowLan)",
-            "mode": config.mode,
-            "log-level": config.logLevel,
-            "external-controller": "'\(config.externalController)'",
-        ]
-
-        // Replace existing TOP-LEVEL settings only (lines with no leading whitespace)
-        var appliedKeys: Set<String> = []
-        for i in lines.indices {
-            let line = lines[i]
-            // Skip indented lines (nested YAML keys like proxy port, ws-opts port, etc.)
-            guard !line.isEmpty, !line.hasPrefix(" "), !line.hasPrefix("\t") else { continue }
-            for (key, value) in overrides {
-                if line.hasPrefix("\(key):") {
-                    lines[i] = "\(key): \(value)"
-                    appliedKeys.insert(key)
-                }
-            }
-        }
-
-        // Prepend any settings not found in the raw YAML
-        var header = "# LiquidClash config overlay\n"
-        for (key, value) in overrides where !appliedKeys.contains(key) {
-            header += "\(key): \(value)\n"
-        }
-
-        // Add secret if needed
-        if !config.secret.isEmpty && !rawYAML.contains("secret:") {
-            header += "secret: '\(config.secret)'\n"
-        }
-
-        // Add TUN config if enabled
-        if config.tunEnabled && !rawYAML.contains("tun:") {
-            header += """
-            tun:
-              enable: true
-              stack: system
-              auto-route: true
-              auto-detect-interface: true
-            
-            """
-        }
-
-        let finalYAML = header + "\n" + lines.joined(separator: "\n")
-        try finalYAML.write(to: configFilePath, atomically: true, encoding: .utf8)
-    }
-
-    // MARK: - Write Config YAML (fallback for manual nodes)
-
-    private func writeConfigYAML(_ config: ClashConfig) throws {
-        var yaml = """
-        # LiquidClash generated config
-        port: \(config.port)
-        socks-port: \(config.socksPort)
-        mixed-port: \(config.mixedPort)
-        allow-lan: \(config.allowLan)
-        mode: \(config.mode)
-        log-level: \(config.logLevel)
-        external-controller: '\(config.externalController)'
-        
-        """
-
-        if !config.secret.isEmpty {
-            yaml += "secret: '\(config.secret)'\n"
-        }
-
-        if config.tunEnabled {
-            yaml += """
-            tun:
-              enable: true
-              stack: system
-              auto-route: true
-              auto-detect-interface: true
-            
-            """
-        }
-
-        // Proxies
-        if !config.proxies.isEmpty {
-            yaml += "\nproxies:\n"
-            for node in config.proxies {
-                yaml += "  - name: \"\(node.name)\"\n"
-                yaml += "    type: \(node.type.rawValue)\n"
-                yaml += "    server: \(node.server)\n"
-                yaml += "    port: \(node.port)\n"
-                if let password = node.password, !password.isEmpty {
-                    yaml += "    password: \"\(password)\"\n"
-                }
-                if let uuid = node.uuid, !uuid.isEmpty {
-                    yaml += "    uuid: \(uuid)\n"
-                }
-                if let cipher = node.cipher, !cipher.isEmpty {
-                    yaml += "    cipher: \(cipher)\n"
-                }
-                if let alterId = node.alterId {
-                    yaml += "    alterId: \(alterId)\n"
-                }
-                yaml += "    udp: \(node.udp)\n"
-                // TLS / transport parameters
-                if let sni = node.sni, !sni.isEmpty {
-                    yaml += "    sni: \(sni)\n"
-                }
-                if let scv = node.skipCertVerify, scv {
-                    yaml += "    skip-cert-verify: true\n"
-                }
-                if let tls = node.tls, tls {
-                    yaml += "    tls: true\n"
-                }
-                if let net = node.network, !net.isEmpty {
-                    yaml += "    network: \(net)\n"
-                    if net == "ws" {
-                        yaml += "    ws-opts:\n"
-                        if let path = node.wsPath, !path.isEmpty {
-                            yaml += "      path: \"\(path)\"\n"
-                        }
-                        if let host = node.wsHost, !host.isEmpty {
-                            yaml += "      headers:\n"
-                            yaml += "        Host: \(host)\n"
-                        }
-                    }
-                }
-            }
-        }
-
-        // Proxy Groups
-        if !config.proxyGroups.isEmpty {
-            yaml += "\nproxy-groups:\n"
-            for group in config.proxyGroups {
-                yaml += "  - name: \"\(group.name)\"\n"
-                yaml += "    type: \(group.type.rawValue)\n"
-                if let url = group.url {
-                    yaml += "    url: \"\(url)\"\n"
-                }
-                if let interval = group.interval {
-                    yaml += "    interval: \(interval)\n"
-                }
-                yaml += "    proxies:\n"
-                for proxy in group.proxies {
-                    yaml += "      - \"\(proxy)\"\n"
-                }
-            }
-        }
-
-        // Rules
-        if !config.rules.isEmpty {
-            yaml += "\nrules:\n"
-            for rule in config.rules {
-                yaml += "  - \(rule)\n"
-            }
-        }
-
-        try yaml.write(to: configFilePath, atomically: true, encoding: .utf8)
-    }
 }
 
 // MARK: - Clash Error
