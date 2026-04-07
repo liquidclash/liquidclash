@@ -98,27 +98,26 @@ final class ProxyService {
         }
     }
 
-    /// Test latency for a specific proxy. Uses mihomo name directly.
-    func testLatency(name: String) async -> Int? {
-        guard let api else { return nil }
-        do {
-            let result = try await api.testProxyDelay(name: name)
-            if let delay = result.delay {
-                await MainActor.run {
-                    if let idx = nodes.firstIndex(where: { $0.id == name }) {
-                        nodes[idx].latency = delay
-                    }
-                }
-                return delay
+    private static let testURL = "http://cp.cloudflare.com/generate_204"
+    private static let testTimeout = 3000
+
+    /// Test latency for a specific proxy. Returns delay in ms, 0 = timeout.
+    func testLatency(name: String) async -> Int {
+        guard let api else { return 0 }
+        let result = await api.testProxyDelay(name: name, url: Self.testURL, timeout: Self.testTimeout)
+        let delay = result.delay ?? 0
+        await MainActor.run {
+            if let idx = nodes.firstIndex(where: { $0.id == name }) {
+                nodes[idx].latency = delay
             }
-        } catch { }
-        return nil
+        }
+        return delay
     }
 
-    /// Test latency for all nodes with limited concurrency.
+    /// Test latency for all nodes with limited concurrency (like Verge: max 10).
     func testAllLatency() async {
         guard api != nil else { return }
-        let maxConcurrent = 8
+        let maxConcurrent = 10
         await withTaskGroup(of: Void.self) { group in
             var running = 0
             for node in nodes {

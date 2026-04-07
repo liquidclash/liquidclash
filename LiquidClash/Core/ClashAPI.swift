@@ -109,11 +109,33 @@ actor ClashAPI {
         try await requestVoid("/proxies/\(encodedGroup)", method: "PUT", body: body)
     }
 
-    func testProxyDelay(name: String, url: String = "http://www.gstatic.com/generate_204", timeout: Int = 5000) async throws -> APIDelayResponse {
+    /// Test proxy delay. Like Verge: non-2xx → delay=0 (timeout), never throws for test failures.
+    func testProxyDelay(name: String, url: String = "http://www.gstatic.com/generate_204", timeout: Int = 5000) async -> APIDelayResponse {
         let encodedName = name.addingPercentEncoding(withAllowedCharacters: Self.pathSegmentAllowed) ?? name
         let encodedURL = url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? url
-        let data = try await requestRawData("/proxies/\(encodedName)/delay?url=\(encodedURL)&timeout=\(timeout)")
-        return try JSONDecoder().decode(APIDelayResponse.self, from: data)
+        let path = "/proxies/\(encodedName)/delay?url=\(encodedURL)&timeout=\(timeout)"
+
+        var urlRequest = URLRequest(url: makeURL(path))
+        urlRequest.httpMethod = "GET"
+        urlRequest.timeoutInterval = TimeInterval(timeout / 1000 + 3)
+        if !secret.isEmpty {
+            urlRequest.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+        }
+
+        do {
+            let (data, response) = try await session.data(for: urlRequest)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return APIDelayResponse(delay: 0, message: "No response")
+            }
+            if httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 {
+                return (try? JSONDecoder().decode(APIDelayResponse.self, from: data))
+                    ?? APIDelayResponse(delay: 0, message: nil)
+            }
+            // Non-2xx: mark as timeout (like Verge)
+            return APIDelayResponse(delay: 0, message: "timeout")
+        } catch {
+            return APIDelayResponse(delay: 0, message: error.localizedDescription)
+        }
     }
 
     // MARK: - Health Check

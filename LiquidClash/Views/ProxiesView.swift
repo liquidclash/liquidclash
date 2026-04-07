@@ -218,7 +218,7 @@ struct ProxiesView: View {
                     Text("\(node.latency)ms")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(node.latency < 200 ? Color(hex: "30D158") :
-                                        node.latency < 500 ? Color(hex: "FF9F0A") :
+                                        node.latency < 400 ? Color(hex: "FF9F0A") :
                                         Color(hex: "FF3B30"))
                 }
             }
