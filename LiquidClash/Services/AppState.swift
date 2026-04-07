@@ -783,10 +783,6 @@ final class AppState {
     }
 
     private func fetchNetworkInfo() async {
-        // Wait for proxy to initialize
-        try? await Task.sleep(for: .seconds(2))
-        guard isConnected, !Task.isCancelled else { return }
-
         // Use curl through mihomo proxy to get IP (URLSession proxy config is unreliable)
         let port = config.mixedPort
         var ip = ""
@@ -798,7 +794,7 @@ final class AppState {
         func curlJSON(_ urlString: String) -> [String: Any]? {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            proc.arguments = ["-s", "--max-time", "5", "-x", "http://127.0.0.1:\(port)", urlString]
+            proc.arguments = ["-s", "--max-time", "8", "-x", "http://127.0.0.1:\(port)", urlString]
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = FileHandle.nullDevice
@@ -811,26 +807,34 @@ final class AppState {
             } catch { return nil }
         }
 
-        // Step 1: Get IP + city from ip.sb (no rate limit)
-        if let json = curlJSON("https://api.ip.sb/geoip"),
-           let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
-            ip = fetchedIP
-            city = json["city"] as? String ?? "--"
-            country = json["country_code"] as? String ?? ""
-            asType = json["organization"] as? String ?? "--"
-            print("[LiquidClash]","IP fetch OK via ip.sb: \(ip) \(city), \(country)")
-        } else if let json = curlJSON("https://ipwho.is/"),
-                  let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
-            ip = fetchedIP
-            city = json["city"] as? String ?? "--"
-            country = json["country_code"] as? String ?? ""
-            let conn = json["connection"] as? [String: Any]
-            asType = conn?["org"] as? String ?? "--"
-            print("[LiquidClash]","IP fetch OK via ipwho.is: \(ip) \(city), \(country)")
+        // Retry with increasing delay — providers may need time to load
+        for delay in [5, 8, 12] {
+            try? await Task.sleep(for: .seconds(delay))
+            guard isConnected, !Task.isCancelled else { return }
+
+            if let json = curlJSON("https://ipwho.is/"),
+               let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
+                ip = fetchedIP
+                city = json["city"] as? String ?? "--"
+                country = json["country_code"] as? String ?? ""
+                let conn = json["connection"] as? [String: Any]
+                asType = conn?["org"] as? String ?? "--"
+                print("[LiquidClash] IP fetch OK via ipwho.is: \(ip) \(city), \(country)")
+                break
+            } else if let json = curlJSON("https://api.ip.sb/geoip"),
+                      let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
+                ip = fetchedIP
+                city = json["city"] as? String ?? "--"
+                country = json["country_code"] as? String ?? ""
+                asType = json["organization"] as? String ?? "--"
+                print("[LiquidClash] IP fetch OK via ip.sb: \(ip) \(city), \(country)")
+                break
+            }
+            print("[LiquidClash] IP fetch attempt failed, retrying in \(delay)s...")
         }
 
         guard !ip.isEmpty, isConnected, !Task.isCancelled else {
-            print("[LiquidClash]","Failed to get IP from all sources")
+            print("[LiquidClash] Failed to get IP from all sources")
             return
         }
 
