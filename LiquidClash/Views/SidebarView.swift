@@ -52,12 +52,12 @@ struct SidebarView: View {
         Button {
             selectedPage = page
         } label: {
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
                 Image(systemName: page.icon)
-                    .font(.system(size: 12))
-                    .frame(width: 18, alignment: .center)
+                    .font(.system(size: 15))
+                    .frame(width: 22, alignment: .center)
                 Text(page.displayName)
-                    .font(.system(size: 13, weight: .regular))
+                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
@@ -65,12 +65,13 @@ struct SidebarView: View {
             .foregroundStyle(isSelected ? .white : .primary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
             .background(
                 isSelected
                     ? Color.accentColor
                     : .clear,
-                in: RoundedRectangle(cornerRadius: 6)
+                in: RoundedRectangle(cornerRadius: 8)
             )
         }
         .buttonStyle(.plain)

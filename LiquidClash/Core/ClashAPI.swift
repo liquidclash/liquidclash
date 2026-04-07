@@ -17,8 +17,12 @@ actor ClashAPI {
 
     // MARK: - Generic Request
 
+    private func makeURL(_ path: String) -> URL {
+        URL(string: baseURL.absoluteString + path)!
+    }
+
     private func request<T: Decodable>(_ path: String, method: String = "GET", body: Data? = nil) async throws -> T {
-        var urlRequest = URLRequest(url: baseURL.appendingPathComponent(path))
+        var urlRequest = URLRequest(url: makeURL(path))
         urlRequest.httpMethod = method
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !secret.isEmpty {
@@ -35,7 +39,7 @@ actor ClashAPI {
     }
 
     private func requestVoid(_ path: String, method: String, body: Data? = nil) async throws {
-        var urlRequest = URLRequest(url: baseURL.appendingPathComponent(path))
+        var urlRequest = URLRequest(url: makeURL(path))
         urlRequest.httpMethod = method
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if !secret.isEmpty {
@@ -48,6 +52,21 @@ actor ClashAPI {
               (200...299).contains(httpResponse.statusCode) else {
             throw ClashAPIError.requestFailed(path)
         }
+    }
+
+    /// Raw data request for manual JSON parsing
+    func requestRawData(_ path: String) async throws -> Data {
+        var urlRequest = URLRequest(url: makeURL(path))
+        urlRequest.httpMethod = "GET"
+        if !secret.isEmpty {
+            urlRequest.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await session.data(for: urlRequest)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw ClashAPIError.requestFailed(path)
+        }
+        return data
     }
 
     // MARK: - Version
@@ -77,20 +96,23 @@ actor ClashAPI {
         try await request("/proxies")
     }
 
+    /// Characters safe for a single URL path segment (no `/`, `?`, `#`, etc.)
+    private static let pathSegmentAllowed: CharacterSet = {
+        var cs = CharacterSet.urlPathAllowed
+        cs.remove("/")
+        return cs
+    }()
+
     func selectProxy(group: String, proxy: String) async throws {
         let body = try JSONEncoder().encode(["name": proxy])
-        try await requestVoid("/proxies/\(group.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? group)", method: "PUT", body: body)
+        let encodedGroup = group.addingPercentEncoding(withAllowedCharacters: Self.pathSegmentAllowed) ?? group
+        try await requestVoid("/proxies/\(encodedGroup)", method: "PUT", body: body)
     }
 
     func testProxyDelay(name: String, url: String = "http://www.gstatic.com/generate_204", timeout: Int = 5000) async throws -> APIDelayResponse {
-        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
-        let path = "/proxies/\(encodedName)/delay?url=\(url)&timeout=\(timeout)"
-        var urlRequest = URLRequest(url: URL(string: baseURL.absoluteString + path)!)
-        urlRequest.httpMethod = "GET"
-        if !secret.isEmpty {
-            urlRequest.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
-        }
-        let (data, _) = try await session.data(for: urlRequest)
+        let encodedName = name.addingPercentEncoding(withAllowedCharacters: Self.pathSegmentAllowed) ?? name
+        let encodedURL = url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? url
+        let data = try await requestRawData("/proxies/\(encodedName)/delay?url=\(encodedURL)&timeout=\(timeout)")
         return try JSONDecoder().decode(APIDelayResponse.self, from: data)
     }
 
@@ -133,6 +155,33 @@ actor ClashAPI {
 
     func getRules() async throws -> APIRulesResponse {
         try await request("/rules")
+    }
+
+    func getRuleProviders() async throws -> APIRuleProvidersResponse {
+        try await request("/providers/rules")
+    }
+
+    /// Fetch rules for a specific provider. Returns (type, payload) tuples.
+    /// Mihomo returns rules as either [String] or [{type, payload}] depending on version.
+    func getProviderRules(name: String) async throws -> [(type: String?, payload: String)] {
+        let encoded = name.addingPercentEncoding(withAllowedCharacters: Self.pathSegmentAllowed) ?? name
+        let data = try await requestRawData("/providers/rules/\(encoded)")
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rules = json["rules"] else {
+            return []
+        }
+
+        // rules can be [String] or [[String: Any]]
+        if let stringRules = rules as? [String] {
+            return stringRules.map { (type: nil, payload: $0) }
+        } else if let objectRules = rules as? [[String: Any]] {
+            return objectRules.compactMap { obj in
+                guard let payload = obj["payload"] as? String else { return nil }
+                return (type: obj["type"] as? String, payload: payload)
+            }
+        }
+        return []
     }
 
     // MARK: - Connections
@@ -200,11 +249,27 @@ struct APIRulesResponse: Codable {
     let rules: [APIRule]
 }
 
-struct APIRule: Codable {
+struct APIRule: Codable, Identifiable {
     let type: String
     let payload: String
     let proxy: String
+
+    var id: String { "\(type)|\(payload)|\(proxy)" }
 }
+
+struct APIRuleProvidersResponse: Codable {
+    let providers: [String: APIRuleProvider]
+}
+
+struct APIRuleProvider: Codable {
+    let name: String
+    let type: String
+    let behavior: String
+    let ruleCount: Int
+    let updatedAt: String?
+    let vehicleType: String?
+}
+
 
 struct APIConnectionsResponse: Codable {
     let downloadTotal: Int64

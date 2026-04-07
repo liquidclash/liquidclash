@@ -48,9 +48,6 @@ final class AppState {
     var isLoadingProviderRules = false
     var providerRulesLoaded = false
 
-    /// Actual Selector-type proxy group names from mihomo (for node switching)
-    var selectorGroupNames: [String] = []
-
     /// Total rule count: inline rules + all provider rules
     var totalRuleCount: Int {
         let inline = isConnected && !activeRules.isEmpty
@@ -87,7 +84,6 @@ final class AppState {
     private var clashAPI: ClashAPI?
     private var webSocket: ClashWebSocket?
     private var connectTask: Task<Void, Never>?
-    private var networkInfoTask: Task<Void, Never>?
 
     // MARK: - Init
 

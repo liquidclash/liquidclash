@@ -25,6 +25,7 @@ struct ConnectPill: View {
                     .offset(x: -20)
             }
             .frame(width: 240, height: 72)
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .disabled(isConnecting)
@@ -98,14 +99,14 @@ struct ConnectPill: View {
         if isConnecting { return String(localized: "Connecting…") }
         return isConnected
             ? String(localized: "Connected")
-            : String(localized: "Connect")
+            : String(localized: "Not Connected")
     }
 
     private var statusSubtext: String {
         if isConnecting { return String(localized: "Starting core") }
         return isConnected
-            ? String(localized: "Secure")
-            : String(localized: "Not connected")
+            ? String(localized: "Tap to disconnect")
+            : String(localized: "Tap to connect")
     }
 
     private var statusColor: Color {

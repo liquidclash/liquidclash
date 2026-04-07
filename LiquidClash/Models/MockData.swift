@@ -1,4 +1,4 @@
-import Foundation
+import SwiftUI
 
 // MARK: - ProxyMode
 
@@ -27,11 +27,22 @@ enum AppPage: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .dashboard: return "house"
-        case .proxies:   return "network"
-        case .rules:     return "list.bullet.rectangle"
-        case .activity:  return "clock.arrow.circlepath"
+        case .proxies:   return "globe"
+        case .rules:     return "list.bullet"
+        case .activity:  return "arrow.up.arrow.down"
         case .logs:      return "doc.text"
-        case .settings:  return "gearshape.fill"
+        case .settings:  return "gearshape"
+        }
+    }
+
+    var iconColor: Color {
+        switch self {
+        case .dashboard: return Color(hex: "007AFF")
+        case .proxies:   return Color(hex: "32ADE6")
+        case .rules:     return Color(hex: "5856D6")
+        case .activity:  return Color(hex: "007AFF")
+        case .logs:      return Color(hex: "8E8E93")
+        case .settings:  return Color(hex: "8E8E93")
         }
     }
 }

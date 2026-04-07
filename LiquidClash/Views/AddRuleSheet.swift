@@ -121,6 +121,8 @@ struct AddRuleSheet: View {
             .frame(width: 420)
             .fixedSize(horizontal: false, vertical: true)
             .glassEffect(.regular.tint(.white.opacity(0.15)), in: RoundedRectangle(cornerRadius: 20))
+            .contentShape(Rectangle())
+            .onTapGesture { }
             .shadow(color: .black.opacity(0.12), radius: 30, y: 10)
             .opacity(isPresented ? 1 : 0)
         }

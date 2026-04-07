@@ -87,16 +87,39 @@ actor SubscriptionManager {
         storage.appSupportDirectory.appendingPathComponent("subscriptions.json")
     }
 
+    /// Log file for download debugging — use /tmp for guaranteed accessibility
+    private var downloadLogPath: URL {
+        URL(fileURLWithPath: "/tmp/liquidclash_download.log")
+    }
+
+    /// Write a line to the download log file (and also print to console)
+    private func log(_ message: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        print("[LiquidClash] \(message)")
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: downloadLogPath.path) {
+                if let handle = try? FileHandle(forWritingTo: downloadLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: downloadLogPath)
+            }
+        }
+    }
+
     // MARK: - Fetch & Parse
 
     /// Download subscription content from URL.
-    /// Aggressive multi-strategy fallback:
-    ///   1. System proxy (HTTP/HTTPS/SOCKS from system settings)
-    ///   2. Local mihomo proxy if running
-    ///   3. curl with proxy on common local ports (most reliable proxy detection)
-    ///   4. Direct URLSession
-    ///   5. Direct curl
-    ///   6. python3 urllib (different TLS fingerprint)
+    /// Strategy: direct first (bypasses system proxy to avoid Cloudflare), then proxy fallbacks.
+    ///   1. Direct curl (--noproxy, bypasses system proxy — like Verge's first attempt)
+    ///   2. Direct URLSession (proxy-free session)
+    ///   3. Local mihomo proxy if running
+    ///   4. System proxy
+    ///   5. curl through common local proxy ports
+    ///   6. WKWebView with hybrid UA (browser + clash)
+    ///   7. WKWebView with browser UA (last resort)
     func downloadContent(url: String, proxyPort: Int? = nil) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         guard URL(string: url) != nil else {
             throw SubscriptionError.invalidURL
@@ -119,23 +142,72 @@ actor SubscriptionManager {
             }
         }
 
-        // 1. System proxy
-        if let systemProxy = Self.getSystemProxy() {
-            do {
-                return try await downloadWithCurlSingleProxy(
-                    url: url, proxy: "http://\(systemProxy.host):\(systemProxy.port)")
-            } catch { recordError(error) }
+        log("\n=== Download started for: \(url) ===")
+
+        // 0. clash-fetcher (reqwest+rustls — same TLS fingerprint as Clash Verge)
+        // Bypasses Cloudflare TLS fingerprint detection and system proxy
+        log("Step 0: clash-fetcher (rustls TLS, Verge-compatible)...")
+        do {
+            let result = try await downloadWithClashFetcher(url: url)
+            log("Step 0 SUCCESS: \(result.content.count) chars, has proxies: \(result.content.contains("proxies:")), has rules: \(result.content.contains("rules:")), userInfo: \(result.userInfo != nil ? "yes" : "no")")
+            return result
+        } catch {
+            log("Step 0 failed: \(error)")
+            recordError(error)
         }
 
-        // 2. Local mihomo proxy
+        // 1. Direct curl — truly direct with --noproxy '*', bypasses system proxy
+        log("Step 1: Direct curl (bypassing system proxy)...")
+        do {
+            let result = try await downloadWithCurl(url: url)
+            log("Step 1 SUCCESS: \(result.content.count) chars, has proxies: \(result.content.contains("proxies:")), has rules: \(result.content.contains("rules:")), preview: \(String(result.content.prefix(100)))")
+            return result
+        } catch {
+            log("Step 1 failed: \(error)")
+            recordError(error)
+        }
+
+        // 2. Direct URLSession (proxy-free)
+        log("Step 2: Direct URLSession (proxy-free)...")
+        do {
+            let result = try await downloadWithURLSession(url: url)
+            log("Step 2 SUCCESS: \(result.content.count) chars, has proxies: \(result.content.contains("proxies:")), has rules: \(result.content.contains("rules:")), preview: \(String(result.content.prefix(100)))")
+            return result
+        } catch {
+            log("Step 2 failed: \(error)")
+            recordError(error)
+        }
+
+        // 3. Local mihomo proxy (if our own mihomo is running)
         if let port = proxyPort {
+            log("Step 3: Trying local mihomo on port \(port)")
             do {
-                return try await downloadWithCurlSingleProxy(
+                let result = try await downloadWithCurlSingleProxy(
                     url: url, proxy: "http://127.0.0.1:\(port)")
-            } catch { recordError(error) }
+                log("Step 3 SUCCESS: \(result.content.count) chars, preview: \(String(result.content.prefix(100)))")
+                return result
+            } catch {
+                log("Step 3 failed: \(error)")
+                recordError(error)
+            }
         }
 
-        // 3. curl through common local proxy ports (parallel)
+        // 4. System proxy
+        if let systemProxy = Self.getSystemProxy() {
+            log("Step 4: Trying system proxy \(systemProxy.host):\(systemProxy.port)")
+            do {
+                let result = try await downloadWithCurlSingleProxy(
+                    url: url, proxy: "http://\(systemProxy.host):\(systemProxy.port)")
+                log("Step 4 SUCCESS: \(result.content.count) chars, preview: \(String(result.content.prefix(100)))")
+                return result
+            } catch {
+                log("Step 4 failed: \(error)")
+                recordError(error)
+            }
+        }
+
+        // 5. curl through common local proxy ports (parallel)
+        log("Step 5: Scanning common proxy ports...")
         typealias CurlResult = (content: String, userInfo: SubscriptionUserInfo?)?
         let commonPorts = [7897, 7890, 7891, 1080, 10808, 10809]
             .filter { $0 != proxyPort }
@@ -143,11 +215,11 @@ actor SubscriptionManager {
             for port in commonPorts {
                 group.addTask { [self] in
                     try? await downloadWithCurlSingleProxy(
-                        url: url, proxy: "http://127.0.0.1:\(port)", timeout: 3)
+                        url: url, proxy: "http://127.0.0.1:\(port)", timeout: 15)
                 }
                 group.addTask { [self] in
                     try? await downloadWithCurlSingleProxy(
-                        url: url, proxy: "socks5://127.0.0.1:\(port)", timeout: 3)
+                        url: url, proxy: "socks5://127.0.0.1:\(port)", timeout: 15)
                 }
             }
             for await result in group {
@@ -158,28 +230,38 @@ actor SubscriptionManager {
             }
             return nil
         }
-        if let result = proxyResult { return result }
+        if let result = proxyResult {
+            log("Step 5 SUCCESS: \(result.content.count) chars, has proxies: \(result.content.contains("proxies:")), has rules: \(result.content.contains("rules:")), preview: \(String(result.content.prefix(100)))")
+            return result
+        }
+        log("Step 5 failed: no proxy port responded")
 
-        // 4. Direct curl (with DoH DNS to bypass pollution)
-        do { return try await downloadWithCurl(url: url) }
-        catch { recordError(error) }
-
-        // 5. Direct URLSession
-        do { return try await downloadWithURLSession(url: url) }
-        catch { recordError(error) }
-
-        // If we already know the server blocked us (403/HTML), skip WKWebView and fail fast
-        if let sub = bestError as? SubscriptionError {
-            switch sub {
-            case .serverReturnedHTML, .downloadHTTPError(403):
-                throw SubscriptionError.blockedByServer
-            default: break
+        // 6. WKWebView with hybrid UA — browser-like (passes Cloudflare) + contains "clash" (backend returns YAML)
+        let hybridUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) clash-verge/v2.4.7 Safari/605.1.15"
+        log("Step 6: WKWebView with hybrid UA (browser + clash)...")
+        do {
+            let webResult = try await WebViewDownloader.download(url: url, timeout: 30, userAgent: hybridUA)
+            if !webResult.content.isEmpty {
+                log("Step 6 got content: \(webResult.content.count) chars, has proxies: \(webResult.content.contains("proxies:")), has rules: \(webResult.content.contains("rules:")), preview: \(String(webResult.content.prefix(200)))")
+                return (webResult.content, nil)
             }
+        } catch {
+            log("Step 6 failed: \(error)")
+            recordError(error)
         }
 
-        // 6. WKWebView — last resort (no header capture)
-        do { return (try await WebViewDownloader.download(url: url), nil) }
-        catch { recordError(error) }
+        // 7. WKWebView with pure browser UA — last resort
+        log("Step 7: WKWebView with browser UA (fallback)...")
+        do {
+            let webResult = try await WebViewDownloader.download(url: url, timeout: 30)
+            if !webResult.content.isEmpty {
+                log("Step 7 got content: \(webResult.content.count) chars, preview: \(String(webResult.content.prefix(200)))")
+                return (webResult.content, nil)
+            }
+        } catch {
+            log("Step 7 failed: \(error)")
+            recordError(error)
+        }
 
         throw bestError
     }
@@ -209,20 +291,121 @@ actor SubscriptionManager {
 
     // MARK: - curl with proxy (single attempt)
 
+    /// The User-Agent that subscription backends recognize as a Clash client.
+    /// Must use -A flag in curl (not -H) to properly override default UA.
+    private static let clashUA = "clash-verge/v2.4.7"
+
     /// Try downloading via curl through a specific proxy. Fast timeout for probing.
     private func downloadWithCurlSingleProxy(url: String, proxy: String, timeout: Int = 10) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         let args = ["-sSL", "--compressed", "--max-time", "\(timeout)", "--proxy", proxy,
-                    "-H", "User-Agent: clash-verge/v2.4.7",
+                    "-A", Self.clashUA,
                     url]
         return try await runCurl(args: args)
     }
 
-    /// Direct curl download. Tries DoH first, then plain curl.
+    /// curl with extracted Cloudflare cookies + clash UA to get YAML format
+    private func downloadWithCurlAndCookies(url: String, cookies: String) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
+        return try await runCurl(args: [
+            "-sSL", "--compressed", "--max-time", "15",
+            "-A", Self.clashUA,
+            "-b", cookies,
+            url
+        ])
+    }
+
+    /// Direct curl download — truly direct, bypasses system proxy with --noproxy '*'
+    /// Download using clash-fetcher binary (reqwest+rustls, same TLS fingerprint as Clash Verge)
+    /// Bypasses Cloudflare TLS-based blocking. Outputs body to stdout, headers to stderr.
+    private func downloadWithClashFetcher(url: String) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
+        // Find clash-fetcher binary: bundled in app > app support > /usr/local/bin
+        let binaryPath: String? = {
+            if let bundled = Bundle.main.url(forResource: "clash-fetcher", withExtension: nil) {
+                return bundled.path
+            }
+            let appSupport = ConfigStorage.shared.appSupportDirectory
+                .appendingPathComponent("bin/clash-fetcher")
+            if FileManager.default.fileExists(atPath: appSupport.path) {
+                return appSupport.path
+            }
+            return nil
+        }()
+
+        guard let binary = binaryPath else {
+            throw SubscriptionError.downloadFailed
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: binary)
+                proc.arguments = [url]
+
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                proc.standardOutput = outPipe
+                proc.standardError = errPipe
+
+                do {
+                    try proc.run()
+                } catch {
+                    continuation.resume(throwing: SubscriptionError.downloadFailed)
+                    return
+                }
+
+                // Timeout: kill process after 30 seconds
+                let timer = DispatchSource.makeTimerSource(queue: .global())
+                timer.schedule(deadline: .now() + 30)
+                timer.setEventHandler { if proc.isRunning { proc.terminate() } }
+                timer.resume()
+                proc.waitUntilExit()
+                timer.cancel()
+
+                guard proc.terminationStatus == 0 else {
+                    continuation.resume(throwing: SubscriptionError.downloadFailed)
+                    return
+                }
+
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+
+                guard let content = String(data: outData, encoding: .utf8),
+                      !content.isEmpty else {
+                    continuation.resume(throwing: SubscriptionError.invalidContent)
+                    return
+                }
+
+                // Check for HTML error pages
+                if content.contains("<!doctype html>") || content.contains("<html") {
+                    if content.contains("403") || content.contains("访问受限") {
+                        continuation.resume(throwing: SubscriptionError.blockedByServer)
+                    } else {
+                        continuation.resume(throwing: SubscriptionError.serverReturnedHTML(String(content.prefix(200))))
+                    }
+                    return
+                }
+
+                // Parse subscription-userinfo from stderr
+                var userInfo: SubscriptionUserInfo?
+                if let errStr = String(data: errData, encoding: .utf8) {
+                    for line in errStr.split(separator: "\n") {
+                        if line.lowercased().hasPrefix("subscription-userinfo:") {
+                            let value = String(line.dropFirst("subscription-userinfo:".count)).trimmingCharacters(in: .whitespaces)
+                            userInfo = SubscriptionUserInfo.parse(value)
+                        }
+                    }
+                }
+
+                continuation.resume(returning: (content, userInfo))
+            }
+        }
+    }
+
     private func downloadWithCurl(url: String) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         do {
             return try await runCurl(args: [
                 "-sSL", "--compressed", "--max-time", "10",
-                "-H", "User-Agent: clash-verge/v2.4.7",
+                "--noproxy", "*",
+                "-A", Self.clashUA,
                 "--doh-url", "https://1.1.1.1/dns-query",
                 url
             ])
@@ -230,18 +413,24 @@ actor SubscriptionManager {
 
         return try await runCurl(args: [
             "-sSL", "--compressed", "--max-time", "10",
-            "-H", "User-Agent: clash-verge/v2.4.7",
+            "--noproxy", "*",
+            "-A", Self.clashUA,
             url
         ])
     }
 
-    /// Native URLSession direct download
+    /// Native URLSession direct download — uses proxy-free configuration to bypass system proxy
     private func downloadWithURLSession(url: String) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
         var request = URLRequest(url: URL(string: url)!)
         request.timeoutInterval = 15
         request.setValue("clash-verge/v2.4.7", forHTTPHeaderField: "User-Agent")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        // Create a proxy-free session — URLSession.shared honors system proxy settings,
+        // which would route traffic through Verge's proxy and trigger Cloudflare
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [:]
+        let session = URLSession(configuration: config)
+        let (data, response) = try await session.data(for: request)
 
         if let httpResponse = response as? HTTPURLResponse,
            !(200...299).contains(httpResponse.statusCode) {
@@ -268,7 +457,7 @@ actor SubscriptionManager {
     /// Run curl with given arguments and return output as String + optional subscription user info.
     /// Validates that the response is not an HTML error page.
     private func runCurl(args: [String]) async throws -> (content: String, userInfo: SubscriptionUserInfo?) {
-        try await withCheckedThrowingContinuation { continuation in
+        return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let headerFile = URL(fileURLWithPath: NSTemporaryDirectory())
                     .appendingPathComponent(UUID().uuidString + ".headers")
@@ -336,6 +525,23 @@ actor SubscriptionManager {
 
         let resolved = resolveContent(content)
 
+        // If content is not Clash YAML, retry with flag=clash to request YAML format
+        if !resolved.contains("proxies:") {
+            if let clashURL = Self.appendClashFlag(url) {
+                log("Content is not YAML format, retrying with flag=clash: \(clashURL)")
+                if let (retryContent, retryUserInfo) = try? await downloadContent(url: clashURL, proxyPort: proxyPort) {
+                    let retryResolved = resolveContent(retryContent)
+                    if retryResolved.contains("proxies:") {
+                        log("Retry with flag=clash succeeded, got YAML format")
+                        let nodes = ConfigParser.parseSubscription(retryResolved)
+                        if !nodes.isEmpty {
+                            return (nodes, retryResolved, retryUserInfo ?? userInfo)
+                        }
+                    }
+                }
+            }
+        }
+
         let nodes = ConfigParser.parseSubscription(resolved)
         guard !nodes.isEmpty else {
             let preview = String(resolved.prefix(200))
@@ -349,7 +555,34 @@ actor SubscriptionManager {
             throw SubscriptionError.parseFailedWithPreview(preview)
         }
 
-        return (nodes, resolved, userInfo)
+        // If the original content was URI format (not YAML), generate proper Clash YAML
+        // from the parsed nodes. This is needed when the subscription backend uses TLS
+        // fingerprinting and only returns YAML for specific TLS libraries (e.g. rustls).
+        let rawContent: String
+        if resolved.contains("proxies:") {
+            rawContent = resolved
+        } else {
+            log("Content is URI format, generating Clash YAML locally from \(nodes.count) nodes")
+            rawContent = ConfigParser.generateClashYAML(from: nodes)
+        }
+
+        return (nodes, rawContent, userInfo)
+    }
+
+    /// Append flag=clash to URL to request Clash YAML format from subscription backend.
+    /// Returns nil if the URL already has a Clash format parameter.
+    private static func appendClashFlag(_ urlString: String) -> String? {
+        guard var components = URLComponents(string: urlString) else { return nil }
+        let existingNames = Set((components.queryItems ?? []).map { $0.name.lowercased() })
+        // Don't add if URL already specifies output format
+        if existingNames.contains("flag") || existingNames.contains("target") ||
+           existingNames.contains("type") || existingNames.contains("client") {
+            return nil
+        }
+        var items = components.queryItems ?? []
+        items.append(URLQueryItem(name: "flag", value: "clash"))
+        components.queryItems = items
+        return components.string
     }
 
     /// Resolve content that may be base64-encoded
@@ -372,8 +605,90 @@ actor SubscriptionManager {
 
     /// Fetch and organize nodes into regions
     func fetchAndOrganize(url: String, proxyPort: Int? = nil) async throws -> ([ProxyRegion], String, SubscriptionUserInfo?) {
-        let (nodes, rawContent, userInfo) = try await fetchSubscription(url: url, proxyPort: proxyPort)
-        return (organizeIntoRegions(nodes), rawContent, userInfo)
+        let (nodes, rawContent, headerInfo) = try await fetchSubscription(url: url, proxyPort: proxyPort)
+        let (realNodes, nodeInfo) = Self.extractInfoNodes(nodes)
+        // Prefer HTTP header info, fallback to node-name-based info
+        let userInfo = headerInfo ?? nodeInfo
+        return (organizeIntoRegions(realNodes), rawContent, userInfo)
+    }
+
+    // MARK: - Info Node Detection
+
+    /// Extract traffic/expiry info from special "info nodes" and filter them out
+    static func extractInfoNodes(_ nodes: [ProxyNode]) -> (realNodes: [ProxyNode], info: SubscriptionUserInfo?) {
+        var info = SubscriptionUserInfo()
+        var foundInfo = false
+        var realNodes: [ProxyNode] = []
+
+        let infoPatterns: [(String) -> Bool] = [
+            { $0.lowercased().contains("traffic") || $0.contains("流量") },
+            { $0.lowercased().contains("expire") || $0.contains("到期") || $0.contains("过期") },
+            { $0.contains("套餐") || $0.contains("剩余") || $0.contains("重置") },
+            { $0.lowercased().contains("subscription") && !$0.lowercased().contains("subscribe") },
+        ]
+
+        for node in nodes {
+            let isInfoNode = infoPatterns.contains { $0(node.name) }
+            if isInfoNode {
+                // Try to parse traffic: "142.3 GB / 600 GB" or "Traffic: 142.3 GB / 600 GB"
+                if let (used, total) = parseTrafficFromName(node.name) {
+                    info.download = used
+                    info.total = total
+                    foundInfo = true
+                }
+                // Try to parse expiry: "2026-07-09" or "Expire: 2026-07-09"
+                if let expire = parseExpireFromName(node.name) {
+                    info.expire = expire
+                    foundInfo = true
+                }
+            } else {
+                realNodes.append(node)
+            }
+        }
+
+        return (realNodes, foundInfo ? info : nil)
+    }
+
+    /// Parse traffic from node name like "Traffic: 142.3 GB / 600 GB"
+    private static func parseTrafficFromName(_ name: String) -> (used: Int64, total: Int64)? {
+        // Match patterns like "142.3 GB / 600 GB" or "142.3GB/600GB"
+        let pattern = #"(\d+(?:\.\d+)?)\s*(GB|MB|TB|KB)\s*/\s*(\d+(?:\.\d+)?)\s*(GB|MB|TB|KB)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+              let match = regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
+              match.numberOfRanges >= 5 else { return nil }
+
+        func extractBytes(_ valueRange: NSRange, _ unitRange: NSRange) -> Int64? {
+            guard let vr = Range(valueRange, in: name), let ur = Range(unitRange, in: name),
+                  let value = Double(name[vr]) else { return nil }
+            let unit = name[ur].uppercased()
+            let multiplier: Double = switch unit {
+                case "TB": 1_099_511_627_776
+                case "GB": 1_073_741_824
+                case "MB": 1_048_576
+                case "KB": 1024
+                default: 1
+            }
+            return Int64(value * multiplier)
+        }
+
+        guard let used = extractBytes(match.range(at: 1), match.range(at: 2)),
+              let total = extractBytes(match.range(at: 3), match.range(at: 4)) else { return nil }
+        return (used, total)
+    }
+
+    /// Parse expiry from node name like "Expire: 2026-07-09"
+    private static func parseExpireFromName(_ name: String) -> TimeInterval? {
+        let pattern = #"(\d{4}[-/]\d{1,2}[-/]\d{1,2})"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
+              let range = Range(match.range(at: 1), in: name) else { return nil }
+
+        let dateStr = String(name[range]).replacingOccurrences(of: "/", with: "-")
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        guard let date = formatter.date(from: dateStr) else { return nil }
+        return date.timeIntervalSince1970
     }
 
     // MARK: - Organize Nodes
@@ -383,7 +698,7 @@ actor SubscriptionManager {
         var regionMap: [String: (name: String, nodes: [ProxyNode])] = [:]
 
         let regionMapping: [(flags: Set<String>, id: String, name: String)] = [
-            (["🇯🇵", "🇸🇬", "🇭🇰", "🇹🇼", "🇰🇷", "🇮🇳", "🇦🇺"], "ap", "ASIA PACIFIC"),
+            (["🇯🇵", "🇸🇬", "🇭🇰", "🇨🇳", "🇰🇷", "🇮🇳", "🇦🇺"], "ap", "ASIA PACIFIC"),
             (["🇺🇸", "🇨🇦", "🇧🇷"], "am", "AMERICAS"),
             (["🇬🇧", "🇩🇪", "🇫🇷", "🇳🇱", "🇷🇺"], "eu", "EUROPE"),
         ]
@@ -423,12 +738,15 @@ actor SubscriptionManager {
 
         for i in updatedSubs.indices where updatedSubs[i].isEnabled {
             do {
-                let (nodes, rawContent, userInfo) = try await fetchSubscription(url: updatedSubs[i].url, proxyPort: proxyPort)
-                allNodes.append(contentsOf: nodes)
+                let (nodes, rawContent, headerInfo) = try await fetchSubscription(url: updatedSubs[i].url, proxyPort: proxyPort)
+                let (realNodes, nodeInfo) = Self.extractInfoNodes(nodes)
+                allNodes.append(contentsOf: realNodes)
                 allRawContents.append(rawContent)
                 updatedSubs[i].lastUpdate = Date()
-                updatedSubs[i].nodeCount = nodes.count
-                if let info = userInfo {
+                updatedSubs[i].nodeCount = realNodes.count
+                // Prefer HTTP header info, fallback to node-name-based info
+                let info = headerInfo ?? nodeInfo
+                if let info {
                     updatedSubs[i].upload = info.upload
                     updatedSubs[i].download = info.download
                     updatedSubs[i].total = info.total
