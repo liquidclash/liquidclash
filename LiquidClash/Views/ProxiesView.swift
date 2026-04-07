@@ -30,12 +30,17 @@ struct ProxiesView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    // Proxy Groups from mihomo API
-                    if !appState.proxyService.groups.isEmpty {
-                        proxyGroupsSection
+                    // Service groups (YouTube, Netflix, etc.)
+                    if !serviceGroups.isEmpty {
+                        groupTagsSection("APP SERVICES", serviceGroups)
                     }
 
-                    // Individual nodes from mihomo API, organized by region
+                    // Region groups (HK, JP, SG, etc.)
+                    if !regionGroups.isEmpty {
+                        groupTagsSection("REGIONS", regionGroups)
+                    }
+
+                    // Individual nodes from mihomo API
                     if !appState.proxyService.nodes.isEmpty {
                         nodesSection
                     }
@@ -93,30 +98,44 @@ struct ProxiesView: View {
         }
     }
 
-    // MARK: - Proxy Groups (from mihomo API)
+    // MARK: - Proxy Groups (from mihomo API, split by service/region)
+
+    private let regionGroupNames: Set<String> = [
+        "HK", "JP", "SG", "TW", "US", "UK", "KR", "DE", "FR", "CA", "AU", "IN", "RU", "BR", "NL",
+        "Auto Select", "PROXY", "Proxies", "Fallback", "GLOBAL",
+    ]
 
     private let serviceIcons: [String: String] = [
         "YouTube": "play.rectangle.fill", "Netflix": "film.fill", "Disney": "sparkles",
         "Spotify": "music.note", "Telegram": "paperplane.fill", "Google": "magnifyingglass",
         "OpenAI": "brain.head.profile.fill", "Apple": "apple.logo", "Microsoft": "desktopcomputer",
-        "Steam": "gamecontroller.fill",
+        "Steam": "gamecontroller.fill", "HK": "globe.asia.australia.fill", "JP": "globe.asia.australia.fill",
+        "SG": "globe.asia.australia.fill", "TW": "globe.asia.australia.fill", "US": "globe.americas.fill",
     ]
 
-    private var proxyGroupsSection: some View {
+    private var serviceGroups: [ProxyService.MihomoGroup] {
+        appState.proxyService.groups.filter { !regionGroupNames.contains($0.name) }
+    }
+
+    private var regionGroups: [ProxyService.MihomoGroup] {
+        appState.proxyService.groups.filter {
+            regionGroupNames.contains($0.name) && $0.name != "GLOBAL"
+        }
+    }
+
+    private func groupTagsSection(_ title: String, _ groups: [ProxyService.MihomoGroup]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("PROXY GROUPS")
+            Text(title)
                 .font(.system(size: 11, weight: .semibold))
                 .kerning(1.0)
                 .foregroundStyle(.secondary)
 
             let columns = [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
             LazyVGrid(columns: columns, spacing: 8) {
-                ForEach(appState.proxyService.groups) { group in
+                ForEach(groups) { group in
                     let icon = serviceIcons[group.name] ?? (group.isSelector ? "square.grid.2x2.fill" : "bolt.fill")
                     let target = group.now ?? (group.isSelector ? "Select" : "Auto")
                     Button {
-                        // For Selector groups, this could open a sub-menu
-                        // For now, just select the group's current node in parent selectors
                         if let now = group.now {
                             withAnimation(.easeInOut(duration: 0.2)) {
                                 appState.selectNode(now)
@@ -158,32 +177,19 @@ struct ProxiesView: View {
         }
     }
 
-    // MARK: - Nodes Section (from mihomo API, organized by flag)
+    // MARK: - Nodes Section (flat list from mihomo API)
 
     private var nodesSection: some View {
-        let grouped = Dictionary(grouping: appState.proxyService.nodes, by: \.flag)
-        let sortedFlags = grouped.keys.sorted()
-
-        return VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("NODES")
                 .font(.system(size: 11, weight: .semibold))
                 .kerning(1.0)
                 .foregroundStyle(.secondary)
 
             let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
-            ForEach(sortedFlags, id: \.self) { flag in
-                if let nodes = grouped[flag] {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("\(flag) \(nodes.count) nodes")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.secondary)
-
-                        LazyVGrid(columns: columns, spacing: 12) {
-                            ForEach(nodes) { node in
-                                nodeCard(node)
-                            }
-                        }
-                    }
+            LazyVGrid(columns: columns, spacing: 12) {
+                ForEach(appState.proxyService.nodes) { node in
+                    nodeCard(node)
                 }
             }
         }

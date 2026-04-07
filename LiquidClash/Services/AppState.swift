@@ -798,7 +798,7 @@ final class AppState {
         func curlJSON(_ urlString: String) -> [String: Any]? {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            proc.arguments = ["-s", "--max-time", "5", "--noproxy", "*", "--proxy", "http://127.0.0.1:\(port)", urlString]
+            proc.arguments = ["-s", "--max-time", "5", "-x", "http://127.0.0.1:\(port)", urlString]
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = FileHandle.nullDevice
