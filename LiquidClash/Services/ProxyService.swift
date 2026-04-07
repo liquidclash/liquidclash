@@ -98,8 +98,8 @@ final class ProxyService {
         }
     }
 
-    private static let testURL = "http://cp.cloudflare.com/generate_204"
-    private static let testTimeout = 3000
+    private static let testURL = "http://www.gstatic.com/generate_204"
+    private static let testTimeout = 5000
 
     /// Test latency for a specific proxy. Returns delay in ms, 0 = timeout.
     func testLatency(name: String) async -> Int {

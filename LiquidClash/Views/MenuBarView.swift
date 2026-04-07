@@ -186,33 +186,25 @@ private struct NodeSelectorMenu: View {
 
     var body: some View {
         Menu {
-            // Show Selector groups and their members
-            ForEach(appState.proxyService.groups.filter(\.isSelector)) { group in
+            // Only show groups that have members, skip GLOBAL in rule mode (like Verge)
+            ForEach(appState.proxyService.groups.filter { group in
+                guard !group.all.isEmpty else { return false }
+                if appState.proxyMode.rawValue.lowercased() != "global" {
+                    return group.name != "GLOBAL"
+                } else {
+                    return group.name == "GLOBAL"
+                }
+            }) { group in
                 Section(group.name) {
                     ForEach(group.all, id: \.self) { member in
                         Button {
-                            appState.selectNode(member)
+                            Task {
+                                await appState.proxyService.selectProxy(group: group.name, proxy: member)
+                            }
                         } label: {
                             HStack {
                                 Text(member)
                                 if member == group.now {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Individual nodes
-            if !appState.proxyService.nodes.isEmpty {
-                Section("Nodes") {
-                    ForEach(appState.proxyService.nodes) { node in
-                        Button {
-                            appState.selectNode(node.name)
-                        } label: {
-                            HStack {
-                                Text("\(node.flag) \(node.name)")
-                                if node.name == appState.proxyService.activeNodeName {
                                     Image(systemName: "checkmark")
                                 }
                             }
