@@ -135,8 +135,7 @@ struct ProxiesView: View {
                 ForEach(groups) { group in
                     let icon = serviceIcons[group.name] ?? (group.isSelector ? "square.grid.2x2.fill" : "bolt.fill")
                     let target = group.now ?? (group.isSelector ? "Select" : "Auto")
-                    let isActive = group.name == appState.proxyService.activeGroupName
-                                || group.name == appState.proxyService.activeNodeName
+                    let isActive = group.name == appState.proxyService.activeNodeName
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             appState.selectNode(group.name)
