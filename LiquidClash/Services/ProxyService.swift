@@ -102,13 +102,17 @@ final class ProxyService {
     private static let testTimeout = 5000
 
     /// Test latency for a specific proxy. Returns delay in ms, 0 = timeout.
+    /// Like Verge: keep historical delay if current test times out.
     func testLatency(name: String, url: String = defaultTestURL) async -> Int {
         guard let api else { return 0 }
         let result = await api.testProxyDelay(name: name, url: url, timeout: Self.testTimeout)
         let delay = result.delay ?? 0
         await MainActor.run {
             if let idx = nodes.firstIndex(where: { $0.id == name }) {
-                nodes[idx].latency = delay
+                if delay > 0 {
+                    nodes[idx].latency = delay
+                }
+                // delay == 0 (timeout): keep existing historical value
             }
         }
         return delay
