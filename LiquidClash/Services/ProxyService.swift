@@ -115,14 +115,21 @@ final class ProxyService {
         return nil
     }
 
-    /// Test latency for all nodes.
+    /// Test latency for all nodes with limited concurrency.
     func testAllLatency() async {
         guard api != nil else { return }
+        let maxConcurrent = 8
         await withTaskGroup(of: Void.self) { group in
+            var running = 0
             for node in nodes {
+                if running >= maxConcurrent {
+                    await group.next()
+                    running -= 1
+                }
                 group.addTask {
                     _ = await self.testLatency(name: node.name)
                 }
+                running += 1
             }
         }
     }
