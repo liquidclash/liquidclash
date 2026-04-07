@@ -98,13 +98,13 @@ final class ProxyService {
         }
     }
 
-    private static let testURL = "http://www.gstatic.com/generate_204"
+    private static let defaultTestURL = "http://www.gstatic.com/generate_204"
     private static let testTimeout = 5000
 
     /// Test latency for a specific proxy. Returns delay in ms, 0 = timeout.
-    func testLatency(name: String) async -> Int {
+    func testLatency(name: String, url: String = defaultTestURL) async -> Int {
         guard let api else { return 0 }
-        let result = await api.testProxyDelay(name: name, url: Self.testURL, timeout: Self.testTimeout)
+        let result = await api.testProxyDelay(name: name, url: url, timeout: Self.testTimeout)
         let delay = result.delay ?? 0
         await MainActor.run {
             if let idx = nodes.firstIndex(where: { $0.id == name }) {
@@ -114,19 +114,24 @@ final class ProxyService {
         return delay
     }
 
-    /// Test latency for all nodes with limited concurrency (like Verge: max 10).
+    /// Test latency for all nodes. Max 10 concurrent with random stagger (like Verge).
     func testAllLatency() async {
         guard api != nil else { return }
         let maxConcurrent = 10
         await withTaskGroup(of: Void.self) { group in
             var running = 0
-            for node in nodes {
+            for (i, node) in nodes.enumerated() {
                 if running >= maxConcurrent {
                     await group.next()
                     running -= 1
                 }
+                let name = node.name
                 group.addTask {
-                    _ = await self.testLatency(name: node.name)
+                    // Random stagger like Verge (0-200ms)
+                    if i > 0 {
+                        try? await Task.sleep(nanoseconds: UInt64.random(in: 0...200_000_000))
+                    }
+                    _ = await self.testLatency(name: name)
                 }
                 running += 1
             }

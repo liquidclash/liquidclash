@@ -186,28 +186,36 @@ private struct NodeSelectorMenu: View {
 
     var body: some View {
         Menu {
-            // Only show groups that have members, skip GLOBAL in rule mode (like Verge)
-            ForEach(appState.proxyService.groups.filter { group in
-                guard !group.all.isEmpty else { return false }
-                if appState.proxyMode.rawValue.lowercased() != "global" {
-                    return group.name != "GLOBAL"
-                } else {
-                    return group.name == "GLOBAL"
+            // Proxy groups — each group as a selectable item (like Verge tray)
+            let groups = appState.proxyService.groups.filter { g in
+                !g.all.isEmpty && g.name != "GLOBAL"
+            }
+            if !groups.isEmpty {
+                ForEach(groups) { group in
+                    Button {
+                        appState.selectNode(group.name)
+                    } label: {
+                        HStack {
+                            Text("\(group.name)  →  \(group.now ?? "-")")
+                            if group.name == appState.proxyService.activeNodeName {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
                 }
-            }) { group in
-                Section(group.name) {
-                    ForEach(group.all, id: \.self) { member in
-                        Button {
-                            Task {
-                                await appState.proxyService.selectProxy(group: group.name, proxy: member)
-                            }
-                        } label: {
-                            HStack {
-                                Text(member)
-                                if member == group.now {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
+            }
+
+            Divider()
+
+            // Individual nodes
+            ForEach(appState.proxyService.nodes) { node in
+                Button {
+                    appState.selectNode(node.name)
+                } label: {
+                    HStack {
+                        Text("\(node.flag) \(ConfigParser.extractFlag(from: node.name).cleanName)")
+                        if node.name == appState.proxyService.activeNodeName {
+                            Image(systemName: "checkmark")
                         }
                     }
                 }
