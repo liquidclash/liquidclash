@@ -138,10 +138,8 @@ struct ProxiesView: View {
                     let isActive = group.name == appState.proxyService.activeGroupName
                                 || group.name == appState.proxyService.activeNodeName
                     Button {
-                        if let now = group.now {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                appState.selectNode(now)
-                            }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            appState.selectNode(group.name)
                         }
                     } label: {
                         HStack(spacing: 6) {

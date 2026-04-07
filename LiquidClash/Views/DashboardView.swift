@@ -75,7 +75,7 @@ struct DashboardView: View {
     private var networkInfoBar: some View {
         HStack(spacing: 24) {
             infoItem(label: "IP", value: appState.networkInfo.ip)
-            infoItem(label: "AS Type", value: appState.networkInfo.asType)
+            infoItem(label: "ISP", value: appState.networkInfo.asType)
             infoItem(label: "City", value: appState.networkInfo.city)
 
             Spacer()
