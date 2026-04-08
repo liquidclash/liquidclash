@@ -342,6 +342,7 @@ final class AppState {
                 proxyRegions[i].nodes[j] = node
                 if selectedNodeId == node.id { activeNode = node }
                 saveState()
+                if isConnected { reloadCoreConfig() }
                 return
             }
         }
@@ -357,6 +358,7 @@ final class AppState {
             activeNode = proxyRegions.first?.nodes.first
         }
         saveState()
+        if isConnected { reloadCoreConfig() }
     }
 
     func clearAllNodes() {

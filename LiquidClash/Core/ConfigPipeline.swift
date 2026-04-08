@@ -90,9 +90,12 @@ struct ConfigPipeline {
 
         // Inject custom nodes into proxies section
         if !customNodes.isEmpty {
+            let insertion = customNodes.map { nodeToYAML($0) }.joined()
             if let proxiesIdx = lines.firstIndex(where: { $0.hasPrefix("proxies:") }) {
-                let insertion = customNodes.map { nodeToYAML($0) }.joined()
                 lines.insert(insertion, at: proxiesIdx + 1)
+            } else {
+                lines.append("proxies:")
+                lines.append(insertion)
             }
         }
 

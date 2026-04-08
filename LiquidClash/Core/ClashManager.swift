@@ -148,7 +148,7 @@ final class ClashManager {
         // Write config file with TUN enabled overlay
         var tunOverlay = overlay
         tunOverlay.tunEnabled = true
-        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: tunOverlay)
+        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: tunOverlay, customNodes: customNodes)
 
         // Launch with admin privileges via osascript
         let binaryPath = binary.path.replacingOccurrences(of: "'", with: "'\\''")
