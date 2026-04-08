@@ -1,0 +1,24 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Design mockups (temporary)
+LiquidClash/design/
+
+# Claude / AI tooling
+.claude/
+.spec-workflow/
+
+# Docs (plans, specs)
+docs/
+
+# Rust build artifacts
+Tools/clash-fetcher/target/
