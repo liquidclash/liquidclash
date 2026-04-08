@@ -78,10 +78,11 @@ final class ClashManager {
     // MARK: - Write Runtime Config
 
     /// Write runtime config using ConfigPipeline
-    func writeRuntimeConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
+    func writeRuntimeConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
         try ConfigPipeline.generateRuntime(
             subscriptionYAML: subscriptionYAML,
             overlay: overlay,
+            customNodes: customNodes,
             outputPath: configFilePath
         )
     }
@@ -89,7 +90,7 @@ final class ClashManager {
     // MARK: - Start
 
     /// Start mihomo with subscription YAML + overlay
-    func start(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
+    func start(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
         guard !isRunning else { return }
 
         guard let binary = findBinary() else {
@@ -97,7 +98,7 @@ final class ClashManager {
         }
 
         ensureGeodataFiles()
-        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay)
+        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
 
         let proc = Process()
         proc.executableURL = binary
@@ -135,7 +136,7 @@ final class ClashManager {
     // MARK: - Start with Privileges (for TUN mode)
 
     /// Start mihomo with root privileges via osascript (required for TUN)
-    func startWithPrivileges(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
+    func startWithPrivileges(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
         guard !isRunning else { return }
 
         guard let binary = findBinary() else {
@@ -223,8 +224,8 @@ final class ClashManager {
 
     /// Rewrite config.yaml on disk without restarting the process.
     /// Used together with ClashAPI.reloadConfig() for hot reloading.
-    func rewriteConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig) throws {
-        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay)
+    func rewriteConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
+        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
     }
 
 }

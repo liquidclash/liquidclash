@@ -98,6 +98,10 @@ final class AppState {
         clashManager.findBinary() != nil
     }
 
+    var customNodes: [ProxyNode] {
+        proxyRegions.filter { $0.id == "custom" }.flatMap(\.nodes)
+    }
+
     // MARK: - Connection Control
 
     func connect() {
@@ -131,9 +135,9 @@ final class AppState {
 
         do {
             if config.tunEnabled {
-                try clashManager.startWithPrivileges(subscriptionYAML: subscriptionYAML, overlay: overlay)
+                try clashManager.startWithPrivileges(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
             } else {
-                try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay)
+                try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
             }
         } catch {
             isConnecting = false
@@ -317,7 +321,6 @@ final class AppState {
     // MARK: - Node Management
 
     func addNode(_ node: ProxyNode) {
-        // Place in matching region or create "CUSTOM" region
         let flag = node.flag.isEmpty ? "🌐" : node.flag
         var nodeWithFlag = node
         nodeWithFlag.flag = flag
@@ -330,6 +333,7 @@ final class AppState {
             proxyRegions.append(region)
         }
         saveState()
+        if isConnected { reloadCoreConfig() }
     }
 
     func updateNode(_ node: ProxyNode) {
@@ -398,7 +402,7 @@ final class AppState {
         )
 
         do {
-            try clashManager.rewriteConfig(subscriptionYAML: subscriptionYAML, overlay: overlay)
+            try clashManager.rewriteConfig(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
         } catch {
             print("Warning: Failed to rewrite config: \(error)")
             return

@@ -41,8 +41,8 @@ struct ConfigPipeline {
       auto-detect-interface: true
     """
 
-    /// Generate runtime.yaml from subscription YAML + overlay config.
-    static func generateRuntime(subscriptionYAML: String, overlay: OverlayConfig, outputPath: URL) throws {
+    /// Generate runtime.yaml from subscription YAML + overlay config + optional custom nodes.
+    static func generateRuntime(subscriptionYAML: String, overlay: OverlayConfig, customNodes: [ProxyNode] = [], outputPath: URL) throws {
         var lines = subscriptionYAML.components(separatedBy: .newlines)
 
         // Fields we ALWAYS override (control fields only)
@@ -88,7 +88,40 @@ struct ConfigPipeline {
             header += "\n" + defaultTUN + "\n"
         }
 
+        // Inject custom nodes into proxies section
+        if !customNodes.isEmpty {
+            if let proxiesIdx = lines.firstIndex(where: { $0.hasPrefix("proxies:") }) {
+                let insertion = customNodes.map { nodeToYAML($0) }.joined()
+                lines.insert(insertion, at: proxiesIdx + 1)
+            }
+        }
+
         let finalYAML = header + "\n" + lines.joined(separator: "\n")
         try finalYAML.write(to: outputPath, atomically: true, encoding: .utf8)
+    }
+
+    /// Convert a ProxyNode to mihomo YAML proxy entry.
+    private static func nodeToYAML(_ node: ProxyNode) -> String {
+        var y = "  - name: \"\(node.name)\"\n"
+        y += "    type: \(node.type.rawValue)\n"
+        y += "    server: \(node.server)\n"
+        y += "    port: \(node.port)\n"
+        if let pw = node.password, !pw.isEmpty { y += "    password: \"\(pw)\"\n" }
+        if let uuid = node.uuid, !uuid.isEmpty { y += "    uuid: \(uuid)\n" }
+        if let cipher = node.cipher, !cipher.isEmpty { y += "    cipher: \(cipher)\n" }
+        if let aid = node.alterId { y += "    alterId: \(aid)\n" }
+        y += "    udp: \(node.udp)\n"
+        if let sni = node.sni, !sni.isEmpty { y += "    sni: \(sni)\n" }
+        if let scv = node.skipCertVerify, scv { y += "    skip-cert-verify: true\n" }
+        if let tls = node.tls, tls { y += "    tls: true\n" }
+        if let net = node.network, !net.isEmpty {
+            y += "    network: \(net)\n"
+            if net == "ws" {
+                y += "    ws-opts:\n"
+                if let path = node.wsPath, !path.isEmpty { y += "      path: \"\(path)\"\n" }
+                if let host = node.wsHost, !host.isEmpty { y += "      headers:\n        Host: \(host)\n" }
+            }
+        }
+        return y
     }
 }
