@@ -95,18 +95,14 @@ struct ConnectPill: View {
 
     // MARK: - Text Block
 
-    private var statusText: String {
-        if isConnecting { return String(localized: "Connecting…") }
-        return isConnected
-            ? String(localized: "Connected")
-            : String(localized: "Not Connected")
+    private var statusText: LocalizedStringKey {
+        if isConnecting { return "Connecting…" }
+        return isConnected ? "Connected" : "Not Connected"
     }
 
-    private var statusSubtext: String {
-        if isConnecting { return String(localized: "Starting core") }
-        return isConnected
-            ? String(localized: "Tap to disconnect")
-            : String(localized: "Tap to connect")
+    private var statusSubtext: LocalizedStringKey {
+        if isConnecting { return "Starting core" }
+        return isConnected ? "Tap to disconnect" : "Tap to connect"
     }
 
     private var statusColor: Color {

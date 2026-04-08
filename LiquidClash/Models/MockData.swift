@@ -20,8 +20,8 @@ enum AppPage: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var displayName: String {
-        String(localized: String.LocalizationValue(rawValue))
+    var displayName: LocalizedStringKey {
+        LocalizedStringKey(rawValue)
     }
 
     var icon: String {
