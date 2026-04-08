@@ -1,8 +1,10 @@
 import SwiftUI
 
 struct AddNodeSheet: View {
+    @Environment(AppState.self) private var appState
     @Binding var isPresented: Bool
     var onAdd: ((ProxyNode) -> Void)?
+    var editingNode: ProxyNode?
 
     @State private var nodeName = ""
     @State private var selectedType = "SOCKS5"
@@ -14,14 +16,19 @@ struct AddNodeSheet: View {
     @State private var enableUDP = true
     @State private var validationError: String?
 
+    private var isEditing: Bool { editingNode != nil }
+
     private let proxyTypes = ["SOCKS5", "HTTP", "Shadowsocks", "Vmess", "Trojan", "VLESS", "Hysteria2"]
-    private let dialerOptions: [(value: String, label: String)] = [
-        ("", "None (Direct)"),
-        ("japan-01", "🇯🇵 Japan | 01"),
-        ("singapore-sg4", "🇸🇬 Singapore - SG-4"),
-        ("hongkong-hkt", "🇭🇰 Hong Kong - HKT"),
-        ("losangeles-lax", "🇺🇸 Los Angeles - LAX"),
-    ]
+
+    private var dialerOptions: [(value: String, label: String)] {
+        var options: [(value: String, label: String)] = [("", "None (Direct)")]
+        for region in appState.proxyRegions {
+            for node in region.nodes {
+                options.append((node.name, "\(node.flag) \(node.name)"))
+            }
+        }
+        return options
+    }
 
     var body: some View {
         ZStack {
@@ -34,7 +41,7 @@ struct AddNodeSheet: View {
             VStack(alignment: .leading, spacing: 0) {
                 // Header
                 HStack {
-                    Text("Add Proxy Node")
+                    Text(isEditing ? "Edit Proxy Node" : "Add Proxy Node")
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(.primary)
 
@@ -150,7 +157,7 @@ struct AddNodeSheet: View {
                     Button {
                         addNode()
                     } label: {
-                        Text("Add Node")
+                        Text(isEditing ? "Save" : "Add Node")
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 20)
@@ -172,8 +179,24 @@ struct AddNodeSheet: View {
             .frame(width: 440)
             .fixedSize(horizontal: false, vertical: true)
             .glassEffect(.regular.tint(.white.opacity(0.15)), in: RoundedRectangle(cornerRadius: 20))
+            .contentShape(Rectangle())
+            .onTapGesture { }  // Prevent tap-through to backdrop
             .shadow(color: .black.opacity(0.12), radius: 30, y: 10)
             .opacity(isPresented ? 1 : 0)
+            .onAppear {
+                if let node = editingNode {
+                    nodeName = node.name
+                    selectedType = node.type.rawValue.capitalized
+                    // Map ProxyType rawValue to picker option
+                    if let match = proxyTypes.first(where: { $0.lowercased() == node.type.rawValue.lowercased() }) {
+                        selectedType = match
+                    }
+                    server = node.server
+                    port = String(node.port)
+                    password = node.password ?? node.uuid ?? ""
+                    enableUDP = node.udp
+                }
+            }
         }
     }
 
@@ -212,7 +235,7 @@ struct AddNodeSheet: View {
         let flag = ConfigParser.guessFlag(from: nodeName)
 
         let node = ProxyNode(
-            id: UUID().uuidString,
+            id: editingNode?.id ?? UUID().uuidString,
             flag: flag.isEmpty ? "🌐" : flag,
             name: nodeName.trimmingCharacters(in: .whitespaces),
             type: proxyType,

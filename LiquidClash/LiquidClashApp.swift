@@ -9,6 +9,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var appState: AppState?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Register URL schemes with Launch Services (ensures clash:// works immediately)
+        if let appURL = Bundle.main.bundleURL as CFURL? {
+            LSRegisterURL(appURL, true)
+        }
+
         // Fallback: force-resize window if SwiftUI still created it too small
         enforceDefaultWindowSize()
 
@@ -83,7 +88,7 @@ struct LiquidClashApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @AppStorage(SettingsKey.hasCompletedOnboarding) private var hasCompletedOnboarding = false
     @AppStorage(SettingsKey.themeMode) private var themeMode = "Adaptive"
-    @AppStorage(SettingsKey.interfaceLanguage) private var interfaceLanguage = "English"
+    @AppStorage(SettingsKey.interfaceLanguage) private var interfaceLanguage = "Auto"
     @State private var appState = AppState()
     @State private var pendingSubscriptionURL: String?
     @State private var showImportAlert = false
@@ -114,7 +119,8 @@ struct LiquidClashApp: App {
         switch interfaceLanguage {
         case "简体中文": return Locale(identifier: "zh-Hans")
         case "日本語": return Locale(identifier: "ja")
-        default: return Locale(identifier: "en")
+        case "English": return Locale(identifier: "en")
+        default: return Locale.current  // "Auto" — follow system
         }
     }
 

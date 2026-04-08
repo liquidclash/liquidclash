@@ -7,11 +7,24 @@ struct RulesView: View {
     @State private var showingAddRule = false
     @State private var showingImporter = false
     @State private var showingExporter = false
+    @State private var searchText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerRow
-                .padding(.bottom, 24)
+                .padding(.bottom, 16)
+
+            // Search bar (when connected and has active rules)
+            if appState.isConnected && !appState.activeRules.isEmpty {
+                searchBar
+                    .padding(.bottom, 12)
+            }
+
+            // Rule Providers summary (when connected and providers loaded, not searching)
+            if !appState.ruleProviders.isEmpty && searchText.isEmpty {
+                ruleProvidersSection
+                    .padding(.bottom, 16)
+            }
 
             // Rules table container
             VStack(spacing: 0) {
@@ -38,7 +51,81 @@ struct RulesView: View {
                 Divider().opacity(0.3)
 
                 // Rules list
-                if appState.rules.isEmpty {
+                if appState.isConnected && !appState.activeRules.isEmpty {
+                    if !searchText.isEmpty {
+                        // Search mode: search ALL rules (inline + provider)
+                        if appState.isLoadingProviderRules {
+                            VStack(spacing: 8) {
+                                Spacer()
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Loading provider rules…")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                            .frame(maxWidth: .infinity)
+                        } else {
+                            let query = searchText.lowercased()
+                            let results = appState.allSearchableRules.filter {
+                                $0.payload.localizedCaseInsensitiveContains(query) ||
+                                $0.type.localizedCaseInsensitiveContains(query) ||
+                                $0.proxy.localizedCaseInsensitiveContains(query)
+                            }
+                            if results.isEmpty {
+                                VStack(spacing: 6) {
+                                    Spacer()
+                                    Image(systemName: "magnifyingglass")
+                                        .font(.system(size: 20))
+                                        .foregroundStyle(.tertiary)
+                                    Text("No rules matching \"\(searchText)\"")
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                                .frame(maxWidth: .infinity)
+                            } else {
+                                ScrollView {
+                                    LazyVStack(spacing: 4) {
+                                        let total = results.count
+                                        if total > 200 {
+                                            Text("Showing 200 of \(Self.formatLargeNumber(total)) matches")
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(.tertiary)
+                                                .padding(.vertical, 6)
+                                        }
+                                        ForEach(results.prefix(200)) { rule in
+                                            activeRuleRow(rule)
+                                        }
+                                    }
+                                    .padding(8)
+                                }
+                                .scrollIndicators(.hidden)
+                            }
+                        }
+                    } else {
+                        // Default: show inline active rules
+                        ScrollView {
+                            LazyVStack(spacing: 4) {
+                                ForEach(appState.activeRules) { rule in
+                                    activeRuleRow(rule)
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .scrollIndicators(.hidden)
+                    }
+                } else if !appState.rules.isEmpty {
+                    ScrollView {
+                        LazyVStack(spacing: 4) {
+                            ForEach(appState.rules) { rule in
+                                ruleRow(rule)
+                            }
+                        }
+                        .padding(8)
+                    }
+                    .scrollIndicators(.hidden)
+                } else {
                     VStack(spacing: 8) {
                         Spacer()
                         Text("No rules loaded")
@@ -50,16 +137,6 @@ struct RulesView: View {
                         Spacer()
                     }
                     .frame(maxWidth: .infinity)
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 4) {
-                            ForEach(appState.rules) { rule in
-                                ruleRow(rule)
-                            }
-                        }
-                        .padding(8)
-                    }
-                    .scrollIndicators(.hidden)
                 }
             }
             .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: RoundedRectangle(cornerRadius: 20))
@@ -72,6 +149,11 @@ struct RulesView: View {
         .padding(.vertical, 16)
         .padding(.bottom, 16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: searchText) { _, newValue in
+            if !newValue.isEmpty && !appState.providerRulesLoaded {
+                appState.loadProviderRulesForSearch()
+            }
+        }
         .overlay {
             if showingAddRule {
                 AddRuleSheet(isPresented: $showingAddRule) { newRule in
@@ -88,12 +170,13 @@ struct RulesView: View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
-                    Text("Rules Editor")
+                    Text("Rules")
                         .font(.system(size: 24, weight: .semibold))
                         .foregroundStyle(.primary)
 
-                    if !appState.rules.isEmpty {
-                        Text("\(appState.rules.count)")
+                    let totalCount = appState.totalRuleCount
+                    if totalCount > 0 {
+                        Text("\(Self.formatLargeNumber(totalCount)) rules")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 8)
@@ -179,12 +262,134 @@ struct RulesView: View {
         }
     }
 
+    // MARK: - Search Bar
+
+    private var searchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 13))
+                .foregroundStyle(.tertiary)
+            TextField("Search all \(Self.formatLargeNumber(appState.totalRuleCount)) rules…", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(.white.opacity(colorScheme == .dark ? 0.12 : 0.7), lineWidth: 0.5)
+        )
+    }
+
+    // MARK: - Rule Providers Section
+
+    private var ruleProvidersSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Rule Providers")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            let sortedProviders = appState.ruleProviders.sorted(by: { $0.key < $1.key })
+            let columns = [GridItem(.adaptive(minimum: 180), spacing: 10)]
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(sortedProviders, id: \.key) { name, provider in
+                    HStack(spacing: 8) {
+                        Image(systemName: provider.behavior == "ipcidr" ? "network" : "globe")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(name)
+                                .font(.system(size: 11, weight: .medium))
+                                .lineLimit(1)
+                            Text("\(provider.ruleCount) rules")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.white.opacity(colorScheme == .dark ? 0.06 : 0.3), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+
+    // MARK: - Active Rule Row (from mihomo API)
+
+    private func activeRuleRow(_ rule: APIRule) -> some View {
+        HStack(spacing: 0) {
+            Text("")
+                .frame(width: 40)
+
+            Text(rule.type)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(Color(hex: "C34AC2"))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color(hex: "C34AC2").opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                .frame(width: 150, alignment: .leading)
+
+            Text(rule.payload)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color(hex: activeRuleDotColor(rule.proxy)))
+                    .frame(width: 8, height: 8)
+                Text(rule.proxy)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            .frame(width: 150, alignment: .leading)
+
+            Text("")
+                .frame(width: 60)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private func activeRuleDotColor(_ proxy: String) -> String {
+        switch proxy.uppercased() {
+        case "DIRECT": "30D158"
+        case "REJECT": "FF6E52"
+        default: "4B6EFF"
+        }
+    }
+
     // MARK: - Rule Row
 
     private func ruleRow(_ rule: RuleItem) -> some View {
         RuleRowView(rule: rule) {
             appState.deleteRule(rule.id)
         }
+    }
+
+    // MARK: - Helpers
+
+    private static func formatLargeNumber(_ n: Int) -> String {
+        if n >= 10000 {
+            let k = Double(n) / 10000
+            return String(format: "%.1f万", k)
+        }
+        return "\(n)"
     }
 
     // MARK: - Import / Export
@@ -199,7 +404,7 @@ struct RulesView: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         if let content = try? String(contentsOf: url, encoding: .utf8) {
-            let imported = ConfigParser.parseClashYAMLRules(content)
+            let imported = ConfigParser.parseClashYAMLRules(content, source: .user)
             if !imported.isEmpty {
                 for rule in imported {
                     appState.addRule(rule)

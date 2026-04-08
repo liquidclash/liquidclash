@@ -1,0 +1,14 @@
+/Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/deps/serde-513ef37300a64db7.d: /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/build/serde-4288e16efa9ad830/out/private.rs
+
+/Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/deps/libserde-513ef37300a64db7.rlib: /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/build/serde-4288e16efa9ad830/out/private.rs
+
+/Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/deps/libserde-513ef37300a64db7.rmeta: /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/build/serde-4288e16efa9ad830/out/private.rs
+
+/Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/hesong/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/build/serde-4288e16efa9ad830/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/hesong/Documents/xcode_space/LiquidClash/Tools/clash-fetcher/target/release/build/serde-4288e16efa9ad830/out

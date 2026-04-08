@@ -1,8 +1,18 @@
 import SwiftUI
 
 struct ActiveNodeCard: View {
-    let node: ProxyNode
+    let nodeName: String
+    var groupName: String?
+    var latency: Int = 0
     var onSwitch: (() -> Void)?
+
+    private var flag: String {
+        ConfigParser.extractFlag(from: nodeName).flag
+    }
+
+    private var cleanName: String {
+        ConfigParser.extractFlag(from: nodeName).cleanName
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,28 +35,38 @@ struct ActiveNodeCard: View {
 
             HStack {
                 HStack(spacing: 10) {
-                    Text(node.flag)
+                    Text(flag)
                         .font(.system(size: 16))
                         .frame(width: 28, height: 28)
                         .background(.white.opacity(0.28), in: Circle())
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(node.name)
+                        Text(cleanName)
                             .font(.system(size: 13, weight: .semibold))
                             .fontWeight(.semibold)
                             .foregroundStyle(.primary)
-                        Text(node.protocolType)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Color(hex: "8E8E93"))
+                        if let group = groupName {
+                            Text(group)
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color(hex: "8E8E93"))
+                        }
                     }
                 }
                 Spacer()
-                Text("\(node.latency)ms")
-                    .font(.system(size: 12, weight: .semibold))
-                    .fontWeight(.semibold)
-                    .foregroundStyle(Color(hex: "30D158"))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color(hex: "30D158").opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+                if latency > 0 {
+                    Text("\(latency)ms")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(latency < 200 ? Color(hex: "30D158") :
+                                        latency < 400 ? Color(hex: "FF9F0A") :
+                                        Color(hex: "FF3B30"))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            (latency < 200 ? Color(hex: "30D158") :
+                             latency < 400 ? Color(hex: "FF9F0A") :
+                             Color(hex: "FF3B30")).opacity(0.15),
+                            in: RoundedRectangle(cornerRadius: 6)
+                        )
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
@@ -72,7 +92,7 @@ struct ActiveNodeCard: View {
 #Preview {
     ZStack {
         MeshGradientBackground()
-        ActiveNodeCard(node: mockProxyRegions[0].nodes[0])
+        ActiveNodeCard(nodeName: "🇯🇵 Tokyo 01", groupName: "PROXY")
     }
     .frame(width: 900, height: 600)
 }

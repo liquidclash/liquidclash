@@ -6,7 +6,7 @@ struct SettingsView: View {
 
     // General
     @AppStorage(SettingsKey.launchAtStartup) private var launchAtStartup = true
-    @AppStorage(SettingsKey.interfaceLanguage) private var selectedLanguage = "English"
+    @AppStorage(SettingsKey.interfaceLanguage) private var selectedLanguage = "Auto"
     @AppStorage(SettingsKey.logsEnabled) private var logsEnabled = true
 
     // Proxy Engine
@@ -22,7 +22,7 @@ struct SettingsView: View {
 
 
 
-    private let languages = ["English", "简体中文", "日本語"]
+    private let languages = ["Auto", "English", "简体中文", "日本語"]
     private let themes = ["Light", "Dark", "Adaptive"]
 
     var body: some View {
@@ -201,7 +201,7 @@ struct SettingsView: View {
                     .labelsHidden()
             }
 
-            settingDivider
+            Spacer()
 
             // Links
             HStack(spacing: 10) {
@@ -278,8 +278,8 @@ struct SettingsView: View {
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 5)
-                .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: Capsule())
-                .overlay(Capsule().strokeBorder(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), lineWidth: 0.5))
+                .background(.white.opacity(colorScheme == .dark ? 0.06 : 0.25), in: Capsule())
+                .overlay(Capsule().strokeBorder(.white.opacity(colorScheme == .dark ? 0.06 : 0.3), lineWidth: 0.5))
         }
         .buttonStyle(.plain)
     }

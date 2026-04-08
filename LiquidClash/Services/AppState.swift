@@ -5,8 +5,8 @@ import Observation
 
 struct NetworkInfo {
     var ip: String = "--"
-    var networkType: String = "--"
-    var location: String = "--"
+    var asType: String = "--"
+    var city: String = "--"
 }
 
 // MARK: - Traffic Stats
@@ -41,6 +41,26 @@ final class AppState {
 
     // Rules
     var rules: [RuleItem] = []
+    var activeRules: [APIRule] = []
+    var ruleProviders: [String: APIRuleProvider] = [:]
+    /// Cached provider rules for search (lazy-loaded on first search)
+    var providerRulesCache: [APIRule] = []
+    var isLoadingProviderRules = false
+    var providerRulesLoaded = false
+
+    /// Total rule count: inline rules + all provider rules
+    var totalRuleCount: Int {
+        let inline = isConnected && !activeRules.isEmpty
+            ? activeRules.count
+            : rules.count
+        let providerTotal = ruleProviders.values.reduce(0) { $0 + $1.ruleCount }
+        return inline + providerTotal
+    }
+
+    /// All searchable rules: inline active rules + cached provider rules
+    var allSearchableRules: [APIRule] {
+        activeRules + providerRulesCache
+    }
 
     // Activity
     var connections: [ConnectionEntry] = []
@@ -60,6 +80,7 @@ final class AppState {
     // Core components
     let clashManager = ClashManager()
     let subscriptionManager = SubscriptionManager()
+    let proxyService = ProxyService()
     private var clashAPI: ClashAPI?
     private var webSocket: ClashWebSocket?
     private var connectTask: Task<Void, Never>?
@@ -81,10 +102,6 @@ final class AppState {
 
     func connect() {
         guard !isConnected && !isConnecting else { return }
-        guard !proxyRegions.isEmpty else {
-            errorMessage = "没有可用的代理节点，请先导入订阅"
-            return
-        }
         isConnecting = true
         errorMessage = nil
 
@@ -92,41 +109,31 @@ final class AppState {
         let portString = UserDefaults.standard.string(forKey: SettingsKey.mixedPort) ?? "7890"
         let port = Int(portString) ?? 7890
         config.mixedPort = port
-        config.port = port
-        config.socksPort = port
         config.tunEnabled = UserDefaults.standard.bool(forKey: SettingsKey.tunMode)
         config.allowLan = config.tunEnabled && UserDefaults.standard.bool(forKey: SettingsKey.allowLAN)
-
-        // Populate proxies from regions
-        let allNodes = proxyRegions.flatMap(\.nodes)
-        config.proxies = allNodes
-
-        // Build proxy groups
-        let nodeNames = allNodes.map(\.name)
-        let proxyGroup = ProxyGroup(name: "Proxy", type: .select, proxies: nodeNames + ["DIRECT"])
-        config.proxyGroups = [
-            ProxyGroup(name: "GLOBAL", type: .select, proxies: ["Proxy", "DIRECT"] + nodeNames),
-            proxyGroup,
-        ]
-
-        // Build config rules from current rules
-        config.rules = rules.map { $0.clashString }
-        // Ensure a final catch-all rule exists — use Proxy so traffic actually goes through proxy
-        if !config.rules.contains(where: { $0.hasPrefix("MATCH,") }) {
-            config.rules.append("MATCH,Proxy")
-        }
         config.mode = proxyMode.rawValue.lowercased()
 
-        // Load raw subscription YAML — only use if it's actual Clash YAML (contains "proxies:")
-        // URI-format subscriptions (trojan://, vmess://) are parsed into structured nodes instead
-        let rawYAML = ConfigStorage.shared.loadRawSubscriptionYAML()
-        let validRawYAML = rawYAML.flatMap { $0.contains("proxies:") ? $0 : nil }
+        // Load subscription YAML (single source of truth)
+        guard let subscriptionYAML = ConfigStorage.shared.loadSubscriptionYAML(),
+              !subscriptionYAML.isEmpty else {
+            isConnecting = false
+            errorMessage = "没有可用的订阅配置，请先导入订阅"
+            return
+        }
+
+        let overlay = ConfigPipeline.OverlayConfig(
+            mixedPort: port,
+            mode: proxyMode.rawValue.lowercased(),
+            logLevel: "info",
+            allowLan: config.tunEnabled && UserDefaults.standard.bool(forKey: SettingsKey.allowLAN),
+            tunEnabled: config.tunEnabled
+        )
 
         do {
             if config.tunEnabled {
-                try clashManager.startWithPrivileges(config: config, rawSubscriptionYAML: validRawYAML)
+                try clashManager.startWithPrivileges(subscriptionYAML: subscriptionYAML, overlay: overlay)
             } else {
-                try clashManager.start(config: config, rawSubscriptionYAML: validRawYAML)
+                try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay)
             }
         } catch {
             isConnecting = false
@@ -193,10 +200,16 @@ final class AppState {
         trafficStats = TrafficStats()
         connections = []
         logEntries = []
+        activeRules = []
+        ruleProviders = [:]
+        providerRulesCache = []
+        providerRulesLoaded = false
+        isLoadingProviderRules = false
     }
 
     private func onCoreStarted(api: ClashAPI) {
         clashAPI = api
+        proxyService.setAPI(api)
 
         // Auto-enable system proxy (skip for TUN mode — TUN handles routing itself)
         if !config.tunEnabled {
@@ -249,23 +262,17 @@ final class AppState {
         ws.startConnectionsStream()
         ws.startLogsStream(level: logLevel)
 
-        // Fetch initial data from API
-        Task { await fetchProxiesFromAPI() }
-        Task { await fetchNetworkInfo() }
-
-        // Set the active proxy in mihomo if a node is selected
-        if let node = activeNode {
-            Task {
-                try? await api.selectProxy(group: "GLOBAL", proxy: "Proxy")
-                try? await api.selectProxy(group: "Proxy", proxy: node.name)
-            }
+        // Fetch proxy data from mihomo API (single source of truth)
+        Task {
+            await proxyService.refresh()
+            await fetchNetworkInfo()
         }
+        Task { await fetchActiveRules() }
 
         // Auto-retry subscriptions that have 0 nodes (likely failed due to needing proxy)
         let failedSubs = subscriptions.filter { $0.nodeCount == 0 && $0.isEnabled }
         if !failedSubs.isEmpty {
             Task {
-                // Wait a moment for the proxy to be fully ready
                 try? await Task.sleep(for: .seconds(2))
                 try? await updateAllSubscriptions()
             }
@@ -274,20 +281,17 @@ final class AppState {
 
     // MARK: - Proxy Management
 
-    func selectNode(_ nodeId: String) {
-        selectedNodeId = nodeId
-        for region in proxyRegions {
-            if let node = region.nodes.first(where: { $0.id == nodeId }) {
-                activeNode = node
-
-                // If connected, tell mihomo to switch
-                if isConnected, let api = clashAPI {
-                    Task {
-                        try? await api.selectProxy(group: "GLOBAL", proxy: node.name)
-                    }
-                }
-                break
+    /// Select a node/group by name. Uses ProxyService to interact with mihomo directly.
+    func selectNode(_ nodeName: String) {
+        guard isConnected else { return }
+        Task {
+            // Find which Selector group contains this node/group name and switch
+            for group in proxyService.groups where group.isSelector && group.all.contains(nodeName) {
+                await proxyService.selectProxy(group: group.name, proxy: nodeName)
             }
+            // Refresh IP after switch
+            await MainActor.run { self.networkInfo = NetworkInfo() }
+            await fetchNetworkInfo()
         }
     }
 
@@ -304,6 +308,8 @@ final class AppState {
         if isConnected, let api = clashAPI {
             Task {
                 try? await api.updateMode(mode.rawValue.lowercased())
+                await MainActor.run { self.networkInfo = NetworkInfo() }
+                await fetchNetworkInfo()
             }
         }
     }
@@ -324,6 +330,17 @@ final class AppState {
             proxyRegions.append(region)
         }
         saveState()
+    }
+
+    func updateNode(_ node: ProxyNode) {
+        for i in proxyRegions.indices {
+            if let j = proxyRegions[i].nodes.firstIndex(where: { $0.id == node.id }) {
+                proxyRegions[i].nodes[j] = node
+                if selectedNodeId == node.id { activeNode = node }
+                saveState()
+                return
+            }
+        }
     }
 
     func deleteNode(_ nodeId: String) {
@@ -367,17 +384,21 @@ final class AppState {
 
     /// Rewrite config on disk and tell mihomo to reload it
     func reloadCoreConfig() {
-        // Rebuild rules in config
-        config.rules = rules.map { $0.clashString }
-        if !config.rules.contains(where: { $0.hasPrefix("MATCH,") }) {
-            config.rules.append("MATCH,Proxy")
-        }
+        guard let subscriptionYAML = ConfigStorage.shared.loadSubscriptionYAML(),
+              !subscriptionYAML.isEmpty else { return }
 
-        // Rewrite config file — only use raw YAML if it's actual Clash config
-        let rawYAML = ConfigStorage.shared.loadRawSubscriptionYAML()
-        let validRawYAML = rawYAML.flatMap { $0.contains("proxies:") ? $0 : nil }
+        let portString = UserDefaults.standard.string(forKey: SettingsKey.mixedPort) ?? "7890"
+        let port = Int(portString) ?? 7890
+        let overlay = ConfigPipeline.OverlayConfig(
+            mixedPort: port,
+            mode: config.mode,
+            logLevel: config.logLevel,
+            allowLan: config.allowLan,
+            tunEnabled: config.tunEnabled
+        )
+
         do {
-            try clashManager.rewriteConfig(config: config, rawSubscriptionYAML: validRawYAML)
+            try clashManager.rewriteConfig(subscriptionYAML: subscriptionYAML, overlay: overlay)
         } catch {
             print("Warning: Failed to rewrite config: \(error)")
             return
@@ -424,62 +445,59 @@ final class AppState {
 
     // MARK: - Latency Testing
 
-    func testNodeLatency(_ nodeId: String) async {
-        guard let api = clashAPI else { return }
-
-        // Find node name
-        var nodeName: String?
-        for region in proxyRegions {
-            if let node = region.nodes.first(where: { $0.id == nodeId }) {
-                nodeName = node.name
-                break
-            }
-        }
-        guard let name = nodeName else { return }
-
-        do {
-            let result = try await api.testProxyDelay(name: name)
-            if let delay = result.delay {
-                await MainActor.run {
-                    updateNodeLatency(nodeId: nodeId, latency: delay)
-                }
-            }
-        } catch {
-            // Node unreachable
-        }
+    func testNodeLatency(_ name: String) async {
+        _ = await proxyService.testLatency(name: name)
     }
 
     func testAllLatency() async {
-        guard let api = clashAPI else { return }
-        let allNodes = proxyRegions.flatMap(\.nodes)
+        guard !proxyService.nodes.isEmpty else { return }
 
-        await withTaskGroup(of: Void.self) { group in
-            for node in allNodes {
-                group.addTask {
-                    do {
-                        let result = try await api.testProxyDelay(name: node.name)
-                        if let delay = result.delay {
-                            await MainActor.run {
-                                self.updateNodeLatency(nodeId: node.id, latency: delay)
-                            }
-                        }
-                    } catch { }
-                }
+        // If not connected, temporarily start mihomo just for latency testing
+        let needsTempCore = clashAPI == nil
+
+        if needsTempCore {
+            do {
+                let api = try await startTemporaryCore()
+                proxyService.setAPI(api)
+                await proxyService.refresh()
+            } catch {
+                print("[LiquidClash] Failed to start temp core for testing: \(error)")
+                return
             }
+        }
+
+        await proxyService.testAllLatency()
+
+        if needsTempCore {
+            clashManager.stop()
+            proxyService.setAPI(nil)
         }
     }
 
-    private func updateNodeLatency(nodeId: String, latency: Int) {
-        for i in proxyRegions.indices {
-            if let j = proxyRegions[i].nodes.firstIndex(where: { $0.id == nodeId }) {
-                proxyRegions[i].nodes[j].latency = latency
-            }
+    /// Start mihomo temporarily (no system proxy) for latency testing
+    private func startTemporaryCore() async throws -> ClashAPI {
+        let portString = UserDefaults.standard.string(forKey: SettingsKey.mixedPort) ?? "7890"
+        let port = Int(portString) ?? 7890
+
+        guard let subscriptionYAML = ConfigStorage.shared.loadSubscriptionYAML(),
+              !subscriptionYAML.isEmpty else {
+            throw ClashError.configWriteFailed
         }
-        // Update active node if needed
-        if activeNode?.id == nodeId {
-            activeNode?.latency = latency
-        }
+
+        let overlay = ConfigPipeline.OverlayConfig(
+            mixedPort: port,
+            mode: "rule",
+            logLevel: "info"
+        )
+
+        try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay)
+
+        let apiPort = config.externalController.split(separator: ":").last.flatMap { Int($0) } ?? 9090
+        let api = ClashAPI(port: apiPort, secret: config.secret)
+        try await api.waitUntilReady()
+        return api
     }
+
 
     // MARK: - Subscription
 
@@ -489,13 +507,16 @@ final class AppState {
     }
 
     func updateSubscription(url: String) async throws {
-        let (regions, rawYAML, _) = try await subscriptionManager.fetchAndOrganize(url: url, proxyPort: activeProxyPort)
+        let (regions, rawYAML, userInfo) = try await subscriptionManager.fetchAndOrganize(url: url, proxyPort: activeProxyPort)
         await MainActor.run {
-            self.proxyRegions = regions
+            let customRegions = self.proxyRegions.filter { $0.id == "custom" }
+            self.proxyRegions = regions + customRegions
             self.selectedNodeId = regions.first?.nodes.first?.id
             self.activeNode = regions.first?.nodes.first
             // Merge rules: keep user rules, replace subscription rules
-            if rawYAML.contains("rules:") {
+            let hasRules = rawYAML.components(separatedBy: .newlines)
+                .contains { $0.trimmingCharacters(in: .whitespaces) == "rules:" }
+            if hasRules {
                 let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription)
                 if !parsedRules.isEmpty {
                     let userRules = self.rules.filter { $0.source == .user }
@@ -508,13 +529,17 @@ final class AppState {
         // Save raw YAML for mihomo to use directly
         ConfigStorage.shared.saveRawSubscriptionYAML(rawYAML)
 
-        // Save subscription info
+        // Save subscription info with traffic data
         await subscriptionManager.saveSubscriptionInfo(
             SubscriptionInfo(
                 url: url,
                 name: "Default",
                 lastUpdate: Date(),
-                nodeCount: regions.flatMap(\.nodes).count
+                nodeCount: regions.flatMap(\.nodes).count,
+                upload: userInfo?.upload,
+                download: userInfo?.download,
+                total: userInfo?.total,
+                expire: userInfo?.expire
             )
         )
     }
@@ -560,16 +585,25 @@ final class AppState {
         let (regions, updatedSubs, rawYAML) = try await subscriptionManager.fetchAllAndOrganize(subscriptions, proxyPort: activeProxyPort)
         await MainActor.run {
             self.subscriptions = updatedSubs
-            self.proxyRegions = regions
+            // Preserve custom nodes across subscription updates
+            let customRegions = self.proxyRegions.filter { $0.id == "custom" }
+            self.proxyRegions = regions + customRegions
             self.selectedNodeId = regions.first?.nodes.first?.id
             self.activeNode = regions.first?.nodes.first
             // Merge rules: keep user rules, replace subscription rules
-            if rawYAML.contains("rules:") {
+            let hasRulesSection = rawYAML.components(separatedBy: .newlines)
+                .contains { $0.trimmingCharacters(in: .whitespaces) == "rules:" }
+            if hasRulesSection {
                 let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription)
+                print("[LiquidClash] Parsed \(parsedRules.count) rules from subscription YAML (\(rawYAML.count) chars)")
                 if !parsedRules.isEmpty {
                     let userRules = self.rules.filter { $0.source == .user }
                     self.rules = userRules + parsedRules
                 }
+            } else {
+                print("[LiquidClash] No standalone 'rules:' line in YAML (\(rawYAML.count) chars, contains 'rules:': \(rawYAML.contains("rules:")))")
+                // Preview first 200 chars of rawYAML for debugging
+                print("[LiquidClash] YAML preview: \(String(rawYAML.prefix(200)))")
             }
             self.saveState()
         }
@@ -653,41 +687,179 @@ final class AppState {
 
     // MARK: - API Data Fetching
 
-    private func fetchProxiesFromAPI() async {
-        guard let api = clashAPI else { return }
-        do {
-            let response = try await api.getProxies()
-            await MainActor.run {
-                // Update latencies from API data
-                for (name, proxy) in response.proxies {
-                    if let delay = proxy.history?.last?.delay, delay > 0 {
-                        for i in proxyRegions.indices {
-                            if let j = proxyRegions[i].nodes.firstIndex(where: { $0.name == name }) {
-                                proxyRegions[i].nodes[j].latency = delay
-                            }
-                        }
-                    }
+
+    private func fetchActiveRules() async {
+        guard let api = clashAPI else {
+            print("[LiquidClash]","fetchActiveRules: no API")
+            return
+        }
+        for delay in [3, 8, 15] {
+            try? await Task.sleep(for: .seconds(delay))
+            guard isConnected else { return }
+            do {
+                let rulesResponse = try await api.getRules()
+                let providersResponse = try? await api.getRuleProviders()
+                let providerTotal = providersResponse?.providers.values.reduce(0) { $0 + $1.ruleCount } ?? 0
+                print("[LiquidClash]","fetchActiveRules: \(rulesResponse.rules.count) inline rules, \(providersResponse?.providers.count ?? 0) providers (\(providerTotal) total)")
+                await MainActor.run {
+                    self.activeRules = rulesResponse.rules
+                    self.ruleProviders = providersResponse?.providers ?? [:]
                 }
+                if providerTotal > 0 { return }
+            } catch {
+                print("[LiquidClash]","fetchActiveRules failed: \(error)")
             }
-        } catch { }
+        }
+    }
+
+    /// Load all provider rules for search by reading local cache files.
+    /// mihomo API doesn't expose provider rule contents, so we read the YAML files directly.
+    func loadProviderRulesForSearch() {
+        guard isConnected, !providerRulesLoaded, !isLoadingProviderRules else { return }
+        isLoadingProviderRules = true
+
+        Task {
+            var allRules: [APIRule] = []
+            let providers = await MainActor.run { self.ruleProviders }
+            let inlineRules = await MainActor.run { self.activeRules }
+
+            // Build provider→proxy mapping from inline RULE-SET rules
+            var providerProxyMap: [String: String] = [:]
+            for rule in inlineRules where rule.type == "RuleSet" || rule.type == "RULE-SET" {
+                providerProxyMap[rule.payload] = rule.proxy
+            }
+
+            let rulesetDir = clashManager.configDirectory.appendingPathComponent("ruleset")
+            print("[LiquidClash]","Loading provider rules from \(rulesetDir.path) (\(providers.count) providers)")
+
+            for (name, provider) in providers {
+                let proxyTarget = providerProxyMap[name] ?? name
+                let filePath = rulesetDir.appendingPathComponent("\(name).yaml")
+
+                guard let content = try? String(contentsOf: filePath, encoding: .utf8) else {
+                    print("[LiquidClash]","Provider '\(name)': file not found at \(filePath.path)")
+                    continue
+                }
+
+                // Parse YAML payload list: "payload:\n  - value\n  - value\n"
+                let defaultType: String
+                let behavior = provider.behavior.lowercased()
+                if behavior == "ipcidr" {
+                    defaultType = "IP-CIDR"
+                } else {
+                    defaultType = "DOMAIN"
+                }
+
+                var count = 0
+                for line in content.components(separatedBy: .newlines) {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    guard trimmed.hasPrefix("- ") else { continue }
+                    let value = String(trimmed.dropFirst(2)).trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+                    guard !value.isEmpty else { continue }
+
+                    if behavior == "classical" {
+                        // Classical: "TYPE,payload" format
+                        let parts = value.split(separator: ",", maxSplits: 1)
+                        if parts.count == 2 {
+                            allRules.append(APIRule(type: String(parts[0]), payload: String(parts[1]), proxy: proxyTarget))
+                        } else {
+                            allRules.append(APIRule(type: defaultType, payload: value, proxy: proxyTarget))
+                        }
+                    } else {
+                        // Domain prefix: strip leading '+.' for cleaner display
+                        let cleanValue = value.hasPrefix("+.") ? String(value.dropFirst(2)) : value
+                        allRules.append(APIRule(type: defaultType, payload: cleanValue, proxy: proxyTarget))
+                    }
+                    count += 1
+                }
+                print("[LiquidClash]","Provider '\(name)': loaded \(count) rules from file")
+            }
+
+            await MainActor.run {
+                self.providerRulesCache = allRules
+                self.providerRulesLoaded = true
+                self.isLoadingProviderRules = false
+            }
+            print("[LiquidClash]","Total provider rules loaded: \(allRules.count)")
+        }
+    }
+
+    /// URLSession configured to route through mihomo proxy
+    private func makeProxySession(port: Int) -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [
+            kCFNetworkProxiesHTTPEnable: true,
+            kCFNetworkProxiesHTTPProxy: "127.0.0.1",
+            kCFNetworkProxiesHTTPPort: port,
+            kCFNetworkProxiesHTTPSEnable: true,
+            kCFNetworkProxiesHTTPSProxy: "127.0.0.1",
+            kCFNetworkProxiesHTTPSPort: port,
+        ]
+        config.timeoutIntervalForRequest = 5
+        return URLSession(configuration: config)
     }
 
     private func fetchNetworkInfo() async {
-        // Simple IP detection via httpbin
-        do {
-            let url = URL(string: "https://httpbin.org/ip")!
-            let (data, _) = try await URLSession.shared.data(from: url)
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-               let ip = json["origin"] {
-                await MainActor.run {
-                    self.networkInfo.ip = ip
-                    self.networkInfo.networkType = "Proxy"
-                    if let node = self.activeNode {
-                        self.networkInfo.location = node.name
+        let port = config.mixedPort
+        let session = makeProxySession(port: port)
+
+        // Retry until proxy is ready (providers loading)
+        var ip = ""
+        for attempt in 1...8 {
+            try? await Task.sleep(for: .seconds(2))
+            guard isConnected, !Task.isCancelled else { return }
+
+            // Fast: plain text IP
+            if let (data, _) = try? await session.data(from: URL(string: "https://ifconfig.me")!),
+               let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !result.isEmpty, !result.contains("<") {
+                ip = result
+                break
+            }
+
+            if attempt >= 3 {
+                if let (data, _) = try? await session.data(from: URL(string: "https://ipwho.is/")!),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
+                    ip = fetchedIP
+                    let city = json["city"] as? String ?? "--"
+                    let country = json["country_code"] as? String ?? ""
+                    let conn = json["connection"] as? [String: Any]
+                    let org = conn?["org"] as? String ?? "--"
+                    await MainActor.run {
+                        self.networkInfo.ip = ip
+                        self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
                     }
+                    break
                 }
             }
-        } catch { }
+        }
+
+        guard !ip.isEmpty, isConnected, !Task.isCancelled else { return }
+
+        // Show IP immediately
+        await MainActor.run { self.networkInfo.ip = ip }
+
+        // City from ipwho.is
+        if let (data, _) = try? await session.data(from: URL(string: "https://ipwho.is/")!),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let city = json["city"] as? String ?? "--"
+            let country = json["country_code"] as? String ?? ""
+            await MainActor.run {
+                self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
+            }
+        }
+
+        // ASN type (hosting/isp/business) from ipapi.is — direct connection, no proxy needed
+        if let url = URL(string: "https://api.ipapi.is/?q=\(ip)"),
+           let (data, _) = try? await URLSession.shared.data(from: url),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let asnObj = json["asn"] as? [String: Any],
+           let type = asnObj["type"] as? String, !type.isEmpty {
+            await MainActor.run {
+                self.networkInfo.asType = type.uppercased()
+            }
+        }
     }
 
     // MARK: - Update Connections from WebSocket
@@ -728,42 +900,6 @@ final class AppState {
         }
     }
 
-    // MARK: - Region Organization (for re-parsing from raw YAML)
-
-    private func organizeIntoRegions(_ nodes: [ProxyNode]) -> [ProxyRegion] {
-        var regionMap: [String: (name: String, nodes: [ProxyNode])] = [:]
-
-        let regionMapping: [(flags: Set<String>, id: String, name: String)] = [
-            (["🇯🇵", "🇸🇬", "🇭🇰", "🇹🇼", "🇰🇷", "🇮🇳", "🇦🇺"], "ap", "ASIA PACIFIC"),
-            (["🇺🇸", "🇨🇦", "🇧🇷"], "am", "AMERICAS"),
-            (["🇬🇧", "🇩🇪", "🇫🇷", "🇳🇱", "🇷🇺"], "eu", "EUROPE"),
-        ]
-
-        for node in nodes {
-            var placed = false
-            for region in regionMapping {
-                if region.flags.contains(node.flag) {
-                    var existing = regionMap[region.id] ?? (name: region.name, nodes: [])
-                    existing.nodes.append(node)
-                    regionMap[region.id] = existing
-                    placed = true
-                    break
-                }
-            }
-            if !placed {
-                var other = regionMap["other"] ?? (name: "OTHER", nodes: [])
-                other.nodes.append(node)
-                regionMap["other"] = other
-            }
-        }
-
-        let order = ["ap", "am", "eu", "other"]
-        return order.compactMap { id in
-            guard let region = regionMap[id], !region.nodes.isEmpty else { return nil }
-            return ProxyRegion(id: id, name: region.name, nodes: region.nodes)
-        }
-    }
-
     // MARK: - Persistence
 
     func loadInitialData() {
@@ -771,22 +907,15 @@ final class AppState {
 
         proxyRegions = storage.loadProxyRegions() ?? []
         rules = storage.loadRules() ?? []
-
-        // Re-parse from subscription YAML if data is missing on disk
-        let rawYAML = storage.loadRawSubscriptionYAML()
-
-        // Re-parse regions from raw YAML if regions.json is empty
-        if proxyRegions.isEmpty, let yaml = rawYAML, yaml.contains("proxies:") {
-            let nodes = ConfigParser.parseClashYAMLProxies(yaml)
-            if !nodes.isEmpty {
-                proxyRegions = organizeIntoRegions(nodes)
-                storage.saveProxyRegions(proxyRegions)
-            }
-        }
+        print("[LiquidClash] loadInitialData: \(proxyRegions.count) regions, \(rules.count) rules from disk")
 
         // Re-parse rules from subscription YAML if rules are empty or missing policyName
+        let rawYAML = storage.loadRawSubscriptionYAML()
         let needsReParse = rules.isEmpty || rules.contains(where: { $0.policyName == nil && $0.policy == .proxy })
-        if needsReParse, let yaml = rawYAML, yaml.contains("rules:") {
+        let yamlHasRules = rawYAML.map { yaml in
+            yaml.components(separatedBy: .newlines).contains { $0.trimmingCharacters(in: .whitespaces) == "rules:" }
+        } ?? false
+        if needsReParse, let yaml = rawYAML, yamlHasRules {
             let parsed = ConfigParser.parseClashYAMLRules(yaml, source: .subscription)
             if !parsed.isEmpty {
                 let userRules = rules.filter { $0.source == .user }
@@ -802,10 +931,14 @@ final class AppState {
             config = savedConfig
         }
 
-        // Load subscriptions async
+        // Load subscriptions and refresh traffic data on launch
         Task {
             subscriptions = await subscriptionManager.loadSubscriptions()
             startAutoUpdate()
+            // Auto-refresh subscriptions on launch to get latest traffic info
+            if !subscriptions.isEmpty {
+                try? await updateAllSubscriptions()
+            }
         }
     }
 

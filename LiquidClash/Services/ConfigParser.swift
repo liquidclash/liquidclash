@@ -62,8 +62,8 @@ struct ConfigParser {
         let password = parsed.user ?? ""
         let server = parsed.host ?? ""
         let port = parsed.port ?? 443
-        let name = parsed.fragment?.removingPercentEncoding ?? "\(server):\(port)"
-        let flag = guessFlag(from: name)
+        let rawName = parsed.fragment?.removingPercentEncoding ?? "\(server):\(port)"
+        let (flag, name) = extractFlag(from: rawName)
 
         let params = queryParams(from: parsed)
 
@@ -92,12 +92,12 @@ struct ConfigParser {
             return nil
         }
 
-        let name = json["ps"] as? String ?? json["remarks"] as? String ?? ""
+        let rawName = json["ps"] as? String ?? json["remarks"] as? String ?? ""
+        let (flag, name) = extractFlag(from: rawName)
         let server = json["add"] as? String ?? ""
         let port = (json["port"] as? Int) ?? Int(json["port"] as? String ?? "") ?? 443
         let uuid = json["id"] as? String ?? ""
         let cipher = json["scy"] as? String ?? "auto"
-        let flag = guessFlag(from: name)
 
         var node = ProxyNode(
             flag: flag, name: name, type: .vmess,
@@ -142,7 +142,7 @@ struct ConfigParser {
             let port = hostParts.count > 1 ? Int(hostParts[1]) ?? 443 : 443
 
             if name.isEmpty { name = "\(server):\(port)" }
-            let flag = guessFlag(from: name)
+            let (flag, cleanName) = extractFlag(from: name); name = cleanName
 
             return ProxyNode(
                 flag: flag, name: name, type: .shadowsocks,
@@ -164,7 +164,7 @@ struct ConfigParser {
             let port = hostPort.count > 1 ? Int(hostPort[1]) ?? 443 : 443
 
             if name.isEmpty { name = "\(server):\(port)" }
-            let flag = guessFlag(from: name)
+            let (flag, cleanName) = extractFlag(from: name); name = cleanName
 
             return ProxyNode(
                 flag: flag, name: name, type: .shadowsocks,
@@ -183,8 +183,8 @@ struct ConfigParser {
         let password = parsed.user ?? ""
         let server = parsed.host ?? ""
         let port = parsed.port ?? 443
-        let name = parsed.fragment?.removingPercentEncoding ?? "\(server):\(port)"
-        let flag = guessFlag(from: name)
+        let rawName = parsed.fragment?.removingPercentEncoding ?? "\(server):\(port)"
+        let (flag, name) = extractFlag(from: rawName)
 
         return ProxyNode(
             flag: flag, name: name, type: .hysteria2,
@@ -200,8 +200,8 @@ struct ConfigParser {
         let uuid = parsed.user ?? ""
         let server = parsed.host ?? ""
         let port = parsed.port ?? 443
-        let name = parsed.fragment?.removingPercentEncoding ?? "\(server):\(port)"
-        let flag = guessFlag(from: name)
+        let rawName = parsed.fragment?.removingPercentEncoding ?? "\(server):\(port)"
+        let (flag, name) = extractFlag(from: rawName)
 
         return ProxyNode(
             flag: flag, name: name, type: .vless,
@@ -273,13 +273,46 @@ struct ConfigParser {
         return nodes
     }
 
+    /// Extract leading emoji flag from name if present, return (flag, cleanName)
+    /// Only strips actual emoji (flags, symbols), not CJK/Hangul/other scripts.
+    static func extractFlag(from name: String) -> (flag: String, cleanName: String) {
+        var scalars = name.unicodeScalars[...]
+        var emojiEnd = scalars.startIndex
+
+        while emojiEnd < scalars.endIndex {
+            let s = scalars[emojiEnd]
+            if s.isASCII { break }
+            // Regional Indicator Symbols (flags): U+1F1E6..U+1F1FF
+            let isRegionalIndicator = (0x1F1E6...0x1F1FF).contains(s.value)
+            // Variation selectors, zero-width joiners (emoji modifiers)
+            let isModifier = s.value == 0xFE0F || s.value == 0x200D
+            // Only treat as emoji if Unicode says so AND it's not a letter/number
+            let isEmoji = (s.properties.isEmojiPresentation || isRegionalIndicator || isModifier)
+                          && !s.properties.isAlphabetic
+            if isEmoji {
+                emojiEnd = scalars.index(after: emojiEnd)
+            } else {
+                break
+            }
+        }
+
+        if emojiEnd > scalars.startIndex {
+            let flag = String(scalars[scalars.startIndex..<emojiEnd])
+            let rest = String(scalars[emojiEnd...]).trimmingCharacters(in: .whitespaces)
+            if !rest.isEmpty {
+                return (flag, rest)
+            }
+        }
+        return (guessFlag(from: name), name)
+    }
+
     private static func buildNodeFromDict(_ dict: [String: String]) -> ProxyNode? {
-        guard let name = dict["name"], !name.isEmpty else { return nil }
+        guard let rawName = dict["name"], !rawName.isEmpty else { return nil }
+        let (flag, name) = extractFlag(from: rawName)
         let typeStr = dict["type"] ?? "trojan"
         let type = ProxyType(rawValue: typeStr) ?? .trojan
         let server = dict["server"] ?? ""
         let port = Int(dict["port"] ?? "443") ?? 443
-        let flag = guessFlag(from: name)
 
         var node = ProxyNode(
             flag: flag, name: name, type: type,
@@ -385,12 +418,18 @@ struct ConfigParser {
                 continue
             }
 
-            if inRules && !line.hasPrefix(" ") && !line.hasPrefix("\t") && !trimmed.isEmpty {
+            if inRules && !line.hasPrefix(" ") && !line.hasPrefix("\t") && !trimmed.isEmpty
+                && !trimmed.hasPrefix("- ") {
                 break
             }
 
             guard inRules, trimmed.hasPrefix("- ") else { continue }
-            let ruleStr = String(trimmed.dropFirst(2))
+            var ruleStr = String(trimmed.dropFirst(2))
+            // Strip YAML single/double quotes: - 'DOMAIN,example.com,Proxy' → DOMAIN,example.com,Proxy
+            if (ruleStr.hasPrefix("'") && ruleStr.hasSuffix("'")) ||
+               (ruleStr.hasPrefix("\"") && ruleStr.hasSuffix("\"")) {
+                ruleStr = String(ruleStr.dropFirst().dropLast())
+            }
             if let rule = RuleItem.from(clashString: ruleStr, source: source) {
                 rules.append(rule)
             }
@@ -439,7 +478,7 @@ struct ConfigParser {
             (["japan", "tokyo", "osaka", "jp", "🇯🇵"], "🇯🇵"),
             (["singapore", "sg", "🇸🇬"], "🇸🇬"),
             (["hong kong", "hk", "hongkong", "🇭🇰"], "🇭🇰"),
-            (["taiwan", "tw", "taipei", "🇹🇼"], "🇹🇼"),
+            (["taiwan", "tw", "taipei", "🇹🇼"], "🇨🇳"),
             (["korea", "seoul", "kr", "🇰🇷"], "🇰🇷"),
             (["us", "united states", "los angeles", "san jose", "lax", "sjc", "america", "🇺🇸"], "🇺🇸"),
             (["uk", "london", "united kingdom", "gb", "🇬🇧"], "🇬🇧"),
@@ -458,5 +497,262 @@ struct ConfigParser {
             }
         }
         return "🌐"
+    }
+
+    // MARK: - Generate Clash YAML from Nodes
+
+    /// Convert parsed ProxyNode array to complete Clash YAML config.
+    /// Used when the subscription backend returns base64/URI format instead of YAML.
+    /// Generates proxies, proxy-groups, and comprehensive rules using mihomo's geosite/geoip.
+    static func generateClashYAML(from nodes: [ProxyNode]) -> String {
+        var yaml = """
+        # Generated by LiquidClash from subscription nodes
+        mixed-port: 7890
+        allow-lan: false
+        mode: rule
+        log-level: info
+        external-controller: '127.0.0.1:9090'
+
+        dns:
+          enable: true
+          enhanced-mode: fake-ip
+          fake-ip-range: 198.18.0.1/16
+          nameserver:
+            - https://dns.alidns.com/dns-query
+            - https://doh.pub/dns-query
+          fallback:
+            - https://dns.google/dns-query
+            - https://cloudflare-dns.com/dns-query
+          fallback-filter:
+            geoip: true
+            geoip-code: CN
+
+        """
+
+        // Proxies
+        yaml += "\nproxies:\n"
+        for node in nodes {
+            yaml += "  - name: \"\(escapeYAML(node.name))\"\n"
+            yaml += "    type: \(node.type.rawValue)\n"
+            yaml += "    server: \(node.server)\n"
+            yaml += "    port: \(node.port)\n"
+            if let password = node.password, !password.isEmpty {
+                yaml += "    password: \"\(escapeYAML(password))\"\n"
+            }
+            if let uuid = node.uuid, !uuid.isEmpty {
+                yaml += "    uuid: \(uuid)\n"
+            }
+            if let cipher = node.cipher, !cipher.isEmpty {
+                yaml += "    cipher: \(cipher)\n"
+            }
+            if let alterId = node.alterId {
+                yaml += "    alterId: \(alterId)\n"
+            }
+            yaml += "    udp: \(node.udp)\n"
+            if let sni = node.sni, !sni.isEmpty {
+                yaml += "    sni: \(sni)\n"
+            }
+            if let scv = node.skipCertVerify, scv {
+                yaml += "    skip-cert-verify: true\n"
+            }
+            if let tls = node.tls, tls {
+                yaml += "    tls: true\n"
+            }
+            if let net = node.network, !net.isEmpty {
+                yaml += "    network: \(net)\n"
+                if net == "ws" {
+                    yaml += "    ws-opts:\n"
+                    if let path = node.wsPath, !path.isEmpty {
+                        yaml += "      path: \"\(path)\"\n"
+                    }
+                    if let host = node.wsHost, !host.isEmpty {
+                        yaml += "      headers:\n"
+                        yaml += "        Host: \(host)\n"
+                    }
+                }
+            }
+        }
+
+        // Proxy Groups
+        let nodeNames = nodes.map { "\"\(escapeYAML($0.name))\"" }
+
+        // Build region-based sub-groups from node flags
+        let regionKeywords: [(keywords: [String], id: String, name: String)] = [
+            (["hong kong", "hk", "hongkong"], "HK", "HK"),
+            (["japan", "tokyo", "osaka", "jp"], "JP", "JP"),
+            (["singapore", "sg"], "SG", "SG"),
+            (["taiwan", "tw", "taipei"], "TW", "TW"),
+            (["united states", "us", "los angeles", "lax", "san jose", "sjc", "america"], "US", "US"),
+        ]
+        var regionNodes: [(id: String, name: String, members: [String])] = []
+        for region in regionKeywords {
+            let members = nodes.filter { node in
+                let lower = node.name.lowercased()
+                return region.keywords.contains { lower.contains($0) }
+            }.map { "\"\(escapeYAML($0.name))\"" }
+            if !members.isEmpty {
+                regionNodes.append((id: region.id, name: region.name, members: members))
+            }
+        }
+
+        yaml += "\nproxy-groups:\n"
+
+        // Main select group — includes Auto Select, region groups, service groups, and all nodes
+        yaml += "  - name: \"PROXY\"\n"
+        yaml += "    type: select\n"
+        yaml += "    proxies:\n"
+        yaml += "      - \"Auto Select\"\n"
+        for rg in regionNodes {
+            yaml += "      - \"\(rg.name)\"\n"
+        }
+        for name in nodeNames {
+            yaml += "      - \(name)\n"
+        }
+
+        // Auto select (url-test)
+        yaml += "  - name: \"Auto Select\"\n"
+        yaml += "    type: url-test\n"
+        yaml += "    url: \"http://www.gstatic.com/generate_204\"\n"
+        yaml += "    interval: 300\n"
+        yaml += "    tolerance: 50\n"
+        yaml += "    proxies:\n"
+        for name in nodeNames {
+            yaml += "      - \(name)\n"
+        }
+
+        // Region sub-groups (url-test within each region)
+        for rg in regionNodes {
+            yaml += "  - name: \"\(rg.name)\"\n"
+            yaml += "    type: url-test\n"
+            yaml += "    url: \"http://www.gstatic.com/generate_204\"\n"
+            yaml += "    interval: 300\n"
+            yaml += "    tolerance: 50\n"
+            yaml += "    proxies:\n"
+            for member in rg.members {
+                yaml += "      - \(member)\n"
+            }
+        }
+
+        // Service-specific select groups — each defaults to PROXY
+        let serviceGroups = ["YouTube", "Netflix", "Disney", "Spotify", "Telegram", "Google", "OpenAI", "Apple", "Microsoft", "Steam"]
+        for svc in serviceGroups {
+            yaml += "  - name: \"\(svc)\"\n"
+            yaml += "    type: select\n"
+            yaml += "    proxies:\n"
+            yaml += "      - \"PROXY\"\n"
+            yaml += "      - \"Auto Select\"\n"
+            yaml += "      - \"DIRECT\"\n"
+            for rg in regionNodes {
+                yaml += "      - \"\(rg.name)\"\n"
+            }
+            for name in nodeNames {
+                yaml += "      - \(name)\n"
+            }
+        }
+
+        // Fallback group
+        yaml += "  - name: \"Fallback\"\n"
+        yaml += "    type: fallback\n"
+        yaml += "    url: \"http://www.gstatic.com/generate_204\"\n"
+        yaml += "    interval: 300\n"
+        yaml += "    proxies:\n"
+        for name in nodeNames {
+            yaml += "      - \(name)\n"
+        }
+
+        // Rule Providers
+        yaml += """
+
+        rule-providers:
+          reject:
+            type: http
+            behavior: domain
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt"
+            path: ./ruleset/reject.yaml
+            interval: 86400
+          proxy:
+            type: http
+            behavior: domain
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt"
+            path: ./ruleset/proxy.yaml
+            interval: 86400
+          direct:
+            type: http
+            behavior: domain
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt"
+            path: ./ruleset/direct.yaml
+            interval: 86400
+          private:
+            type: http
+            behavior: domain
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt"
+            path: ./ruleset/private.yaml
+            interval: 86400
+          gfw:
+            type: http
+            behavior: domain
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt"
+            path: ./ruleset/gfw.yaml
+            interval: 86400
+          tld-not-cn:
+            type: http
+            behavior: domain
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt"
+            path: ./ruleset/tld-not-cn.yaml
+            interval: 86400
+          telegramcidr:
+            type: http
+            behavior: ipcidr
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt"
+            path: ./ruleset/telegramcidr.yaml
+            interval: 86400
+          cncidr:
+            type: http
+            behavior: ipcidr
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt"
+            path: ./ruleset/cncidr.yaml
+            interval: 86400
+          lancidr:
+            type: http
+            behavior: ipcidr
+            url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt"
+            path: ./ruleset/lancidr.yaml
+            interval: 86400
+
+        rules:
+          - RULE-SET,private,DIRECT
+          - RULE-SET,reject,REJECT
+          - GEOSITE,youtube,YouTube
+          - GEOSITE,netflix,Netflix
+          - GEOSITE,disney,Disney
+          - GEOSITE,spotify,Spotify
+          - GEOSITE,telegram,Telegram
+          - RULE-SET,telegramcidr,Telegram,no-resolve
+          - GEOSITE,google,Google
+          - GEOSITE,openai,OpenAI
+          - GEOSITE,apple,Apple
+          - GEOSITE,microsoft,Microsoft
+          - GEOSITE,steam,Steam
+          - RULE-SET,tld-not-cn,PROXY
+          - RULE-SET,gfw,PROXY
+          - RULE-SET,proxy,PROXY
+          - RULE-SET,direct,DIRECT
+          - RULE-SET,cncidr,DIRECT,no-resolve
+          - RULE-SET,lancidr,DIRECT,no-resolve
+          - GEOSITE,category-ads-all,REJECT
+          - GEOSITE,cn,DIRECT
+          - GEOSITE,geolocation-!cn,PROXY
+          - GEOIP,private,DIRECT,no-resolve
+          - GEOIP,CN,DIRECT,no-resolve
+          - MATCH,PROXY
+        """
+
+        return yaml
+    }
+
+    /// Escape special characters for YAML string values
+    private static func escapeYAML(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
     }
 }

@@ -8,18 +8,18 @@ struct ModeSelector: View {
         GlassEffectContainer(spacing: 10) {
             HStack(spacing: 0) {
                 ForEach(ProxyMode.allCases, id: \.self) { mode in
+                    let isSelected = selectedMode == mode
                     Button {
                         withAnimation(.smooth(duration: 0.22)) {
                             selectedMode = mode
                         }
                     } label: {
                         Text(LocalizedStringKey(mode.rawValue))
-                            .font(.system(size: 12.5, weight: .medium))
-                            .fontWeight(.medium)
+                            .font(.system(size: 12.5, weight: isSelected ? .bold : .medium))
                             .foregroundStyle(
-                                selectedMode == mode
-                                ? Color.primary.opacity(0.82)
-                                : Color.primary.opacity(0.48)
+                                isSelected
+                                ? Color.white
+                                : Color.primary.opacity(0.35)
                             )
                             .padding(.horizontal, 22)
                             .padding(.vertical, 8)
@@ -27,7 +27,9 @@ struct ModeSelector: View {
                     }
                     .buttonStyle(.plain)
                     .glassEffect(
-                        selectedMode == mode ? .regular.tint(.white.opacity(0.08)) : .identity,
+                        isSelected
+                            ? .regular.tint(Color.accentColor)
+                            : .identity,
                         in: Capsule()
                     )
                     .glassEffectID(mode.rawValue, in: namespace)

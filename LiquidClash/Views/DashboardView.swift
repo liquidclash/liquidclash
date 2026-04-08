@@ -29,8 +29,9 @@ struct DashboardView: View {
                     ), isConnecting: appState.isConnecting)
                         .glassEffectID("pill", in: dashboardNS)
 
-                    if appState.isConnected, let node = appState.activeNode {
-                        ActiveNodeCard(node: node, onSwitch: {
+                    if appState.isConnected, let nodeName = appState.proxyService.activeNodeName {
+                        let nodeLatency = appState.proxyService.nodes.first(where: { $0.name == nodeName })?.latency ?? 0
+                        ActiveNodeCard(nodeName: nodeName, groupName: appState.proxyService.activeGroupName, latency: nodeLatency, onSwitch: {
                             appState.selectedPage = .proxies
                         })
                             .glassEffectID("card", in: dashboardNS)
@@ -49,6 +50,11 @@ struct DashboardView: View {
                 }
 
                 Spacer()
+
+                // Network info bar (when connected)
+                if appState.isConnected {
+                    networkInfoBar
+                }
             }
             .padding(.horizontal, 32)
             .padding(.vertical, 12)
@@ -65,6 +71,62 @@ struct DashboardView: View {
     }
 
 
+    // MARK: - Network Info Bar
+
+    private var networkInfoBar: some View {
+        HStack(spacing: 24) {
+            infoItem(label: "IP", value: appState.networkInfo.ip)
+            infoItem(label: "AS Type", value: appState.networkInfo.asType)
+            infoItem(label: "City", value: appState.networkInfo.city)
+
+            Spacer()
+
+            // Traffic stats
+            HStack(spacing: 16) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    Text(formatSpeed(appState.trafficStats.uploadSpeed))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    Text(formatSpeed(appState.trafficStats.downloadSpeed))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+    }
+
+    private func infoItem(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .textCase(.uppercase)
+            Text(value)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private func formatSpeed(_ bytesPerSec: Int64) -> String {
+        let kb = Double(bytesPerSec) / 1024
+        if kb < 1024 { return String(format: "%.1f KB/s", kb) }
+        let mb = kb / 1024
+        return String(format: "%.1f MB/s", mb)
+    }
 }
 
 // MARK: - Previews
@@ -87,8 +149,7 @@ struct DashboardView: View {
     .environment({
         let state = AppState()
         state.isConnected = true
-        state.activeNode = mockProxyRegions.first?.nodes.first
-        state.networkInfo = NetworkInfo(ip: "192.0.2.1", networkType: "BGP / Residential", location: "Tokyo, JP")
+        state.networkInfo = NetworkInfo(ip: "192.0.2.1", asType: "ISP", city: "Tokyo, JP")
         return state
     }())
 }

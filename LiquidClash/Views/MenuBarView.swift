@@ -82,14 +82,9 @@ struct MenuBarView: View {
 
             // MARK: TUN Mode Toggle
             HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("TUN Mode")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.primary)
-                    Text("System-wide traffic capture")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
+                Text("TUN Mode")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary)
                 Spacer()
                 Toggle("", isOn: Binding(
                     get: { UserDefaults.standard.bool(forKey: SettingsKey.tunMode) },
@@ -188,61 +183,66 @@ struct MenuBarView: View {
 
 private struct NodeSelectorMenu: View {
     var appState: AppState
+    @State private var selected: String = ""
+
+    private let regionNames: Set<String> = ["HK","JP","SG","TW","US","UK","KR","DE","FR","CA","AU","IN","RU","BR","NL","Auto Select","PROXY","Proxies","Fallback","GLOBAL","Final","default"]
 
     var body: some View {
-        Menu {
-            ForEach(appState.proxyRegions) { region in
-                Section(region.name) {
-                    ForEach(region.nodes) { node in
-                        Button {
-                            appState.selectNode(node.id)
-                        } label: {
-                            HStack {
-                                Text("\(node.flag) \(node.name)")
-                                if node.id == appState.selectedNodeId {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
+        Picker("", selection: $selected) {
+            Text(String(localized: "No Node Selected")).tag("")
+
+            if appState.isConnected && !appState.proxyService.nodes.isEmpty {
+                Section("Nodes") {
+                    ForEach(appState.proxyService.nodes) { node in
+                        let delay = node.latency > 0 ? "\(node.latency)ms" : "-ms"
+                        Text("\(node.flag) \(ConfigParser.extractFlag(from: node.name).cleanName)   | \(delay)")
+                            .tag(node.name)
                     }
                 }
-            }
-        } label: {
-            nodeSelectorLabel
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-    }
 
-    private var nodeSelectorLabel: some View {
-        HStack(spacing: 8) {
-            ZStack {
-                Circle()
-                    .fill(Color.primary.opacity(0.08))
-                    .frame(width: 28, height: 28)
-                Image(systemName: "shield.checkered")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.primary)
+                Section("Services") {
+                    ForEach(appState.proxyService.groups.filter { !regionNames.contains($0.name) }) { group in
+                        let delay = group.latency > 0 ? "\(group.latency)ms" : "-ms"
+                        Text("\(group.name)   | \(delay)")
+                            .tag(group.name)
+                    }
+                }
+
+                Section("Regions") {
+                    ForEach(appState.proxyService.groups.filter { regionNames.contains($0.name) && $0.name != "GLOBAL" }) { group in
+                        let delay = group.latency > 0 ? "\(group.latency)ms" : "-ms"
+                        Text("\(group.name)   | \(delay)")
+                            .tag(group.name)
+                    }
+                }
+            } else {
+                ForEach(appState.proxyRegions.flatMap(\.nodes)) { node in
+                    Text("\(node.flag) \(node.name)")
+                        .tag(node.name)
+                }
             }
-            Text(appState.activeNode.map { "\($0.flag) \($0.name)" } ?? String(localized: "No Node Selected"))
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-            Spacer()
-            Image(systemName: "chevron.down")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.tertiary)
         }
-        .padding(.horizontal, 12)
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background {
-            RoundedRectangle(cornerRadius: 14)
-                .fill(Color.primary.opacity(0.05))
-        }
-        .overlay {
+        .frame(maxWidth: .infinity, minHeight: 42)
+        .background(Color.primary.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
             RoundedRectangle(cornerRadius: 14)
                 .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+        )
+        .onAppear {
+            selected = appState.proxyService.activeNodeName ?? ""
         }
-        .contentShape(Rectangle())
+        .onChange(of: appState.proxyService.activeNodeName) { _, newValue in
+            selected = newValue ?? ""
+        }
+        .onChange(of: selected) { _, newValue in
+            guard !newValue.isEmpty else { return }
+            appState.selectNode(newValue)
+        }
     }
 }
