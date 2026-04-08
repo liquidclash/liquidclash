@@ -3,6 +3,7 @@ import SwiftUI
 struct ActiveNodeCard: View {
     let nodeName: String
     var groupName: String?
+    var latency: Int = 0
     var onSwitch: (() -> Void)?
 
     private var flag: String {
@@ -51,6 +52,21 @@ struct ActiveNodeCard: View {
                     }
                 }
                 Spacer()
+                if latency > 0 {
+                    Text("\(latency)ms")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(latency < 200 ? Color(hex: "30D158") :
+                                        latency < 400 ? Color(hex: "FF9F0A") :
+                                        Color(hex: "FF3B30"))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            (latency < 200 ? Color(hex: "30D158") :
+                             latency < 400 ? Color(hex: "FF9F0A") :
+                             Color(hex: "FF3B30")).opacity(0.15),
+                            in: RoundedRectangle(cornerRadius: 6)
+                        )
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)

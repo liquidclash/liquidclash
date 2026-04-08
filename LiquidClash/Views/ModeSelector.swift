@@ -28,7 +28,7 @@ struct ModeSelector: View {
                     .buttonStyle(.plain)
                     .glassEffect(
                         isSelected
-                            ? .regular.tint(Color(hex: "4B6EFF").opacity(0.45))
+                            ? .regular.tint(Color.accentColor)
                             : .identity,
                         in: Capsule()
                     )

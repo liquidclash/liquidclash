@@ -308,6 +308,8 @@ final class AppState {
         if isConnected, let api = clashAPI {
             Task {
                 try? await api.updateMode(mode.rawValue.lowercased())
+                await MainActor.run { self.networkInfo = NetworkInfo() }
+                await fetchNetworkInfo()
             }
         }
     }

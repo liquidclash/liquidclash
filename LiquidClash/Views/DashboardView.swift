@@ -30,7 +30,8 @@ struct DashboardView: View {
                         .glassEffectID("pill", in: dashboardNS)
 
                     if appState.isConnected, let nodeName = appState.proxyService.activeNodeName {
-                        ActiveNodeCard(nodeName: nodeName, groupName: appState.proxyService.activeGroupName, onSwitch: {
+                        let nodeLatency = appState.proxyService.nodes.first(where: { $0.name == nodeName })?.latency ?? 0
+                        ActiveNodeCard(nodeName: nodeName, groupName: appState.proxyService.activeGroupName, latency: nodeLatency, onSwitch: {
                             appState.selectedPage = .proxies
                         })
                             .glassEffectID("card", in: dashboardNS)

@@ -123,8 +123,14 @@ struct ProxiesView: View {
         }
     }
 
+    @State private var expandedSections: Set<String> = []
+
     private func groupTagsSection(_ title: String, _ groups: [ProxyService.MihomoGroup]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let maxVisible = 6 // 3 columns × 2 rows
+        let isExpanded = expandedSections.contains(title)
+        let visibleGroups = isExpanded ? groups : Array(groups.prefix(maxVisible))
+
+        return VStack(alignment: .leading, spacing: 8) {
             Text(title)
                 .font(.system(size: 11, weight: .semibold))
                 .kerning(1.0)
@@ -132,7 +138,7 @@ struct ProxiesView: View {
 
             let columns = [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
             LazyVGrid(columns: columns, spacing: 8) {
-                ForEach(groups) { group in
+                ForEach(visibleGroups) { group in
                     let icon = serviceIcons[group.name] ?? (group.isSelector ? "square.grid.2x2.fill" : "bolt.fill")
                     let target = group.now ?? (group.isSelector ? "Select" : "Auto")
                     let isActive = group.name == appState.proxyService.activeNodeName
@@ -172,6 +178,27 @@ struct ProxiesView: View {
                     }
                     .buttonStyle(.plain)
                 }
+            }
+
+            if groups.count > maxVisible {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        if isExpanded {
+                            expandedSections.remove(title)
+                        } else {
+                            expandedSections.insert(title)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(isExpanded ? "Collapse" : "\(groups.count - maxVisible) more")
+                            .font(.system(size: 11, weight: .medium))
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
         }
     }
