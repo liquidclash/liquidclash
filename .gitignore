@@ -21,4 +21,4 @@ LiquidClash/design/
 docs/
 
 # Rust build artifacts
-Tools/clash-fetcher/target/
+**/target/
