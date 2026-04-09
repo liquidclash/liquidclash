@@ -175,11 +175,7 @@ private struct LogEntryRow: View {
                         .font(.system(size: 14))
                     Text(entry.nodeName)
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(
-                            entry.type == .rejected
-                                ? .secondary
-                                : Color(hex: "7A7B9F")
-                        )
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 .frame(width: 160, alignment: .leading)

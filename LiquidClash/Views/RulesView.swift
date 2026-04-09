@@ -200,7 +200,7 @@ struct RulesView: View {
                         Text("Import")
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .foregroundStyle(.primary)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                 }
@@ -220,7 +220,7 @@ struct RulesView: View {
                         Text("Export")
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .foregroundStyle(.primary)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                 }

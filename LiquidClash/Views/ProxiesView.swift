@@ -40,28 +40,8 @@ struct ProxiesView: View {
                         groupTagsSection("REGIONS", regionGroups)
                     }
 
-                    // Individual nodes from mihomo API, or local cache when not connected
-                    if !appState.proxyService.nodes.isEmpty {
-                        nodesSection
-                    } else if !appState.proxyRegions.filter({ $0.id != "custom" }).isEmpty {
-                        // Not connected: show local cached nodes
-                        ForEach(appState.proxyRegions.filter { $0.id != "custom" }) { region in
-                            RegionGroupView(
-                                region: region,
-                                selectedNodeId: appState.selectedNodeId,
-                                onToggleExpand: {
-                                    withAnimation(.easeInOut(duration: 0.25)) {
-                                        appState.toggleRegion(region.id)
-                                    }
-                                },
-                                onSelectNode: { node in
-                                    withAnimation(.easeInOut(duration: 0.2)) {
-                                        appState.selectNode(node.id)
-                                    }
-                                }
-                            )
-                        }
-                    }
+                    // Individual nodes: from mihomo API when connected, local cache otherwise
+                    nodesSection
 
                     // Legacy local regions (custom nodes)
                     ForEach(appState.proxyRegions.filter { $0.id == "custom" }) { region in
@@ -224,19 +204,67 @@ struct ProxiesView: View {
     // MARK: - Nodes Section (flat list from mihomo API)
 
     private var nodesSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("NODES")
-                .font(.system(size: 11, weight: .semibold))
-                .kerning(1.0)
-                .foregroundStyle(.secondary)
+        let mihomoNodes = appState.proxyService.nodes
+        let localNodes = appState.proxyRegions.filter { $0.id != "custom" }.flatMap(\.nodes)
+        let hasNodes = !mihomoNodes.isEmpty || !localNodes.isEmpty
 
-            let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
-            LazyVGrid(columns: columns, spacing: 12) {
-                ForEach(appState.proxyService.nodes) { node in
-                    nodeCard(node)
+        return Group {
+            if hasNodes {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("NODES")
+                        .font(.system(size: 11, weight: .semibold))
+                        .kerning(1.0)
+                        .foregroundStyle(.secondary)
+
+                    let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
+                    LazyVGrid(columns: columns, spacing: 12) {
+                        if !mihomoNodes.isEmpty {
+                            ForEach(mihomoNodes) { node in
+                                nodeCard(node)
+                            }
+                        } else {
+                            ForEach(localNodes) { node in
+                                localNodeCard(node)
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private func localNodeCard(_ node: ProxyNode) -> some View {
+        let isActive = appState.selectedNodeId == node.id || appState.selectedNodeId == node.name
+        return Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                appState.selectNode(node.name)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(node.flag)
+                    .font(.system(size: 14))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(node.name)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(node.type.rawValue)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .background(
+                isActive ? Color.accentColor.opacity(0.15) : .white.opacity(colorScheme == .dark ? 0.06 : 0.7),
+                in: RoundedRectangle(cornerRadius: 12)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(isActive ? Color.accentColor.opacity(0.5) : .white.opacity(colorScheme == .dark ? 0.12 : 0.7), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private func nodeCard(_ node: ProxyService.MihomoNode) -> some View {
@@ -341,7 +369,7 @@ struct ProxiesView: View {
                         Text("Test All")
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .foregroundStyle(.primary)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                 }
@@ -385,7 +413,7 @@ struct ProxiesView: View {
                                 Text("Update All")
                                     .font(.system(size: 11, weight: .medium))
                             }
-                            .foregroundStyle(Color(hex: "4B6EFF"))
+                            .foregroundStyle(.primary)
                         }
                     }
                     .buttonStyle(.plain)
@@ -526,7 +554,7 @@ struct ProxiesView: View {
                     } label: {
                         Image(systemName: "doc.badge.plus")
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(Color(hex: "4B6EFF"))
+                            .foregroundStyle(.primary)
                             .padding(8)
                     }
                     .buttonStyle(.plain)
@@ -554,7 +582,7 @@ struct ProxiesView: View {
                             Text("Import from Clash Verge")
                                 .font(.system(size: 11, weight: .medium))
                         }
-                        .foregroundStyle(Color(hex: "4B6EFF"))
+                        .foregroundStyle(.primary)
                     }
                     .buttonStyle(.plain)
                     .disabled(isUpdatingSubscription)
@@ -572,7 +600,7 @@ struct ProxiesView: View {
                         Text("Add Subscription")
                             .font(.system(size: 11, weight: .medium))
                     }
-                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .foregroundStyle(.primary)
                 }
                 .buttonStyle(.plain)
             }

@@ -874,39 +874,25 @@ final class AppState {
             try? await Task.sleep(for: .seconds(2))
             guard isConnected, !Task.isCancelled else { return }
 
-            if let result = await curlViaProxy("https://ifconfig.me")?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !result.isEmpty, !result.contains("<") {
-                ip = result
+            // ip-api.com returns JSON with IP + city + ISP in one call (works in rule mode)
+            if let raw = await curlViaProxy("http://ip-api.com/json"),
+               let data = raw.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let query = json["query"] as? String, !query.isEmpty {
+                ip = query
+                let city = json["city"] as? String ?? "--"
+                let country = json["countryCode"] as? String ?? ""
+                let isp = json["isp"] as? String ?? "--"
+                await MainActor.run {
+                    self.networkInfo.ip = ip
+                    self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
+                    self.networkInfo.asType = isp
+                }
                 break
             }
         }
 
         guard !ip.isEmpty, isConnected, !Task.isCancelled else { return }
-
-        // Show IP immediately
-        await MainActor.run { self.networkInfo.ip = ip }
-
-        // City + org from ipwho.is
-        if let raw = await curlViaProxy("https://ipwho.is/"),
-           let data = raw.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            let city = json["city"] as? String ?? "--"
-            let country = json["country_code"] as? String ?? ""
-            await MainActor.run {
-                self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
-            }
-        }
-
-        // ASN type from ipapi.is (direct, no proxy needed)
-        if let url = URL(string: "https://api.ipapi.is/?q=\(ip)"),
-           let (data, _) = try? await URLSession.shared.data(from: url),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let asnObj = json["asn"] as? [String: Any],
-           let type = asnObj["type"] as? String, !type.isEmpty {
-            await MainActor.run {
-                self.networkInfo.asType = type.uppercased()
-            }
-        }
     }
 
     // MARK: - Update Connections from WebSocket

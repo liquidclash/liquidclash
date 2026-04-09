@@ -88,7 +88,7 @@ struct SettingsView: View {
                 TextField("", text: $mixedPort)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .foregroundStyle(.primary)
                     .multilineTextAlignment(.center)
                     .frame(width: 72)
                     .padding(.vertical, 6)
@@ -152,7 +152,7 @@ struct SettingsView: View {
             SettingRow(label: "Glass Transparency", subtitle: "Adjust backdrop blur intensity") {
                 HStack(spacing: 8) {
                     Slider(value: $glassTransparency, in: 0...100)
-                        .tint(Color(hex: "4B6EFF"))
+                        .tint(.accentColor)
                         .frame(maxWidth: 140)
                 }
             }
@@ -197,7 +197,7 @@ struct SettingsView: View {
                 Spacer()
                 Toggle("", isOn: $checkForUpdates)
                     .toggleStyle(.switch)
-                    .tint(Color(hex: "4B6EFF"))
+                    .tint(.accentColor)
                     .labelsHidden()
             }
 
@@ -257,7 +257,7 @@ struct SettingsView: View {
                     .foregroundStyle(.primary)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(Color(hex: "7A7B9F"))
+                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
@@ -366,7 +366,7 @@ private struct SettingToggleRow: View {
             Spacer()
             Toggle("", isOn: $isOn)
                 .toggleStyle(.switch)
-                .tint(Color(hex: "4B6EFF"))
+                .tint(.accentColor)
                 .labelsHidden()
         }
         .padding(.vertical, 4)

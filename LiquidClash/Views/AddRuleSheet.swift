@@ -237,7 +237,7 @@ struct AddRuleSheet: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(LocalizedStringKey(label))
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(Color(hex: "7A7B9F"))
+                .foregroundStyle(.secondary)
             content()
         }
     }

@@ -32,7 +32,7 @@ struct WelcomeView: View {
 
                 Text("Import your proxy configuration to get started.")
                     .font(.system(size: 14))
-                    .foregroundStyle(Color(hex: "7A7B9F"))
+                    .foregroundStyle(.secondary)
                     .padding(.bottom, 32)
 
                 // Drop zone
@@ -117,7 +117,7 @@ struct WelcomeView: View {
                     Text("View Documentation")
                         .font(.system(size: 12, weight: .medium))
                 }
-                .foregroundStyle(Color(hex: "7A7B9F"))
+                .foregroundStyle(.secondary)
                 .padding(.bottom, 24)
             }
             .frame(maxWidth: 600)
@@ -134,7 +134,7 @@ struct WelcomeView: View {
 
             Text("Drop YAML config file here")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(Color(hex: "7A7B9F"))
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
         .frame(height: 120)

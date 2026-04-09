@@ -128,7 +128,7 @@ struct LogsView: View {
                         Text("Export")
                             .font(.system(size: 12, weight: .medium))
                     }
-                    .foregroundStyle(Color(hex: "4B6EFF"))
+                    .foregroundStyle(.primary)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
                     .background(.white.opacity(colorScheme == .dark ? 0.08 : 0.4), in: Capsule())
