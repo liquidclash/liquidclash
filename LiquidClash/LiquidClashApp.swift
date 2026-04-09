@@ -7,12 +7,22 @@ import AppKit
 class AppDelegate: NSObject, NSApplicationDelegate {
     /// Reference to app state for cleanup on termination
     var appState: AppState?
+    /// URL received before appState was ready
+    var pendingImportURL: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Register URL schemes with Launch Services (ensures clash:// works immediately)
         if let appURL = Bundle.main.bundleURL as CFURL? {
             LSRegisterURL(appURL, true)
         }
+
+        // Register for URL open events (works even when no window is open)
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:replyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
 
         // Fallback: force-resize window if SwiftUI still created it too small
         enforceDefaultWindowSize()
@@ -52,6 +62,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     window.setFrame(NSRect(origin: origin, size: defaultSize), display: true, animate: false)
                 }
             }
+        }
+    }
+
+    @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, replyEvent: NSAppleEventDescriptor) {
+        let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue ?? "nil"
+        writeDebug("handleGetURLEvent: urlString=\(urlString), appState=\(appState != nil)")
+
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "clash" || scheme == "liquidclash") else {
+            writeDebug("handleGetURLEvent: scheme mismatch")
+            return
+        }
+
+        writeDebug("handleGetURLEvent: host=\(url.host ?? "nil")")
+        guard url.host == "install-config",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let subURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
+              !subURL.isEmpty else {
+            writeDebug("handleGetURLEvent: parse failed")
+            return
+        }
+
+        writeDebug("handleGetURLEvent: subURL=\(subURL.prefix(80))")
+        // Mark onboarding complete so app shows main UI
+        UserDefaults.standard.set(true, forKey: SettingsKey.hasCompletedOnboarding)
+
+        if let appState {
+            appState.addSubscription(url: subURL, name: "")
+            appState.loadInitialData()
+            Task { try? await appState.updateSubscription(url: subURL) }
+            writeDebug("handleGetURLEvent: imported!")
+        } else {
+            pendingImportURL = subURL
+            writeDebug("handleGetURLEvent: queued (appState nil)")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func writeDebug(_ msg: String) {
+        let line = "\(Date()): \(msg)\n"
+        let path = "/tmp/liquidclash_url.log"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(line.data(using: .utf8)!)
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
         }
     }
 
@@ -153,25 +211,43 @@ struct LiquidClashApp: App {
                 if hasCompletedOnboarding {
                     appState.loadInitialData()
                 }
+                // Process URL that arrived before appState was ready
+                if let pending = appDelegate.pendingImportURL {
+                    appDelegate.pendingImportURL = nil
+                    appState.addSubscription(url: pending, name: "")
+                    Task { try? await appState.updateAllSubscriptions() }
+                }
             }
             .preferredColorScheme(preferredScheme)
             .environment(\.locale, appLocale)
             .onOpenURL { url in
-                handleIncomingURL(url)
-            }
-            .alert("Import Subscription", isPresented: $showImportAlert) {
-                Button("Import") {
-                    if let subURL = pendingSubscriptionURL {
-                        appState.addSubscription(url: subURL, name: "")
-                        Task { try? await appState.updateAllSubscriptions() }
+                let log = { (msg: String) in
+                    let line = "\(Date()): [onOpenURL] \(msg)\n"
+                    let path = "/tmp/liquidclash_url.log"
+                    if let fh = FileHandle(forWritingAtPath: path) {
+                        fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); fh.closeFile()
+                    } else {
+                        FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
                     }
-                    pendingSubscriptionURL = nil
                 }
-                Button("Cancel", role: .cancel) {
-                    pendingSubscriptionURL = nil
+                log("received: \(url.absoluteString.prefix(120))")
+                log("scheme=\(url.scheme ?? "nil"), host=\(url.host ?? "nil")")
+                guard let scheme = url.scheme?.lowercased(),
+                      (scheme == "clash" || scheme == "liquidclash"),
+                      url.host == "install-config",
+                      let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                      let subURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
+                      !subURL.isEmpty else {
+                    log("guard FAILED")
+                    return
                 }
-            } message: {
-                Text("Add subscription from URL?\n\(pendingSubscriptionURL ?? "")")
+                log("subURL=\(subURL.prefix(80))...")
+                UserDefaults.standard.set(true, forKey: SettingsKey.hasCompletedOnboarding)
+                appState.addSubscription(url: subURL, name: "")
+                appState.loadInitialData()
+                Task { try? await appState.updateSubscription(url: subURL) }
+                NSApp.activate(ignoringOtherApps: true)
+                log("imported!")
             }
         }
         .defaultSize(width: 920, height: 600)
