@@ -22,9 +22,19 @@ struct AddNodeSheet: View {
 
     private var dialerOptions: [(value: String, label: String)] {
         var options: [(value: String, label: String)] = [("", "None (Direct)")]
-        for region in appState.proxyRegions {
-            for node in region.nodes {
-                options.append((node.name, "\(node.flag) \(node.name)"))
+        // Use proxyService nodes (mihomo actual names with emoji) when connected
+        if !appState.proxyService.nodes.isEmpty {
+            for node in appState.proxyService.nodes {
+                options.append((node.name, node.name))
+            }
+            for group in appState.proxyService.groups {
+                options.append((group.name, group.name))
+            }
+        } else {
+            for region in appState.proxyRegions {
+                for node in region.nodes {
+                    options.append((node.name, "\(node.flag) \(node.name)"))
+                }
             }
         }
         return options
@@ -193,7 +203,9 @@ struct AddNodeSheet: View {
                     }
                     server = node.server
                     port = String(node.port)
+                    username = node.username ?? ""
                     password = node.password ?? node.uuid ?? ""
+                    dialerProxy = node.relay == "Direct" ? "" : node.relay
                     enableUDP = node.udp
                 }
             }
@@ -234,7 +246,7 @@ struct AddNodeSheet: View {
 
         let flag = ConfigParser.guessFlag(from: nodeName)
 
-        let node = ProxyNode(
+        var node = ProxyNode(
             id: editingNode?.id ?? UUID().uuidString,
             flag: flag.isEmpty ? "🌐" : flag,
             name: nodeName.trimmingCharacters(in: .whitespaces),
@@ -242,10 +254,15 @@ struct AddNodeSheet: View {
             server: server.trimmingCharacters(in: .whitespaces),
             port: portNum,
             relay: dialerProxy.isEmpty ? "Direct" : dialerProxy,
+            username: username.isEmpty ? nil : username,
             password: password.isEmpty ? nil : password,
             uuid: proxyType == .vmess || proxyType == .vless ? password : nil,
             udp: enableUDP
         )
+        // Dialer proxy (前置代理)
+        if !dialerProxy.isEmpty && dialerProxy != "Direct" {
+            node.relay = dialerProxy
+        }
 
         onAdd?(node)
         close()

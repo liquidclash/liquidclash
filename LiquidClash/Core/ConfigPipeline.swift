@@ -41,6 +41,38 @@ struct ConfigPipeline {
       auto-detect-interface: true
     """
 
+    /// All proxy names found in the subscription YAML (for resolving dialer-proxy names)
+    private static func extractProxyNames(from lines: [String]) -> [String] {
+        var names: [String] = []
+        var inProxies = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "proxies:" { inProxies = true; continue }
+            if inProxies && !line.isEmpty && !line.hasPrefix(" ") && !line.hasPrefix("\t") && !trimmed.hasPrefix("-") && !trimmed.hasPrefix("#") {
+                inProxies = false
+            }
+            guard inProxies else { continue }
+            // Multi-line format: "- name: xxx"
+            if trimmed.hasPrefix("- name:") {
+                let name = trimmed.replacingOccurrences(of: "- name:", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                if !name.isEmpty { names.append(name) }
+            }
+            // Inline format: "- {name: xxx, ...}"
+            if trimmed.hasPrefix("- {") && trimmed.contains("name:") {
+                if let nameStart = trimmed.range(of: "name:") {
+                    let afterName = trimmed[nameStart.upperBound...].trimmingCharacters(in: .whitespaces)
+                    let nameValue = afterName.prefix(while: { $0 != "," && $0 != "}" })
+                        .trimmingCharacters(in: .whitespaces)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                    if !nameValue.isEmpty { names.append(String(nameValue)) }
+                }
+            }
+        }
+        return names
+    }
+
     /// Generate runtime.yaml from subscription YAML + overlay config + optional custom nodes.
     static func generateRuntime(subscriptionYAML: String, overlay: OverlayConfig, customNodes: [ProxyNode] = [], outputPath: URL) throws {
         var lines = subscriptionYAML.components(separatedBy: .newlines)
@@ -88,14 +120,40 @@ struct ConfigPipeline {
             header += "\n" + defaultTUN + "\n"
         }
 
-        // Inject custom nodes into proxies section
+        // Inject custom nodes into proxies section and first Selector group
         if !customNodes.isEmpty {
-            let insertion = customNodes.map { nodeToYAML($0) }.joined()
+            let proxyNames = extractProxyNames(from: lines)
+            let insertion = customNodes.map { nodeToYAML($0, knownNames: proxyNames) }.joined()
             if let proxiesIdx = lines.firstIndex(where: { $0.hasPrefix("proxies:") }) {
                 lines.insert(insertion, at: proxiesIdx + 1)
             } else {
                 lines.append("proxies:")
                 lines.append(insertion)
+            }
+
+            // Add custom node names to Selector groups so mihomo can select them
+            let customNames = customNodes.map { $0.name }
+            let nameEntries = customNames.map { "      - \"\($0)\"" }.joined(separator: "\n")
+            if let groupsIdx = lines.firstIndex(where: { $0.hasPrefix("proxy-groups:") }) {
+                var i = groupsIdx + 1
+                var foundTarget = false
+                while i < lines.count {
+                    let line = lines[i]
+                    if !line.isEmpty && !line.hasPrefix(" ") && !line.hasPrefix("\t") && !line.hasPrefix("-") && !line.hasPrefix("#") {
+                        break
+                    }
+                    // Look for "- name: Proxies" or "- name: PROXY" group
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if trimmed.contains("name:") && (trimmed.contains("Proxies") || trimmed.contains("PROXY")) {
+                        foundTarget = true
+                    }
+                    // Insert after the "proxies:" line of the target group
+                    if foundTarget && trimmed == "proxies:" {
+                        lines.insert(nameEntries, at: i + 1)
+                        break
+                    }
+                    i += 1
+                }
             }
         }
 
@@ -104,16 +162,25 @@ struct ConfigPipeline {
     }
 
     /// Convert a ProxyNode to mihomo YAML proxy entry.
-    private static func nodeToYAML(_ node: ProxyNode) -> String {
+    private static func nodeToYAML(_ node: ProxyNode, knownNames: [String] = []) -> String {
         var y = "  - name: \"\(node.name)\"\n"
         y += "    type: \(node.type.rawValue)\n"
         y += "    server: \(node.server)\n"
         y += "    port: \(node.port)\n"
+        if let user = node.username, !user.isEmpty { y += "    username: \"\(user)\"\n" }
         if let pw = node.password, !pw.isEmpty { y += "    password: \"\(pw)\"\n" }
         if let uuid = node.uuid, !uuid.isEmpty { y += "    uuid: \(uuid)\n" }
         if let cipher = node.cipher, !cipher.isEmpty { y += "    cipher: \(cipher)\n" }
         if let aid = node.alterId { y += "    alterId: \(aid)\n" }
         y += "    udp: \(node.udp)\n"
+        if !node.relay.isEmpty && node.relay != "Direct" {
+            // Resolve dialer-proxy name: match against known proxy names (with emoji)
+            let relay = node.relay
+            let resolved = knownNames.first(where: { $0 == relay })  // exact match first
+                ?? knownNames.first(where: { $0.contains(relay) })   // fuzzy: "Japan | 01" matches "🇯🇵 Japan | 01"
+                ?? relay
+            y += "    dialer-proxy: \"\(resolved)\"\n"
+        }
         if let sni = node.sni, !sni.isEmpty { y += "    sni: \(sni)\n" }
         if let scv = node.skipCertVerify, scv { y += "    skip-cert-verify: true\n" }
         if let tls = node.tls, tls { y += "    tls: true\n" }

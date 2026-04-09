@@ -60,6 +60,7 @@ struct ProxyNode: Identifiable, Codable, Hashable {
     var isActive: Bool = false
 
     // Connection parameters
+    var username: String?
     var password: String?
     var uuid: String?
     var cipher: String?
@@ -86,7 +87,7 @@ struct ProxyNode: Identifiable, Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, flag, name, type, server, port, relay, latency, isActive
-        case password, uuid, cipher, udp
+        case username, password, uuid, cipher, udp
         case sni, skipCertVerify, network, wsPath, wsHost, tls, alterId
     }
 }

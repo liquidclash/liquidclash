@@ -73,12 +73,22 @@ final class ProxyService {
             await MainActor.run {
                 self.groups = fetchedGroups.sorted { $0.name < $1.name }
                 self.nodes = fetchedNodes.sorted { $0.name < $1.name }
-                // Find main proxy group (usually "Proxies" or "PROXY")
+                // Find main proxy group, only set default if current selection is absent
                 if let main = fetchedGroups.first(where: { $0.name == "Proxies" })
                     ?? fetchedGroups.first(where: { $0.name == "PROXY" })
                     ?? fetchedGroups.first(where: { $0.isSelector }) {
-                    self.activeGroupName = main.name
-                    self.activeNodeName = main.now
+                    let currentName = self.activeNodeName
+                    // Try exact match first, then fuzzy (local names may lack emoji prefix)
+                    if let currentName,
+                       let resolved = fetchedNodes.first(where: { $0.name == currentName })?.name
+                        ?? fetchedGroups.first(where: { $0.name == currentName })?.name
+                        ?? fetchedNodes.first(where: { ConfigParser.extractFlag(from: $0.name).cleanName == currentName })?.name
+                        ?? fetchedGroups.first(where: { ConfigParser.extractFlag(from: $0.name).cleanName == currentName })?.name {
+                        self.activeNodeName = resolved
+                    } else {
+                        self.activeGroupName = main.name
+                        self.activeNodeName = main.now
+                    }
                 }
             }
         } catch {

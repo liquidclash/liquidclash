@@ -84,6 +84,7 @@ final class AppState {
     private var clashAPI: ClashAPI?
     private var webSocket: ClashWebSocket?
     private var connectTask: Task<Void, Never>?
+    private var networkInfoTask: Task<Void, Never>?
 
     // MARK: - Init
 
@@ -266,10 +267,19 @@ final class AppState {
         ws.startConnectionsStream()
         ws.startLogsStream(level: logLevel)
 
-        // Fetch proxy data from mihomo API (single source of truth)
+        // Fetch proxy data from mihomo API, then restore user's selection
+        let savedSelection = activeNode?.name ?? selectedNodeId
         Task {
             await proxyService.refresh()
-            await fetchNetworkInfo()
+            await MainActor.run {
+                if let name = savedSelection, !name.isEmpty {
+                    selectNode(name)
+                }
+            }
+            // fetchNetworkInfo runs off MainActor (has blocking curl)
+            if savedSelection == nil || savedSelection?.isEmpty == true {
+                await fetchNetworkInfo()
+            }
         }
         Task { await fetchActiveRules() }
 
@@ -285,17 +295,50 @@ final class AppState {
 
     // MARK: - Proxy Management
 
-    /// Select a node/group by name. Uses ProxyService to interact with mihomo directly.
-    func selectNode(_ nodeName: String) {
+    /// Select a node/group by name or id.
+    func selectNode(_ nameOrId: String) {
+        // Update local selection state
+        selectedNodeId = nameOrId
+        activeNode = proxyRegions.flatMap(\.nodes).first(where: { $0.name == nameOrId || $0.id == nameOrId })
+            ?? proxyRegions.flatMap(\.nodes).first(where: { ConfigParser.extractFlag(from: nameOrId).cleanName == $0.name })
+
+        // Resolve to mihomo name: local names may lack emoji prefix that mihomo uses
+        let nodeName: String
+        if let match = proxyService.nodes.first(where: { $0.name == nameOrId })
+            ?? proxyService.nodes.first(where: { ConfigParser.extractFlag(from: $0.name).cleanName == nameOrId }) {
+            nodeName = match.name
+        } else if let match = proxyService.groups.first(where: { $0.name == nameOrId }) {
+            nodeName = match.name
+        } else {
+            nodeName = activeNode?.name ?? nameOrId
+        }
+        proxyService.activeNodeName = nodeName
+        // Custom node: set group to nil so dashboard doesn't show "Proxies"
+        let isCustom = proxyRegions.first(where: { $0.id == "custom" })?.nodes.contains(where: { $0.name == nodeName || $0.id == nameOrId }) ?? false
+        if isCustom {
+            proxyService.activeGroupName = nil
+        }
+
         guard isConnected else { return }
-        Task {
-            // Find which Selector group contains this node/group name and switch
-            for group in proxyService.groups where group.isSelector && group.all.contains(nodeName) {
-                await proxyService.selectProxy(group: group.name, proxy: nodeName)
+        // Cancel previous IP detection
+        networkInfoTask?.cancel()
+        networkInfo = NetworkInfo()
+        let groups = proxyService.groups
+        let api = clashAPI
+        networkInfoTask = Task.detached { [weak self] in
+            // Batch: select in all matching groups via API, then refresh once
+            let matchingGroups = groups.filter { $0.isSelector && $0.all.contains(nodeName) }
+            guard let api else { return }
+            for group in matchingGroups {
+                try? await api.selectProxy(group: group.name, proxy: nodeName)
             }
-            // Refresh IP after switch
-            await MainActor.run { self.networkInfo = NetworkInfo() }
-            await fetchNetworkInfo()
+            if !matchingGroups.isEmpty {
+                try? await api.closeAllConnections()
+                await self?.proxyService.refresh()
+            }
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            await self?.fetchNetworkInfo()
         }
     }
 
@@ -790,54 +833,51 @@ final class AppState {
         }
     }
 
-    /// URLSession configured to route through mihomo proxy
-    private func makeProxySession(port: Int) -> URLSession {
-        let config = URLSessionConfiguration.ephemeral
-        config.connectionProxyDictionary = [
-            kCFNetworkProxiesHTTPEnable: true,
-            kCFNetworkProxiesHTTPProxy: "127.0.0.1",
-            kCFNetworkProxiesHTTPPort: port,
-            kCFNetworkProxiesHTTPSEnable: true,
-            kCFNetworkProxiesHTTPSProxy: "127.0.0.1",
-            kCFNetworkProxiesHTTPSPort: port,
-        ]
-        config.timeoutIntervalForRequest = 5
-        return URLSession(configuration: config)
+    /// Run curl through mihomo proxy on a background thread (never blocks main thread)
+    private func curlViaProxy(_ urlString: String, timeout: Int = 6) async -> String? {
+        let port = config.mixedPort
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                proc.arguments = ["-s", "--max-time", "\(timeout)", "-x", "http://127.0.0.1:\(port)", urlString]
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = FileHandle.nullDevice
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    guard proc.terminationStatus == 0 else {
+                        continuation.resume(returning: nil)
+                        return
+                    }
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    continuation.resume(returning: String(data: data, encoding: .utf8))
+                } catch {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
     }
 
     private func fetchNetworkInfo() async {
-        let port = config.mixedPort
-        let session = makeProxySession(port: port)
+        // Clear old values and close stale connections
+        await MainActor.run { self.networkInfo = NetworkInfo() }
+        if let api = clashAPI {
+            try? await api.closeAllConnections()
+        }
 
-        // Retry until proxy is ready (providers loading)
         var ip = ""
-        for attempt in 1...8 {
+
+        // Retry until proxy is ready
+        for _ in 1...8 {
             try? await Task.sleep(for: .seconds(2))
             guard isConnected, !Task.isCancelled else { return }
 
-            // Fast: plain text IP
-            if let (data, _) = try? await session.data(from: URL(string: "https://ifconfig.me")!),
-               let result = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+            if let result = await curlViaProxy("https://ifconfig.me")?.trimmingCharacters(in: .whitespacesAndNewlines),
                !result.isEmpty, !result.contains("<") {
                 ip = result
                 break
-            }
-
-            if attempt >= 3 {
-                if let (data, _) = try? await session.data(from: URL(string: "https://ipwho.is/")!),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let fetchedIP = json["ip"] as? String, !fetchedIP.isEmpty {
-                    ip = fetchedIP
-                    let city = json["city"] as? String ?? "--"
-                    let country = json["country_code"] as? String ?? ""
-                    let conn = json["connection"] as? [String: Any]
-                    let org = conn?["org"] as? String ?? "--"
-                    await MainActor.run {
-                        self.networkInfo.ip = ip
-                        self.networkInfo.city = country.isEmpty ? city : "\(city), \(country)"
-                    }
-                    break
-                }
             }
         }
 
@@ -846,8 +886,9 @@ final class AppState {
         // Show IP immediately
         await MainActor.run { self.networkInfo.ip = ip }
 
-        // City from ipwho.is
-        if let (data, _) = try? await session.data(from: URL(string: "https://ipwho.is/")!),
+        // City + org from ipwho.is
+        if let raw = await curlViaProxy("https://ipwho.is/"),
+           let data = raw.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             let city = json["city"] as? String ?? "--"
             let country = json["country_code"] as? String ?? ""
@@ -856,7 +897,7 @@ final class AppState {
             }
         }
 
-        // ASN type (hosting/isp/business) from ipapi.is — direct connection, no proxy needed
+        // ASN type from ipapi.is (direct, no proxy needed)
         if let url = URL(string: "https://api.ipapi.is/?q=\(ip)"),
            let (data, _) = try? await URLSession.shared.data(from: url),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

@@ -4,6 +4,7 @@ import SwiftUI
 
 struct MenuBarView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
@@ -28,10 +29,12 @@ struct MenuBarView: View {
                 Toggle("", isOn: Binding(
                     get: { appState.isConnected },
                     set: { newValue in
-                        if newValue {
-                            appState.connect()
-                        } else {
-                            appState.disconnect()
+                        Task { @MainActor in
+                            if newValue {
+                                appState.connect()
+                            } else {
+                                appState.disconnect()
+                            }
                         }
                     }
                 ))
@@ -122,18 +125,23 @@ struct MenuBarView: View {
             // MARK: Footer Buttons
             HStack(spacing: 8) {
                 Button {
-                    NSApp.activate(ignoringOtherApps: true)
-                    for window in NSApp.windows {
-                        if window.identifier?.rawValue != "menu-bar" && window.canBecomeMain {
-                            window.makeKeyAndOrderFront(nil)
-                            break
-                        }
+                    // Try to find and restore existing main window
+                    var found = false
+                    for window in NSApp.windows where window.title == "LiquidClash" || window.identifier?.rawValue.contains("main") == true {
+                        window.deminiaturize(nil)
+                        window.makeKeyAndOrderFront(nil)
+                        found = true
+                        break
                     }
+                    if !found {
+                        openWindow(id: "main")
+                    }
+                    NSApp.activate(ignoringOtherApps: true)
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "house")
                             .font(.system(size: 10))
-                        Text("Dashboard")
+                        Text(LocalizedStringKey("Dashboard"))
                             .font(.system(size: 12, weight: .semibold))
                     }
                     .frame(maxWidth: .infinity)
@@ -183,48 +191,110 @@ struct MenuBarView: View {
 
 private struct NodeSelectorMenu: View {
     var appState: AppState
-    @State private var selected: String = ""
 
     private let regionNames: Set<String> = ["HK","JP","SG","TW","US","UK","KR","DE","FR","CA","AU","IN","RU","BR","NL","Auto Select","PROXY","Proxies","Fallback","GLOBAL","Final","default"]
 
-    var body: some View {
-        Picker("", selection: $selected) {
-            Text(String(localized: "No Node Selected")).tag("")
+    private var selectedName: String {
+        appState.proxyService.activeNodeName ?? ""
+    }
 
+    private var displayLabel: String {
+        let name = selectedName
+        guard !name.isEmpty else { return String(localized: "No Node Selected") }
+        let (flag, clean) = ConfigParser.extractFlag(from: name)
+        return "\(flag) \(clean)"
+    }
+
+    var body: some View {
+        Menu {
             if appState.isConnected && !appState.proxyService.nodes.isEmpty {
                 Section("Nodes") {
                     ForEach(appState.proxyService.nodes) { node in
                         let delay = node.latency > 0 ? "\(node.latency)ms" : "-ms"
-                        Text("\(node.flag) \(ConfigParser.extractFlag(from: node.name).cleanName)   | \(delay)")
-                            .tag(node.name)
+                        Button {
+                            appState.selectNode(node.name)
+                        } label: {
+                            let label = "\(node.flag) \(ConfigParser.extractFlag(from: node.name).cleanName)   | \(delay)"
+                            if selectedName == node.name {
+                                Label(label, systemImage: "checkmark")
+                            } else {
+                                Text(label)
+                            }
+                        }
                     }
                 }
 
                 Section("Services") {
                     ForEach(appState.proxyService.groups.filter { !regionNames.contains($0.name) }) { group in
                         let delay = group.latency > 0 ? "\(group.latency)ms" : "-ms"
-                        Text("\(group.name)   | \(delay)")
-                            .tag(group.name)
+                        Button {
+                            appState.selectNode(group.name)
+                        } label: {
+                            let label = "\(group.name)   | \(delay)"
+                            if selectedName == group.name {
+                                Label(label, systemImage: "checkmark")
+                            } else {
+                                Text(label)
+                            }
+                        }
                     }
                 }
 
                 Section("Regions") {
                     ForEach(appState.proxyService.groups.filter { regionNames.contains($0.name) && $0.name != "GLOBAL" }) { group in
                         let delay = group.latency > 0 ? "\(group.latency)ms" : "-ms"
-                        Text("\(group.name)   | \(delay)")
-                            .tag(group.name)
+                        Button {
+                            appState.selectNode(group.name)
+                        } label: {
+                            let label = "\(group.name)   | \(delay)"
+                            if selectedName == group.name {
+                                Label(label, systemImage: "checkmark")
+                            } else {
+                                Text(label)
+                            }
+                        }
+                    }
+                }
+
+                if !appState.customNodes.isEmpty {
+                    Section("Custom") {
+                        ForEach(appState.customNodes) { node in
+                            Button {
+                                appState.selectNode(node.name)
+                            } label: {
+                                let label = "\(node.flag) \(node.name)"
+                                if selectedName == node.name {
+                                    Label(label, systemImage: "checkmark")
+                                } else {
+                                    Text(label)
+                                }
+                            }
+                        }
                     }
                 }
             } else {
                 ForEach(appState.proxyRegions.flatMap(\.nodes)) { node in
-                    Text("\(node.flag) \(node.name)")
-                        .tag(node.name)
+                    Button {
+                        appState.selectNode(node.name)
+                    } label: {
+                        if selectedName == node.name || ConfigParser.extractFlag(from: selectedName).cleanName == node.name {
+                            Label("\(node.flag) \(node.name)", systemImage: "checkmark")
+                        } else {
+                            Text("\(node.flag) \(node.name)")
+                        }
+                    }
                 }
             }
+        } label: {
+            HStack {
+                Text(displayLabel)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Spacer()
+            }
         }
-        .pickerStyle(.menu)
-        .labelsHidden()
-        .buttonStyle(.borderless)
+        .menuStyle(.borderlessButton)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, minHeight: 42)
@@ -234,15 +304,5 @@ private struct NodeSelectorMenu: View {
             RoundedRectangle(cornerRadius: 14)
                 .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
         )
-        .onAppear {
-            selected = appState.proxyService.activeNodeName ?? ""
-        }
-        .onChange(of: appState.proxyService.activeNodeName) { _, newValue in
-            selected = newValue ?? ""
-        }
-        .onChange(of: selected) { _, newValue in
-            guard !newValue.isEmpty else { return }
-            appState.selectNode(newValue)
-        }
     }
 }

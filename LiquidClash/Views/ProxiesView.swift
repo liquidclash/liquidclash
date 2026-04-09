@@ -40,9 +40,27 @@ struct ProxiesView: View {
                         groupTagsSection("REGIONS", regionGroups)
                     }
 
-                    // Individual nodes from mihomo API
+                    // Individual nodes from mihomo API, or local cache when not connected
                     if !appState.proxyService.nodes.isEmpty {
                         nodesSection
+                    } else if !appState.proxyRegions.filter({ $0.id != "custom" }).isEmpty {
+                        // Not connected: show local cached nodes
+                        ForEach(appState.proxyRegions.filter { $0.id != "custom" }) { region in
+                            RegionGroupView(
+                                region: region,
+                                selectedNodeId: appState.selectedNodeId,
+                                onToggleExpand: {
+                                    withAnimation(.easeInOut(duration: 0.25)) {
+                                        appState.toggleRegion(region.id)
+                                    }
+                                },
+                                onSelectNode: { node in
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        appState.selectNode(node.id)
+                                    }
+                                }
+                            )
+                        }
                     }
 
                     // Legacy local regions (custom nodes)
@@ -627,7 +645,8 @@ struct ProxiesView: View {
                 let parsedRules = content.contains("rules:") ? ConfigParser.parseClashYAMLRules(content, source: .subscription) : []
 
                 await MainActor.run {
-                    appState.proxyRegions = regions
+                    let customRegions = appState.proxyRegions.filter { $0.id == "custom" }
+                    appState.proxyRegions = regions + customRegions
                     appState.selectedNodeId = regions.first?.nodes.first?.id
                     appState.activeNode = regions.first?.nodes.first
                     if !parsedRules.isEmpty {
@@ -635,7 +654,7 @@ struct ProxiesView: View {
                         appState.rules = userRules + parsedRules
                     }
                     appState.saveState()
-                    ConfigStorage.shared.saveProxyRegions(regions)
+                    ConfigStorage.shared.saveProxyRegions(appState.proxyRegions)
                     ConfigStorage.shared.saveRawSubscriptionYAML(content)
                     isUpdatingSubscription = false
                     showTemporaryStatus(String(localized: "✓ Imported \(nodes.count) nodes"))
@@ -671,7 +690,8 @@ struct ProxiesView: View {
                 let parsedRules = content.contains("rules:") ? ConfigParser.parseClashYAMLRules(content, source: .subscription) : []
 
                 await MainActor.run {
-                    appState.proxyRegions = regions
+                    let customRegions = appState.proxyRegions.filter { $0.id == "custom" }
+                    appState.proxyRegions = regions + customRegions
                     appState.selectedNodeId = regions.first?.nodes.first?.id
                     appState.activeNode = regions.first?.nodes.first
                     if !parsedRules.isEmpty {
@@ -679,7 +699,7 @@ struct ProxiesView: View {
                         appState.rules = userRules + parsedRules
                     }
                     appState.saveState()
-                    ConfigStorage.shared.saveProxyRegions(regions)
+                    ConfigStorage.shared.saveProxyRegions(appState.proxyRegions)
                     ConfigStorage.shared.saveRawSubscriptionYAML(content)
                     isUpdatingSubscription = false
                     showTemporaryStatus(String(localized: "✓ Imported \(nodes.count) nodes from Clash Verge"))
