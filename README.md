@@ -5,7 +5,11 @@
 <h1 align="center">LiquidClash</h1>
 
 <p align="center">
-  <strong>A modern Clash proxy client for macOS, built with native SwiftUI and Liquid Glass design.</strong>
+  <strong>The first Clash client designed for Liquid Glass.</strong>
+</p>
+
+<p align="center">
+  A modern, fully native macOS proxy client — built with SwiftUI from the ground up.
 </p>
 
 <p align="center">
@@ -18,35 +22,34 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/liquidclash/liquidclash/releases/latest"><strong>Download DMG</strong></a>
+  <a href="https://github.com/liquidclash/liquidclash/releases/latest"><strong>📥 Download Latest Release</strong></a>
 </p>
 
 ---
 
+<p align="center">
+  <img src="screenshots/dashboard.jpg" width="720" alt="LiquidClash Dashboard">
+</p>
+
 ## Features
 
-- **100% Native SwiftUI** — No Electron, no WebView. Pure Swift, pure performance.
-- **Liquid Glass Design** — Embraces macOS 26's Liquid Glass design language with translucent materials, mesh gradient backgrounds, and glass-morphism effects.
-- **mihomo Core** — Powered by mihomo (Clash Premium) with full protocol support: Trojan, VMess, Shadowsocks, SOCKS5, HTTP, Hysteria2, VLESS.
-- **Subscription Management** — Multi-source subscriptions with one-click update, file import, and Clash Verge profile import.
-- **System Proxy & TUN** — System-wide proxy configuration with TUN mode support and LAN sharing.
-- **Menu Bar Access** — Quick connect/disconnect and status overview from the menu bar.
-- **Real-time Monitoring** — Live connection logs with filtering and proxy core log viewer.
-- **Multi-language** — English, 简体中文, 日本語.
+- 🖥️ **100% Native SwiftUI** — No Electron, no WebView. Pure Swift performance with zero overhead.
+- 🪟 **Liquid Glass Design** — Translucent materials, mesh gradients, and glass-morphism effects that feel right at home on macOS 26.
+- ⚡ **Full Protocol Support** — Powered by mihomo core: Trojan, VMess, Shadowsocks, SOCKS5, HTTP, Hysteria2, VLESS.
+- 📋 **Smart Subscriptions** — Multi-source management, one-click update, file import, and Clash Verge profile migration.
+- 🌐 **System Proxy & TUN** — System-wide proxy with TUN mode and LAN sharing.
+- 📊 **Real-time Monitoring** — Live connection logs, latency tracking, and proxy core log viewer.
+- 🔤 **Multi-language** — English, 简体中文, 日本語.
+
+## Why LiquidClash?
+
+Most Clash clients are built with Electron or WebView — they work, but they don't feel like Mac apps. LiquidClash is different: **every pixel is native SwiftUI**, designed specifically for macOS 26's Liquid Glass aesthetic. The result is a proxy client that's fast, lightweight, and looks like it belongs on your Mac.
 
 ## Screenshots
 
-| Dashboard | Proxies |
-|:---------:|:-------:|
-| ![Dashboard](screenshots/dashboard.jpg) | ![Proxies](screenshots/proxies.jpg) |
-
-| Add Proxies | Rules |
-|:-----------:|:-----:|
-| ![Add Proxies](screenshots/add-proxies.jpg) | ![Rules](screenshots/rules.jpg) |
-
-| Activity | Settings |
-|:--------:|:--------:|
-| ![Activity](screenshots/activity.jpg) | ![Settings](screenshots/settings.jpg) |
+| Proxies | Settings |
+|:-------:|:--------:|
+| ![Proxies](screenshots/proxies.jpg) | ![Settings](screenshots/setting.jpg) |
 
 ## Install
 
@@ -64,29 +67,6 @@ open LiquidClash.xcodeproj
 
 Build and run with `⌘R` in Xcode. Requires macOS 26.0+ and Xcode 26.0+.
 
-## Pages
-
-### Dashboard
-One-click connect/disconnect with animated pill button. Proxy mode selector (Rule / Global / Direct), active node card with latency display, and network info bar.
-
-### Proxies
-Region-grouped proxy node list with search and filtering. Expandable region sections with 2-column grid layout. Per-node latency badges with color coding. Manual node addition and latency testing.
-
-### Rules
-Table-based rule editor with drag-reorder. Support for DOMAIN-SUFFIX, IP-CIDR, GEOIP, MATCH and more. Color-coded policy indicators (Proxy/Direct/Reject). Import/Export functionality.
-
-### Activity
-Real-time connection log with timeline visualization. Filter by connection type (All/Proxied/Direct/Rejected). Per-connection latency and data transfer stats.
-
-### Logs
-Live proxy core log viewer with filtering.
-
-### Settings
-- **General** — Launch at startup, language selection, log toggle
-- **Proxy Engine** — Mixed port, Allow LAN, TUN mode
-- **Appearance** — Theme (Light/Dark/Adaptive), glass transparency, blur intensity
-- **About** — Version info, auto-update, links
-
 ## Tech Stack
 
 | Layer | Technology |
@@ -98,50 +78,9 @@ Live proxy core log viewer with filtering.
 | Protocols | Trojan, VMess, SS, SOCKS5, HTTP, Hysteria2, VLESS |
 | Architecture | MVVM with `@Observable` / `@AppStorage` |
 
-## Project Structure
+## Contributing
 
-```
-LiquidClash/
-├── LiquidClashApp.swift              # App entry point with menu bar
-├── ContentView.swift                 # Main layout with NavigationSplitView
-├── Core/
-│   ├── ClashAPI.swift                # Clash RESTful API client
-│   ├── ClashManager.swift            # Core process lifecycle management
-│   ├── ClashWebSocket.swift          # WebSocket for real-time updates
-│   └── SystemProxy.swift             # macOS system proxy configuration
-├── Models/
-│   ├── AppSettings.swift             # User preferences model
-│   ├── ClashConfig.swift             # Clash configuration model
-│   ├── ProxyNode.swift               # Proxy node model
-│   ├── ProxyGroup.swift              # Proxy group model
-│   ├── RuleEntry.swift               # Rule entry model
-│   ├── ConnectionLog.swift           # Connection log model
-│   ├── LogEntry.swift                # Log entry model
-│   └── MockData.swift                # Preview mock data
-├── Services/
-│   ├── AppState.swift                # Global app state management
-│   ├── ConfigParser.swift            # YAML config parser
-│   ├── ConfigStorage.swift           # Config persistence
-│   └── SubscriptionManager.swift     # Subscription management
-├── Views/
-│   ├── DashboardView.swift           # Dashboard page
-│   ├── ProxiesView.swift             # Proxies page
-│   ├── RulesView.swift               # Rules editor page
-│   ├── ActivityView.swift            # Connection log page
-│   ├── LogsView.swift                # Core log page
-│   ├── SettingsView.swift            # Settings page
-│   ├── WelcomeView.swift             # First-launch onboarding
-│   ├── MenuBarView.swift             # Menu bar popover
-│   ├── SidebarView.swift             # Navigation sidebar
-│   ├── MeshGradientBackground.swift  # Animated background
-│   └── ...                           # Component views
-├── Resources/
-│   ├── mihomo                        # mihomo core binary
-│   ├── country.mmdb                  # GeoIP database (MaxMind)
-│   ├── geoip.dat                     # GeoIP rules
-│   └── geosite.dat                   # GeoSite rules
-└── Assets.xcassets/                  # App icons and image assets
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for project structure and build instructions.
 
 ## License
 
@@ -150,5 +89,5 @@ MIT License. See [LICENSE](LICENSE) for details.
 ---
 
 <p align="center">
-  Built with SwiftUI & Liquid Glass
+  Crafted for macOS. No compromises.
 </p>
