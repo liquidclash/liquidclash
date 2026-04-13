@@ -21,12 +21,18 @@ struct ConfigPipeline {
       enable: true
       enhanced-mode: fake-ip
       fake-ip-range: 198.18.0.1/16
+      default-nameserver:
+        - 223.5.5.5
+        - 119.29.29.29
+      proxy-server-nameserver:
+        - 223.5.5.5
+        - 119.29.29.29
       nameserver:
-        - https://dns.alidns.com/dns-query
-        - https://doh.pub/dns-query
+        - 223.5.5.5
+        - 119.29.29.29
       fallback:
-        - https://dns.google/dns-query
-        - https://cloudflare-dns.com/dns-query
+        - 1.1.1.1
+        - 8.8.8.8
       fallback-filter:
         geoip: true
         geoip-code: CN
@@ -40,6 +46,28 @@ struct ConfigPipeline {
       auto-route: true
       auto-detect-interface: true
     """
+
+    /// All proxy server hostnames found in the subscription YAML (for fake-ip-filter)
+    private static func extractProxyServerHosts(from lines: [String]) -> [String] {
+        var hosts: Set<String> = []
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // Match "server: hostname" in both multi-line and inline formats
+            guard let range = trimmed.range(of: "server:") else { continue }
+            var value = trimmed[range.upperBound...]
+                .trimmingCharacters(in: .whitespaces)
+            // Remove trailing comma or brace for inline format
+            if let commaIdx = value.firstIndex(of: ",") { value = String(value[..<commaIdx]) }
+            if let braceIdx = value.firstIndex(of: "}") { value = String(value[..<braceIdx]) }
+            value = value.trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            // Skip IPs and empty values
+            if value.isEmpty { continue }
+            if value.allSatisfy({ $0.isNumber || $0 == "." || $0 == ":" }) { continue }
+            hosts.insert(value)
+        }
+        return Array(hosts)
+    }
 
     /// All proxy names found in the subscription YAML (for resolving dialer-proxy names)
     private static func extractProxyNames(from lines: [String]) -> [String] {
@@ -112,7 +140,15 @@ struct ConfigPipeline {
         // Add DNS config only if subscription doesn't have one
         let hasDNS = lines.contains { $0.hasPrefix("dns:") && !$0.hasPrefix(" ") }
         if !hasDNS {
-            header += "\n" + defaultDNS + "\n"
+            var dnsConfig = defaultDNS
+            // Extract proxy server hostnames and add to fake-ip-filter
+            // so they don't get fake IPs (which breaks proxy connections in TUN mode)
+            let proxyHosts = extractProxyServerHosts(from: lines)
+            if !proxyHosts.isEmpty {
+                let filterEntries = proxyHosts.map { "        - \"+.\($0)\"" }.joined(separator: "\n")
+                dnsConfig += "\n      fake-ip-filter:\n" + filterEntries
+            }
+            header += "\n" + dnsConfig + "\n"
         }
 
         // Add TUN config if enabled and not present

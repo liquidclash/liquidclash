@@ -117,9 +117,7 @@ struct SettingsView: View {
             .onChange(of: tunMode) { _, newValue in
                 if !newValue { allowLAN = false }
                 if appState.isConnected {
-                    appState.errorMessage = newValue
-                        ? String(localized: "TUN mode will take effect after reconnecting.")
-                        : String(localized: "TUN mode disabled. Reconnect to apply.")
+                    appState.reconnect()
                 }
             }
 
@@ -127,7 +125,7 @@ struct SettingsView: View {
 
             SettingToggleRow(
                 label: "Allow LAN",
-                subtitle: "Let LAN devices connect through your proxy",
+                subtitle: tunMode ? "Let LAN devices connect through your proxy" : "Requires TUN mode to be enabled",
                 isOn: $allowLAN
             )
             .disabled(!tunMode)

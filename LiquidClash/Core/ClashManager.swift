@@ -189,27 +189,17 @@ final class ClashManager {
 
     // MARK: - Stop
 
-    func stop() {
+    /// Returns false only when a privileged stop was attempted but the user denied authorization.
+    @discardableResult
+    func stop() -> Bool {
         if privilegedMode {
-            // TUN mode: process runs as root, kill by PID or fallback to pkill
-            if let pid = privilegedPID {
-                kill(pid, SIGTERM)
-                // Brief wait for graceful shutdown
-                usleep(500_000)
-                // Force kill if still alive
-                kill(pid, SIGKILL)
+            // TUN mode: process runs as root, must use osascript to kill with admin privileges
+            if stopWithPrivileges() {
+                privilegedPID = nil
+                privilegedMode = false
             } else {
-                // Fallback: pkill (less precise)
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-                proc.arguments = ["-f", "mihomo"]
-                proc.standardOutput = FileHandle.nullDevice
-                proc.standardError = FileHandle.nullDevice
-                try? proc.run()
-                proc.waitUntilExit()
+                return false
             }
-            privilegedPID = nil
-            privilegedMode = false
         } else if let proc = process {
             proc.terminate()
             proc.waitUntilExit()
@@ -218,6 +208,44 @@ final class ClashManager {
         process = nil
         outputPipe = nil
         isRunning = false
+        return true
+    }
+
+    /// Stop a root-owned mihomo process via osascript with admin privileges.
+    /// Returns true if the process was successfully killed, false if user denied or osascript failed.
+    @discardableResult
+    private func stopWithPrivileges() -> Bool {
+        let killCmd: String
+        if let pid = privilegedPID {
+            killCmd = "kill \(pid) 2>/dev/null; sleep 0.5; kill -9 \(pid) 2>/dev/null; exit 0"
+        } else {
+            killCmd = "pkill -f mihomo 2>/dev/null; sleep 0.5; pkill -9 -f mihomo 2>/dev/null; exit 0"
+        }
+
+        let script = "do shell script \"\(killCmd)\" with administrator privileges"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        proc.standardOutput = FileHandle.nullDevice
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+
+        do {
+            try proc.run()
+        } catch {
+            return false
+        }
+        proc.waitUntilExit()
+
+        // terminationStatus != 0 means user denied the authorization dialog
+        if proc.terminationStatus != 0 {
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let errMsg = String(data: errData, encoding: .utf8) ?? ""
+            if errMsg.contains("canceled") || errMsg.contains("User canceled") {
+                return false
+            }
+        }
+        return true
     }
 
     // MARK: - Rewrite Config (for hot reload without restarting process)
