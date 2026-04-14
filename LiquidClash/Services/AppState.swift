@@ -137,11 +137,7 @@ final class AppState {
         )
 
         do {
-            if config.tunEnabled {
-                try clashManager.startWithPrivileges(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
-            } else {
-                try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
-            }
+            try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
         } catch {
             isConnecting = false
             errorMessage = error.localizedDescription
@@ -155,6 +151,8 @@ final class AppState {
         connectTask = Task { [clashManager] in
             do {
                 try await api.waitUntilReady()
+                // Ensure mihomo is using the latest config (may have been running with old config)
+                try? await api.reloadConfig(path: clashManager.configFilePath.path)
                 await MainActor.run {
                     self.isConnecting = false
                     self.onCoreStarted(api: api)
@@ -177,22 +175,14 @@ final class AppState {
         }
     }
 
-    func reconnect() {
-        disconnect()
-        connect()
-    }
-
     func disconnect() {
         // Cancel any in-progress connect Task
         connectTask?.cancel()
         connectTask = nil
         isConnecting = false
 
-        // Stop core first (may fail if user denies admin privileges for TUN mode)
-        if !clashManager.stop() {
-            errorMessage = "停止核心失败：管理员权限被拒绝，进程可能仍在运行。"
-            return
-        }
+        // Stop core via helper daemon
+        clashManager.stop()
 
         // Stop WebSocket streams
         webSocket?.stopAll()
@@ -770,6 +760,30 @@ final class AppState {
 
                 if key == "allow-lan", let val = value as? Bool {
                     await MainActor.run { config.allowLan = val }
+                }
+
+                // TUN hot-switch: toggle system proxy accordingly
+                if key == "tun", let tunDict = value as? [String: Any], let enable = tunDict["enable"] as? Bool {
+                    await MainActor.run {
+                        config.tunEnabled = enable
+                        if enable {
+                            // TUN handles routing — disable system proxy
+                            stopProxyGuard()
+                            if SystemProxy.didSetProxy {
+                                try? SystemProxy.disable()
+                            }
+                        } else {
+                            // TUN off — enable system proxy
+                            do {
+                                try SystemProxy.enable(httpPort: config.mixedPort, socksPort: config.mixedPort)
+                                startProxyGuard()
+                                isProxyDegraded = false
+                            } catch {
+                                isProxyDegraded = true
+                                errorMessage = "System proxy: \(error.localizedDescription)"
+                            }
+                        }
+                    }
                 }
             } catch {
                 print("Warning: Failed to apply setting \(key): \(error)")

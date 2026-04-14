@@ -8,42 +8,6 @@ final class ClashManager {
     var isRunning = false
     var logOutput: [String] = []
 
-    private var process: Process?
-    private var outputPipe: Pipe?
-    private var privilegedMode = false
-    private var privilegedPID: Int32?
-
-    /// Possible binary locations (checked in order)
-    private var binarySearchPaths: [URL] {
-        let appSupport = ConfigStorage.shared.appSupportDirectory
-        var paths = [
-            appSupport.appendingPathComponent("bin/mihomo"),
-            appSupport.appendingPathComponent("bin/clash"),
-        ]
-        // Also check in app bundle
-        if let bundled = Bundle.main.url(forResource: "mihomo", withExtension: nil) {
-            paths.insert(bundled, at: 0)
-        }
-        if let bundled = Bundle.main.url(forResource: "clash", withExtension: nil) {
-            paths.insert(bundled, at: 1)
-        }
-        // Check /usr/local/bin as fallback
-        paths.append(URL(fileURLWithPath: "/usr/local/bin/mihomo"))
-        paths.append(URL(fileURLWithPath: "/usr/local/bin/clash"))
-        return paths
-    }
-
-    /// Find the mihomo/clash binary
-    func findBinary() -> URL? {
-        let fm = FileManager.default
-        for path in binarySearchPaths {
-            if fm.isExecutableFile(atPath: path.path) {
-                return path
-            }
-        }
-        return nil
-    }
-
     /// Config directory for mihomo
     var configDirectory: URL {
         let dir = ConfigStorage.shared.appSupportDirectory.appendingPathComponent("config", isDirectory: true)
@@ -58,14 +22,21 @@ final class ClashManager {
         configDirectory.appendingPathComponent("config.yaml")
     }
 
+    /// Find the mihomo binary (for non-helper fallback checks)
+    func findBinary() -> URL? {
+        let paths: [URL] = [
+            Bundle.main.url(forResource: "mihomo", withExtension: nil),
+            ConfigStorage.shared.appSupportDirectory.appendingPathComponent("bin/mihomo"),
+            URL(fileURLWithPath: "/usr/local/bin/mihomo"),
+        ].compactMap { $0 }
+        return paths.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
     // MARK: - Geodata
 
-    /// Copy bundled geodata files (MMDB, geoip.dat, geosite.dat) to config directory
-    /// so mihomo doesn't need to download them on first launch.
     private func ensureGeodataFiles() {
         let fm = FileManager.default
-        let geodataFiles = ["country.mmdb", "geoip.dat", "geosite.dat"]
-        for filename in geodataFiles {
+        for filename in ["country.mmdb", "geoip.dat", "geosite.dat"] {
             let dest = configDirectory.appendingPathComponent(filename)
             guard !fm.fileExists(atPath: dest.path) else { continue }
             if let bundled = Bundle.main.url(forResource: filename.components(separatedBy: ".").first,
@@ -77,7 +48,6 @@ final class ClashManager {
 
     // MARK: - Write Runtime Config
 
-    /// Write runtime config using ConfigPipeline
     func writeRuntimeConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
         try ConfigPipeline.generateRuntime(
             subscriptionYAML: subscriptionYAML,
@@ -87,175 +57,38 @@ final class ClashManager {
         )
     }
 
-    // MARK: - Start
+    // MARK: - Start (via Helper Daemon)
 
-    /// Start mihomo with subscription YAML + overlay
     func start(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
         guard !isRunning else { return }
-
-        guard let binary = findBinary() else {
-            throw ClashError.binaryNotFound
-        }
 
         ensureGeodataFiles()
         try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
 
-        let proc = Process()
-        proc.executableURL = binary
-        proc.arguments = ["-d", configDirectory.path]
+        // Ensure helper daemon is installed and running
+        try HelperManager.installIfNeeded()
 
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
-            DispatchQueue.main.async {
-                self?.logOutput.append(contentsOf: line.components(separatedBy: .newlines).filter { !$0.isEmpty })
-                // Keep only last 500 lines
-                if let count = self?.logOutput.count, count > 500 {
-                    self?.logOutput.removeFirst(count - 500)
-                }
-            }
-        }
-
-        proc.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.isRunning = false
-                self?.process = nil
-            }
-        }
-
-        try proc.run()
-        process = proc
-        outputPipe = pipe
+        // Tell helper to start mihomo with our config directory
+        try HelperManager.startCore(configDir: configDirectory.path)
         isRunning = true
     }
 
-    // MARK: - Start with Privileges (for TUN mode)
+    // MARK: - Stop (via Helper Daemon)
 
-    /// Start mihomo with root privileges via osascript (required for TUN)
-    func startWithPrivileges(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
-        guard !isRunning else { return }
-
-        guard let binary = findBinary() else {
-            throw ClashError.binaryNotFound
-        }
-
-        ensureGeodataFiles()
-
-        // Write config file with TUN enabled overlay
-        var tunOverlay = overlay
-        tunOverlay.tunEnabled = true
-        try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: tunOverlay, customNodes: customNodes)
-
-        // Launch with admin privileges via osascript
-        let binaryPath = binary.path.replacingOccurrences(of: "'", with: "'\\''")
-        let configDir = configDirectory.path.replacingOccurrences(of: "'", with: "'\\''")
-        let shellCmd = "'\(binaryPath)' -d '\(configDir)' &> /dev/null & echo $!"
-
-        let script = "do shell script \"\(shellCmd.replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-        try proc.run()
-        proc.waitUntilExit()
-
-        if proc.terminationStatus != 0 {
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let errMsg = String(data: errData, encoding: .utf8) ?? ""
-            if errMsg.contains("canceled") || errMsg.contains("User canceled") {
-                throw ClashError.startFailed("Administrator privileges denied")
-            }
-            throw ClashError.startFailed(errMsg.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-
-        // Read the PID from osascript output (from "echo $!")
-        let pidData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        if let pidStr = String(data: pidData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let pid = Int32(pidStr) {
-            privilegedPID = pid
-        }
-
-        privilegedMode = true
-        isRunning = true
-    }
-
-    // MARK: - Stop
-
-    /// Returns false only when a privileged stop was attempted but the user denied authorization.
-    @discardableResult
-    func stop() -> Bool {
-        if privilegedMode {
-            // TUN mode: process runs as root, must use osascript to kill with admin privileges
-            if stopWithPrivileges() {
-                privilegedPID = nil
-                privilegedMode = false
-            } else {
-                return false
-            }
-        } else if let proc = process {
-            proc.terminate()
-            proc.waitUntilExit()
-        }
-        outputPipe?.fileHandleForReading.readabilityHandler = nil
-        process = nil
-        outputPipe = nil
-        isRunning = false
-        return true
-    }
-
-    /// Stop a root-owned mihomo process via osascript with admin privileges.
-    /// Returns true if the process was successfully killed, false if user denied or osascript failed.
-    @discardableResult
-    private func stopWithPrivileges() -> Bool {
-        let killCmd: String
-        if let pid = privilegedPID {
-            killCmd = "kill \(pid) 2>/dev/null; sleep 0.5; kill -9 \(pid) 2>/dev/null; exit 0"
-        } else {
-            killCmd = "pkill -f mihomo 2>/dev/null; sleep 0.5; pkill -9 -f mihomo 2>/dev/null; exit 0"
-        }
-
-        let script = "do shell script \"\(killCmd)\" with administrator privileges"
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        proc.standardOutput = FileHandle.nullDevice
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-
+    func stop() {
         do {
-            try proc.run()
+            try HelperManager.stopCore()
         } catch {
-            return false
+            print("[ClashManager] stop failed: \(error)")
         }
-        proc.waitUntilExit()
-
-        // terminationStatus != 0 means user denied the authorization dialog
-        if proc.terminationStatus != 0 {
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let errMsg = String(data: errData, encoding: .utf8) ?? ""
-            if errMsg.contains("canceled") || errMsg.contains("User canceled") {
-                return false
-            }
-        }
-        return true
+        isRunning = false
     }
 
     // MARK: - Rewrite Config (for hot reload without restarting process)
 
-    /// Rewrite config.yaml on disk without restarting the process.
-    /// Used together with ClashAPI.reloadConfig() for hot reloading.
     func rewriteConfig(subscriptionYAML: String, overlay: ConfigPipeline.OverlayConfig, customNodes: [ProxyNode] = []) throws {
         try writeRuntimeConfig(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
     }
-
 }
 
 // MARK: - Clash Error

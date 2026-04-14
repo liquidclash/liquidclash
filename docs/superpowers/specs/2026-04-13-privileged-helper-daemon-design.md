@@ -31,21 +31,26 @@ A lightweight Swift command-line tool that:
 | Method | Path | Body | Response |
 |--------|------|------|----------|
 | GET | /version | - | `{"version": "1.0"}` |
-| POST | /core/start | `{"configDir": "...", "binaryPath": "..."}` | `{"code": 200}` |
+| POST | /core/start | `{"configDir": "..."}` | `{"code": 200}` |
 | DELETE | /core/stop | - | `{"code": 200}` |
 | GET | /core/status | - | `{"running": true, "pid": 1234}` |
 
-**Implementation:** Single-file `main.swift` using Foundation's `HTTPServer` or raw socket handling. No external dependencies.
+**Security:**
+- `binaryPath` NOT accepted from client — helper resolves mihomo from the app bundle that installed it
+- Socket created with `0o777` (like Verge) but helper validates caller via `getpeereid()`
+- `/core/start` only accepts `configDir`, never arbitrary executables
+
+**Implementation:** Single-file `main.swift` using raw Unix socket + minimal HTTP parsing. No external dependencies.
 
 ### 2. HelperManager (new, in app)
 
 Manages helper lifecycle from the app side:
 - `installIfNeeded()` — check socket, install via osascript if missing
-- `startCore(configDir:binaryPath:)` — POST /core/start
+- `startCore(configDir:)` — POST /core/start
 - `stopCore()` — DELETE /core/stop
 - `isRunning()` — GET /core/status
 
-**Communication:** `URLSession` with Unix socket (available since macOS 13).
+**Communication:** Raw Unix socket HTTP client (Foundation `FileHandle` or `SocketPort`).
 
 ### 3. ClashManager (refactored)
 
@@ -57,9 +62,9 @@ func start(...)              // normal user
 func startWithPrivileges(...) // osascript root
 func stop() -> Bool          // two stop paths
 
-// After: single path
-func start(configDir:binaryPath:)  // via HelperManager
-func stop()                        // via HelperManager
+// After: single path via helper
+func start(configDir:)  // via HelperManager
+func stop()             // via HelperManager
 ```
 
 ### 4. AppState (modified)
@@ -126,7 +131,7 @@ App launches
 
 **Connect:**
 ```
-App → HelperManager.startCore(configDir, binaryPath)
+App → HelperManager.startCore(configDir)
     → POST /core/start → Helper spawns mihomo as root
     → App polls mihomo API until ready
     → onCoreStarted()

@@ -137,18 +137,36 @@ struct ConfigPipeline {
             header += "\(key): \(value)\n"
         }
 
-        // Add DNS config only if subscription doesn't have one
+        // DNS handling: use subscription DNS if present, inject defaults if missing.
+        // Always ensure critical fields (default-nameserver, proxy-server-nameserver,
+        // fake-ip-filter) are present so TUN mode works correctly.
         let hasDNS = lines.contains { $0.hasPrefix("dns:") && !$0.hasPrefix(" ") }
         if !hasDNS {
             var dnsConfig = defaultDNS
-            // Extract proxy server hostnames and add to fake-ip-filter
-            // so they don't get fake IPs (which breaks proxy connections in TUN mode)
             let proxyHosts = extractProxyServerHosts(from: lines)
             if !proxyHosts.isEmpty {
                 let filterEntries = proxyHosts.map { "        - \"+.\($0)\"" }.joined(separator: "\n")
                 dnsConfig += "\n      fake-ip-filter:\n" + filterEntries
             }
             header += "\n" + dnsConfig + "\n"
+        } else {
+            // Subscription has DNS — patch in missing critical fields (2-space indent under dns:)
+            let proxyHosts = extractProxyServerHosts(from: lines)
+            var patches: [String] = []
+            let dnsContent = lines.joined(separator: "\n")
+            if !dnsContent.contains("default-nameserver") {
+                patches.append("  default-nameserver:\n    - 223.5.5.5\n    - 119.29.29.29")
+            }
+            if !dnsContent.contains("proxy-server-nameserver") {
+                patches.append("  proxy-server-nameserver:\n    - 223.5.5.5\n    - 119.29.29.29")
+            }
+            if !dnsContent.contains("fake-ip-filter") && !proxyHosts.isEmpty {
+                let filterEntries = proxyHosts.map { "    - \"+.\($0)\"" }.joined(separator: "\n")
+                patches.append("  fake-ip-filter:\n" + filterEntries)
+            }
+            if !patches.isEmpty, let dnsIdx = lines.firstIndex(where: { $0.hasPrefix("dns:") }) {
+                lines.insert(patches.joined(separator: "\n"), at: dnsIdx + 1)
+            }
         }
 
         // Add TUN config if enabled and not present
@@ -210,10 +228,11 @@ struct ConfigPipeline {
         if let aid = node.alterId { y += "    alterId: \(aid)\n" }
         y += "    udp: \(node.udp)\n"
         if !node.relay.isEmpty && node.relay != "Direct" {
-            // Resolve dialer-proxy name: match against known proxy names (with emoji)
+            // Resolve dialer-proxy name: match against actual proxy names in config
             let relay = node.relay
             let resolved = knownNames.first(where: { $0 == relay })  // exact match first
-                ?? knownNames.first(where: { $0.contains(relay) })   // fuzzy: "Japan | 01" matches "🇯🇵 Japan | 01"
+                ?? knownNames.first(where: { relay.contains($0) })   // relay "🇯🇵 Japan | 01" contains config name "Japan | 01"
+                ?? knownNames.first(where: { $0.contains(relay) })   // config name contains relay
                 ?? relay
             y += "    dialer-proxy: \"\(resolved)\"\n"
         }

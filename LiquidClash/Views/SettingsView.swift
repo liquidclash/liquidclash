@@ -117,7 +117,7 @@ struct SettingsView: View {
             .onChange(of: tunMode) { _, newValue in
                 if !newValue { allowLAN = false }
                 if appState.isConnected {
-                    appState.reconnect()
+                    appState.applySettingChange(key: "tun", value: ["enable": newValue])
                 }
             }
 

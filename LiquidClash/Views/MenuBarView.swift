@@ -94,7 +94,7 @@ struct MenuBarView: View {
                     set: { newValue in
                         UserDefaults.standard.set(newValue, forKey: SettingsKey.tunMode)
                         if appState.isConnected {
-                            appState.reconnect()
+                            appState.applySettingChange(key: "tun", value: ["enable": newValue])
                         }
                     }
                 ))
