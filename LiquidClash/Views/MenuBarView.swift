@@ -17,10 +17,10 @@ struct MenuBarView: View {
 
                     HStack(spacing: 5) {
                         Circle()
-                            .fill(appState.isConnected ? Color(hex: "32D74B") : Color(hex: "A2A3C4"))
+                            .fill(appState.isProxyDegraded ? Color(hex: "FFD60A") : appState.isConnected ? Color(hex: "32D74B") : Color(hex: "A2A3C4"))
                             .frame(width: 5, height: 5)
                             .shadow(color: appState.isConnected ? Color(hex: "32D74B").opacity(0.6) : .clear, radius: 3)
-                        Text(LocalizedStringKey(appState.isConnected ? "Active" : "Inactive"))
+                        Text(LocalizedStringKey(appState.isProxyDegraded ? "Degraded" : appState.isConnected ? "Active" : "Inactive"))
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
@@ -94,9 +94,7 @@ struct MenuBarView: View {
                     set: { newValue in
                         UserDefaults.standard.set(newValue, forKey: SettingsKey.tunMode)
                         if appState.isConnected {
-                            appState.errorMessage = newValue
-                                ? String(localized: "TUN mode will take effect after reconnecting.")
-                                : String(localized: "TUN mode disabled. Reconnect to apply.")
+                            appState.applySettingChange(key: "tun", value: ["enable": newValue])
                         }
                     }
                 ))

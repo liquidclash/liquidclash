@@ -34,6 +34,7 @@ final class AppState {
     var networkInfo: NetworkInfo = NetworkInfo()
     var trafficStats: TrafficStats = TrafficStats()
     var errorMessage: String? = nil
+    var isProxyDegraded: Bool = false
 
     // Proxies
     var proxyRegions: [ProxyRegion] = []
@@ -73,6 +74,7 @@ final class AppState {
     var subscriptions: [SubscriptionInfo] = []
     private var autoUpdateTimer: Timer?
     private var proxyGuardTimer: Timer?
+    private var latencyTestTimer: Timer?
 
     // Clash config
     var config: ClashConfig = ClashConfig()
@@ -135,11 +137,7 @@ final class AppState {
         )
 
         do {
-            if config.tunEnabled {
-                try clashManager.startWithPrivileges(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
-            } else {
-                try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
-            }
+            try clashManager.start(subscriptionYAML: subscriptionYAML, overlay: overlay, customNodes: customNodes)
         } catch {
             isConnecting = false
             errorMessage = error.localizedDescription
@@ -153,6 +151,8 @@ final class AppState {
         connectTask = Task { [clashManager] in
             do {
                 try await api.waitUntilReady()
+                // Ensure mihomo is using the latest config (may have been running with old config)
+                try? await api.reloadConfig(path: clashManager.configFilePath.path)
                 await MainActor.run {
                     self.isConnecting = false
                     self.onCoreStarted(api: api)
@@ -181,16 +181,17 @@ final class AppState {
         connectTask = nil
         isConnecting = false
 
+        // Stop core via helper daemon
+        clashManager.stop()
+
         // Stop WebSocket streams
         webSocket?.stopAll()
         webSocket = nil
         clashAPI = nil
 
-        // Stop core
-        clashManager.stop()
-
-        // Stop proxy guard and restore system proxy
+        // Stop timers and restore system proxy
         stopProxyGuard()
+        stopLatencyTestTimer()
         if SystemProxy.didSetProxy {
             do {
                 try SystemProxy.disable()
@@ -201,6 +202,7 @@ final class AppState {
 
         // Reset state
         isConnected = false
+        isProxyDegraded = false
         networkInfo = NetworkInfo()
         trafficStats = TrafficStats()
         connections = []
@@ -217,16 +219,19 @@ final class AppState {
         proxyService.setAPI(api)
 
         // Auto-enable system proxy (skip for TUN mode — TUN handles routing itself)
+        var proxyFailed = false
         if !config.tunEnabled {
             do {
                 try SystemProxy.enable(httpPort: config.mixedPort, socksPort: config.mixedPort)
                 startProxyGuard()
             } catch {
-                errorMessage = "System proxy: \(error.localizedDescription)"
+                errorMessage = "System proxy failed: \(error.localizedDescription). Core is running but traffic is NOT proxied."
+                proxyFailed = true
             }
         }
 
         isConnected = true
+        isProxyDegraded = proxyFailed
         let port = config.externalController.split(separator: ":").last.flatMap { Int($0) } ?? 9090
 
         // Start WebSocket streams
@@ -276,12 +281,15 @@ final class AppState {
                     selectNode(name)
                 }
             }
+            // Auto test latency on connect
+            await proxyService.testAllLatency()
             // fetchNetworkInfo runs off MainActor (has blocking curl)
             if savedSelection == nil || savedSelection?.isEmpty == true {
                 await fetchNetworkInfo()
             }
         }
         Task { await fetchActiveRules() }
+        startLatencyTestTimer()
 
         // Auto-retry subscriptions that have 0 nodes (likely failed due to needing proxy)
         let failedSubs = subscriptions.filter { $0.nodeCount == 0 && $0.isEnabled }
@@ -684,9 +692,19 @@ final class AppState {
     private func startProxyGuard() {
         stopProxyGuard()
         proxyGuardTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            guard self?.isConnected == true, SystemProxy.didSetProxy else { return }
+            guard let self, self.isConnected, SystemProxy.didSetProxy else { return }
             if !SystemProxy.verifyProxyIntact() {
-                try? SystemProxy.reapply()
+                do {
+                    try SystemProxy.reapply()
+                    DispatchQueue.main.async { self.isProxyDegraded = false }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.isProxyDegraded = true
+                        self.errorMessage = "系统代理丢失：\(error.localizedDescription)"
+                    }
+                }
+            } else if self.isProxyDegraded {
+                DispatchQueue.main.async { self.isProxyDegraded = false }
             }
         }
     }
@@ -694,6 +712,21 @@ final class AppState {
     private func stopProxyGuard() {
         proxyGuardTimer?.invalidate()
         proxyGuardTimer = nil
+    }
+
+    // MARK: - Periodic Latency Test
+
+    private func startLatencyTestTimer() {
+        stopLatencyTestTimer()
+        latencyTestTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            guard let self, self.isConnected else { return }
+            Task { await self.proxyService.testAllLatency() }
+        }
+    }
+
+    private func stopLatencyTestTimer() {
+        latencyTestTimer?.invalidate()
+        latencyTestTimer = nil
     }
 
     // MARK: - Apply Setting Changes at Runtime
@@ -727,6 +760,30 @@ final class AppState {
 
                 if key == "allow-lan", let val = value as? Bool {
                     await MainActor.run { config.allowLan = val }
+                }
+
+                // TUN hot-switch: toggle system proxy accordingly
+                if key == "tun", let tunDict = value as? [String: Any], let enable = tunDict["enable"] as? Bool {
+                    await MainActor.run {
+                        config.tunEnabled = enable
+                        if enable {
+                            // TUN handles routing — disable system proxy
+                            stopProxyGuard()
+                            if SystemProxy.didSetProxy {
+                                try? SystemProxy.disable()
+                            }
+                        } else {
+                            // TUN off — enable system proxy
+                            do {
+                                try SystemProxy.enable(httpPort: config.mixedPort, socksPort: config.mixedPort)
+                                startProxyGuard()
+                                isProxyDegraded = false
+                            } catch {
+                                isProxyDegraded = true
+                                errorMessage = "System proxy: \(error.localizedDescription)"
+                            }
+                        }
+                    }
                 }
             } catch {
                 print("Warning: Failed to apply setting \(key): \(error)")

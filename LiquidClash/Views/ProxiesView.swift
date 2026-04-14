@@ -293,6 +293,10 @@ struct ProxiesView: View {
                         .foregroundStyle(node.latency < 200 ? Color(hex: "30D158") :
                                         node.latency < 400 ? Color(hex: "FF9F0A") :
                                         Color(hex: "FF3B30"))
+                } else if node.lastTestFailed {
+                    Text("timeout")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Color(hex: "FF3B30").opacity(0.7))
                 }
             }
             .padding(.horizontal, 12)
@@ -354,7 +358,7 @@ struct ProxiesView: View {
                     guard !isTesting else { return }
                     isTesting = true
                     Task {
-                        await appState.proxyService.testAllLatency()
+                        await appState.testAllLatency()
                         isTesting = false
                     }
                 } label: {

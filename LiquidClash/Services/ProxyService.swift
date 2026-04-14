@@ -31,6 +31,7 @@ final class ProxyService {
         let type: String  // Trojan, Shadowsocks, VMess, etc.
         var latency: Int
         var flag: String
+        var lastTestFailed: Bool = false
     }
 
     func setAPI(_ api: ClashAPI?) {
@@ -121,8 +122,10 @@ final class ProxyService {
             if let idx = nodes.firstIndex(where: { $0.id == name }) {
                 if delay > 0 {
                     nodes[idx].latency = delay
+                    nodes[idx].lastTestFailed = false
+                } else {
+                    nodes[idx].lastTestFailed = true
                 }
-                // delay == 0 (timeout): keep existing historical value
             }
         }
         return delay

@@ -44,6 +44,7 @@ struct SystemProxy {
     private static let snapshotKey = "LiquidClash_proxySnapshot"
     private static let activePortKey = "LiquidClash_activeProxyPort"
     private static let activeSocksPortKey = "LiquidClash_activeSocksPort"
+    private static let activeServiceKey = "LiquidClash_activeProxyService"
 
     /// Mark that we have set the system proxy
     private static func markProxySet() {
@@ -56,6 +57,7 @@ struct SystemProxy {
         UserDefaults.standard.removeObject(forKey: snapshotKey)
         UserDefaults.standard.removeObject(forKey: activePortKey)
         UserDefaults.standard.removeObject(forKey: activeSocksPortKey)
+        UserDefaults.standard.removeObject(forKey: activeServiceKey)
     }
 
     /// Check if we previously set the system proxy
@@ -121,8 +123,8 @@ struct SystemProxy {
         return try? JSONDecoder().decode(ProxySnapshot.self, from: data)
     }
 
-    /// Get the primary network service name (e.g. "Wi-Fi")
-    static func primaryNetworkService() -> String? {
+    /// List all available network service names
+    private static func listNetworkServices() -> [String] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
         process.arguments = ["-listallnetworkservices"]
@@ -133,15 +135,29 @@ struct SystemProxy {
         process.waitUntilExit()
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
+        guard let output = String(data: data, encoding: .utf8) else { return [] }
 
-        let services = output.components(separatedBy: .newlines)
+        return output.components(separatedBy: .newlines)
             .filter { !$0.isEmpty && !$0.contains("*") && !$0.contains("denotes") }
+    }
 
+    /// Get the primary network service name (e.g. "Wi-Fi")
+    static func primaryNetworkService() -> String? {
+        let services = listNetworkServices()
         for preferred in ["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN"] {
             if services.contains(preferred) { return preferred }
         }
         return services.first
+    }
+
+    /// Resolve the saved service name, falling back to primary if the saved one no longer exists
+    private static func savedOrPrimaryService() -> String? {
+        if let saved = UserDefaults.standard.string(forKey: activeServiceKey) {
+            if listNetworkServices().contains(saved) {
+                return saved
+            }
+        }
+        return primaryNetworkService()
     }
 
     // MARK: - Enable System Proxy
@@ -172,7 +188,8 @@ struct SystemProxy {
             try runNetworkSetupWithPrivileges(commands)
         }
 
-        // Remember which ports we set (for Proxy Guard verification)
+        // Remember which service and ports we set (for Proxy Guard and correct restore)
+        UserDefaults.standard.set(networkService, forKey: activeServiceKey)
         UserDefaults.standard.set(httpPort, forKey: activePortKey)
         UserDefaults.standard.set(socksPort, forKey: activeSocksPortKey)
         markProxySet()
@@ -181,7 +198,7 @@ struct SystemProxy {
     // MARK: - Disable / Restore System Proxy
 
     static func disable(service: String? = nil) throws {
-        guard let networkService = service ?? primaryNetworkService() else {
+        guard let networkService = service ?? savedOrPrimaryService() else {
             throw SystemProxyError.noNetworkService
         }
 
@@ -252,7 +269,7 @@ struct SystemProxy {
     /// Check if system proxy still points to our ports. Returns false if tampered.
     static func verifyProxyIntact() -> Bool {
         guard didSetProxy else { return true }
-        guard let service = primaryNetworkService() else { return true }
+        guard let service = savedOrPrimaryService() else { return true }
 
         let expectedPort = UserDefaults.standard.integer(forKey: activePortKey)
         let expectedSocks = UserDefaults.standard.integer(forKey: activeSocksPortKey)
@@ -270,7 +287,7 @@ struct SystemProxy {
         let httpPort = UserDefaults.standard.integer(forKey: activePortKey)
         let socksPort = UserDefaults.standard.integer(forKey: activeSocksPortKey)
         guard httpPort > 0, socksPort > 0 else { return }
-        guard let service = primaryNetworkService() else { return }
+        guard let service = savedOrPrimaryService() else { return }
 
         let commands: [[String]] = [
             ["-setwebproxy", service, "127.0.0.1", "\(httpPort)"],
