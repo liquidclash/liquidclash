@@ -4,6 +4,7 @@ DerivedData/
 *.xcuserstate
 *.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
+*.xcworkspace/xcshareddata/swiftpm/
 
 # macOS
 .DS_Store
@@ -19,6 +20,9 @@ LiquidClash/design/
 
 # Docs (plans, specs)
 docs/
+
+# Helper source (compiled binary in Resources)
+LiquidClashHelper/
 
 # Rust build artifacts
 **/target/
