@@ -25,6 +25,10 @@
   <a href="https://github.com/liquidclash/liquidclash/releases/latest"><strong>📥 Download Latest Release</strong></a>
 </p>
 
+<p align="center">
+  <a href="https://www.producthunt.com/products/liquidclash?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-liquidclash" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1125755&theme=light&t=1776391020306" alt="LiquidClash - The first Clash client designed for Liquid Glass | Product Hunt" width="250" height="54"></a>
+</p>
+
 ---
 
 <p align="center">
