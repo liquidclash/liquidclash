@@ -1,0 +1,36 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+**/*.xcodeproj/xcuserdata/
+*.xcworkspace/xcshareddata/swiftpm/
+**/*.xcworkspace/xcshareddata/swiftpm/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Design mockups (temporary)
+LiquidClash/design/
+
+# Claude / AI tooling
+.claude/
+.codex/
+.serena/
+.spec-workflow/
+
+# Docs (plans, specs)
+docs/
+
+# Local dev scripts
+script/
+
+# Helper source (compiled binary in Resources)
+LiquidClashHelper/
+
+# Rust build artifacts
+**/target/
+.rust-build/

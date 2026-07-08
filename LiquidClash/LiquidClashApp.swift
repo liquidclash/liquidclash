@@ -1,0 +1,351 @@
+import SwiftUI
+import ServiceManagement
+import AppKit
+
+// MARK: - Runtime Cleanup
+
+enum RuntimeCleanup {
+    static func markCoreStarted(tunEnabled: Bool) {
+        AppProfile.defaults.set(true, forKey: SettingsKey.didStartCore)
+        AppProfile.defaults.set(tunEnabled, forKey: SettingsKey.lastTunEnabled)
+    }
+
+    static func clearCoreStarted() {
+        AppProfile.defaults.removeObject(forKey: SettingsKey.didStartCore)
+        AppProfile.defaults.removeObject(forKey: SettingsKey.lastTunEnabled)
+    }
+
+    static func cleanupStaleRuntime() {
+        SystemProxy.cleanupIfStale()
+
+        let didStartCore = AppProfile.defaults.bool(forKey: SettingsKey.didStartCore)
+        let coreStatus = HelperManager.coreStatus()
+        guard didStartCore || coreStatus.running else { return }
+
+        if stopCore() {
+            clearCoreStarted()
+        }
+    }
+
+    static func cleanupBeforeExit() {
+        _ = stopCore()
+        if SystemProxy.didSetProxy {
+            try? SystemProxy.disable()
+        }
+    }
+
+    @discardableResult
+    static func stopCore() -> Bool {
+        do {
+            try HelperManager.stopCore()
+            clearCoreStarted()
+            return true
+        } catch {
+            if !HelperManager.coreStatus().running {
+                clearCoreStarted()
+                return true
+            }
+            print("[RuntimeCleanup] stop core failed: \(error)")
+            return false
+        }
+    }
+}
+
+// MARK: - App Delegate for Window Configuration
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Reference to app state for cleanup on termination
+    var appState: AppState?
+    /// URL received before appState was ready
+    var pendingImportURL: String?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if !AppProfile.isDev {
+            // Register URL schemes with Launch Services (ensures clash:// works immediately)
+            if let appURL = Bundle.main.bundleURL as CFURL? {
+                LSRegisterURL(appURL, true)
+            }
+
+            // Register for URL open events (works even when no window is open)
+            NSAppleEventManager.shared().setEventHandler(
+                self,
+                andSelector: #selector(handleGetURLEvent(_:replyEvent:)),
+                forEventClass: AEEventClass(kInternetEventClass),
+                andEventID: AEEventID(kAEGetURL)
+            )
+        }
+
+        // Fallback: force-resize window if SwiftUI still created it too small
+        enforceDefaultWindowSize()
+
+        // Clean up stale runtime state from previous crash/force-quit
+        RuntimeCleanup.cleanupStaleRuntime()
+
+        // Handle SIGTERM (kill command) - best-effort cleanup before exit
+        signal(SIGTERM) { _ in
+            RuntimeCleanup.cleanupBeforeExit()
+            exit(0)
+        }
+    }
+
+    private func enforceDefaultWindowSize() {
+        let defaultSize = NSSize(width: 920, height: 600)
+        let minSize = NSSize(width: 860, height: 540)
+
+        for delay in [0.1, 0.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard let window = NSApp.windows.first(where: {
+                    $0.isVisible && !($0 is NSPanel)
+                }) else { return }
+
+                window.minSize = minSize
+                window.contentMinSize = minSize
+
+                if window.frame.width < minSize.width || window.frame.height < minSize.height {
+                    let screen = window.screen ?? NSScreen.main
+                    let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+                    let origin = NSPoint(
+                        x: visibleFrame.midX - defaultSize.width / 2,
+                        y: visibleFrame.midY - defaultSize.height / 2
+                    )
+                    window.setFrame(NSRect(origin: origin, size: defaultSize), display: true, animate: false)
+                }
+            }
+        }
+    }
+
+    @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, replyEvent: NSAppleEventDescriptor) {
+        let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue ?? "nil"
+        writeDebug("handleGetURLEvent: urlString=\(urlString), appState=\(appState != nil)")
+
+        guard !AppProfile.isDev else {
+            writeDebug("handleGetURLEvent: ignored in dev profile")
+            return
+        }
+
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "clash" || scheme == "liquidclash") else {
+            writeDebug("handleGetURLEvent: scheme mismatch")
+            return
+        }
+
+        writeDebug("handleGetURLEvent: host=\(url.host ?? "nil")")
+        guard url.host == "install-config",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let subURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
+              !subURL.isEmpty else {
+            writeDebug("handleGetURLEvent: parse failed")
+            return
+        }
+
+        writeDebug("handleGetURLEvent: subURL=\(subURL.prefix(80))")
+        // Mark onboarding complete so app shows main UI
+        AppProfile.defaults.set(true, forKey: SettingsKey.hasCompletedOnboarding)
+
+        if let appState {
+            appState.addSubscription(url: subURL, name: "")
+            appState.loadInitialData()
+            Task { try? await appState.updateSubscription(url: subURL) }
+            writeDebug("handleGetURLEvent: imported!")
+        } else {
+            pendingImportURL = subURL
+            writeDebug("handleGetURLEvent: queued (appState nil)")
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func writeDebug(_ msg: String) {
+        let line = "\(Date()): \(msg)\n"
+        let path = "/tmp/liquidclash_url.log"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(line.data(using: .utf8)!)
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        appState?.disconnect()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        appState?.disconnect()
+        return .terminateNow
+    }
+}
+
+// MARK: - Window Configurator (NSWindow-level safety net)
+
+struct WindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { [weak view] in
+            guard let view, let window = view.window else { return }
+            window.minSize = NSSize(width: 860, height: 540)
+            window.contentMinSize = NSSize(width: 860, height: 540)
+            window.isOpaque = false
+            window.backgroundColor = .clear
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+@main
+struct LiquidClashApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @AppStorage(SettingsKey.hasCompletedOnboarding, store: AppProfile.defaults) private var hasCompletedOnboarding = false
+    @AppStorage(SettingsKey.themeMode, store: AppProfile.defaults) private var themeMode = "Adaptive"
+    @AppStorage(SettingsKey.interfaceLanguage, store: AppProfile.defaults) private var interfaceLanguage = "Auto"
+    @State private var appState = AppState()
+    @State private var pendingSubscriptionURL: String?
+    @State private var showImportAlert = false
+
+    init() {
+        // CRITICAL: Purge saved window frames BEFORE SwiftUI's scene management
+        // reads them. SwiftUI reads NSWindow Frame / NSSplitView Subview Frames
+        // during scene initialization (before applicationDidFinishLaunching),
+        // so we must clear them here in init() to prevent stale sizes.
+        let defaults = AppProfile.defaults
+        for key in defaults.dictionaryRepresentation().keys
+            where key.hasPrefix("NSWindow Frame ") || key.hasPrefix("NSSplitView Subview Frames ")
+        {
+            defaults.removeObject(forKey: key)
+        }
+        defaults.synchronize()
+    }
+
+    private var preferredScheme: ColorScheme? {
+        switch themeMode {
+        case "Light": return .light
+        case "Dark": return .dark
+        default: return nil
+        }
+    }
+
+    private var appLocale: Locale {
+        switch interfaceLanguage {
+        case "简体中文": return Locale(identifier: "zh-Hans")
+        case "日本語": return Locale(identifier: "ja")
+        case "English": return Locale(identifier: "en")
+        default: return Locale.current  // "Auto" — follow system
+        }
+    }
+
+    var body: some Scene {
+        WindowGroup(id: "main") {
+            ZStack {
+                // Size anchor: forces the ZStack to report 860×540 minimum
+                // and 920×600 ideal to SwiftUI's window-sizing engine.
+                // Without this, NavigationSplitView reports ~200px minimum
+                // which causes the window to open at sidebar-only width.
+                Color.clear
+                    .frame(minWidth: 860, idealWidth: 920,
+                           minHeight: 540, idealHeight: 600)
+
+                if hasCompletedOnboarding {
+                    ContentView()
+                        .environment(appState)
+                } else {
+                    WelcomeView {
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            hasCompletedOnboarding = true
+                        }
+                        appState.loadInitialData()
+                    }
+                }
+            }
+            .background(WindowConfigurator())
+            .defaultAppStorage(AppProfile.defaults)
+            .task {
+                appDelegate.appState = appState
+                if hasCompletedOnboarding {
+                    appState.loadInitialData()
+                }
+                // Process URL that arrived before appState was ready
+                if let pending = appDelegate.pendingImportURL {
+                    appDelegate.pendingImportURL = nil
+                    appState.addSubscription(url: pending, name: "")
+                    Task { try? await appState.updateAllSubscriptions() }
+                }
+            }
+            .preferredColorScheme(preferredScheme)
+            .environment(\.locale, appLocale)
+            .onOpenURL { url in
+                let log = { (msg: String) in
+                    let line = "\(Date()): [onOpenURL] \(msg)\n"
+                    let path = "/tmp/liquidclash_url.log"
+                    if let fh = FileHandle(forWritingAtPath: path) {
+                        fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); fh.closeFile()
+                    } else {
+                        FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+                    }
+                }
+                log("received: \(url.absoluteString.prefix(120))")
+                guard !AppProfile.isDev else {
+                    log("ignored in dev profile")
+                    return
+                }
+                log("scheme=\(url.scheme ?? "nil"), host=\(url.host ?? "nil")")
+                guard let scheme = url.scheme?.lowercased(),
+                      (scheme == "clash" || scheme == "liquidclash"),
+                      url.host == "install-config",
+                      let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                      let subURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
+                      !subURL.isEmpty else {
+                    log("guard FAILED")
+                    return
+                }
+                log("subURL=\(subURL.prefix(80))...")
+                AppProfile.defaults.set(true, forKey: SettingsKey.hasCompletedOnboarding)
+                appState.addSubscription(url: subURL, name: "")
+                appState.loadInitialData()
+                Task { try? await appState.updateSubscription(url: subURL) }
+                NSApp.activate(ignoringOtherApps: true)
+                log("imported!")
+            }
+        }
+        .defaultSize(width: 920, height: 600)
+        .windowResizability(.contentMinSize)
+        .restorationBehavior(.disabled)
+        .windowStyle(.hiddenTitleBar)
+
+        // Menu Bar Extra
+        MenuBarExtra {
+            MenuBarView()
+                .environment(appState)
+                .defaultAppStorage(AppProfile.defaults)
+                .preferredColorScheme(preferredScheme)
+                .environment(\.locale, appLocale)
+        } label: {
+            Image("MenuBarIcon")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        }
+        .menuBarExtraStyle(.window)
+    }
+
+    /// Handle clash:// or liquidclash:// URLs
+    /// Format: clash://install-config?url=<encoded_url>
+    private func handleIncomingURL(_ url: URL) {
+        guard let scheme = url.scheme?.lowercased(),
+              (scheme == "clash" || scheme == "liquidclash") else { return }
+
+        guard url.host == "install-config" else { return }
+
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let subURL = components.queryItems?.first(where: { $0.name == "url" })?.value,
+              !subURL.isEmpty else { return }
+
+        // Show confirmation alert
+        pendingSubscriptionURL = subURL
+        showImportAlert = true
+
+        // Bring app to front
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
