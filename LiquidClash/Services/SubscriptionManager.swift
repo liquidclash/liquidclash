@@ -740,7 +740,11 @@ actor SubscriptionManager {
             do {
                 let (nodes, rawContent, headerInfo) = try await fetchSubscription(url: updatedSubs[i].url, proxyPort: proxyPort)
                 let (realNodes, nodeInfo) = Self.extractInfoNodes(nodes)
-                allNodes.append(contentsOf: realNodes)
+                allNodes.append(contentsOf: realNodes.map { node in
+                    var sourcedNode = node
+                    sourcedNode.subscriptionId = updatedSubs[i].id
+                    return sourcedNode
+                })
                 allRawContents.append(rawContent)
                 updatedSubs[i].lastUpdate = Date()
                 updatedSubs[i].nodeCount = realNodes.count

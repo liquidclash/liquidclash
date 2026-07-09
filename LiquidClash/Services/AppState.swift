@@ -668,17 +668,20 @@ final class AppState {
     }
 
     func updateSubscription(url: String) async throws {
+        let existingSubscription = subscriptions.first { $0.url == url }
+        let subscriptionId = existingSubscription?.id ?? UUID().uuidString
         let previousSelection = currentProxySelectionTarget()
         let (regions, rawYAML, userInfo) = try await subscriptionManager.fetchAndOrganize(url: url, proxyPort: activeProxyPort)
+        let sourcedRegions = Self.assignSubscription(subscriptionId, to: regions)
         await MainActor.run {
             let customRegions = self.proxyRegions.filter { $0.id == "custom" }
-            self.proxyRegions = regions + customRegions
+            self.proxyRegions = sourcedRegions + customRegions
             self.restoreProxySelection(preferredTarget: previousSelection, persistFallback: true)
             // Merge rules: keep user rules, replace subscription rules
             let hasRules = rawYAML.components(separatedBy: .newlines)
                 .contains { $0.trimmingCharacters(in: .whitespaces) == "rules:" }
             if hasRules {
-                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription)
+                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription, subscriptionId: subscriptionId)
                 if !parsedRules.isEmpty {
                     let userRules = self.rules.filter { $0.source == .user }
                     self.rules = userRules + parsedRules
@@ -691,9 +694,8 @@ final class AppState {
         ConfigStorage.shared.saveRawSubscriptionYAML(rawYAML)
 
         // Save subscription info with traffic data
-        let existingSubscription = subscriptions.first { $0.url == url }
         let info = SubscriptionInfo(
-            id: existingSubscription?.id ?? UUID().uuidString,
+            id: subscriptionId,
             url: url,
             name: existingSubscription?.name ?? "Default",
             lastUpdate: Date(),
@@ -727,11 +729,22 @@ final class AppState {
     }
 
     func removeSubscription(_ id: String) {
-        let removedWasEnabled = subscriptions.first(where: { $0.id == id })?.isEnabled == true
+        guard let removed = subscriptions.first(where: { $0.id == id }) else { return }
+        let removedWasEnabled = removed.isEnabled
         subscriptions.removeAll { $0.id == id }
         _ = Self.normalizeSingleEnabledSubscription(&subscriptions)
-        if removedWasEnabled && !subscriptions.contains(where: \.isEnabled) {
-            clearSubscriptionRuntimeState()
+        let hasEnabledSubscription = subscriptions.contains(where: \.isEnabled)
+
+        if removedWasEnabled && !hasEnabledSubscription {
+            ConfigStorage.shared.saveRawSubscriptionYAML("")
+        }
+
+        let didRemoveRuntimeContent = removeSubscriptionRuntimeContent(
+            for: id,
+            includeUnattributedSubscriptionContent: removedWasEnabled || !hasEnabledSubscription
+        )
+        if didRemoveRuntimeContent, isConnected {
+            reloadCoreConfig()
         }
         Task { await subscriptionManager.saveSubscriptions(subscriptions) }
     }
@@ -844,7 +857,8 @@ final class AppState {
             let hasRulesSection = rawYAML.components(separatedBy: .newlines)
                 .contains { $0.trimmingCharacters(in: .whitespaces) == "rules:" }
             if hasRulesSection {
-                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription)
+                let activeSubscriptionId = updatedSubs.first(where: \.isEnabled)?.id
+                let parsedRules = ConfigParser.parseClashYAMLRules(rawYAML, source: .subscription, subscriptionId: activeSubscriptionId)
                 print("[LiquidClash] Parsed \(parsedRules.count) rules from subscription YAML (\(rawYAML.count) chars)")
                 if !parsedRules.isEmpty {
                     let userRules = self.rules.filter { $0.source == .user }
@@ -887,6 +901,70 @@ final class AppState {
         rules = rules.filter { $0.source == .user }
         saveState()
         ConfigStorage.shared.saveRawSubscriptionYAML("")
+    }
+
+    private static func assignSubscription(_ subscriptionId: String, to regions: [ProxyRegion]) -> [ProxyRegion] {
+        regions.map { region in
+            var sourcedRegion = region
+            sourcedRegion.nodes = region.nodes.map { node in
+                var sourcedNode = node
+                sourcedNode.subscriptionId = subscriptionId
+                return sourcedNode
+            }
+            return sourcedRegion
+        }
+    }
+
+    @discardableResult
+    private func removeSubscriptionRuntimeContent(for subscriptionId: String, includeUnattributedSubscriptionContent: Bool) -> Bool {
+        let previousSelection = currentProxySelectionTarget()
+        var removedNode = false
+        var removedRule = false
+
+        proxyRegions = proxyRegions.compactMap { region in
+            guard region.id != "custom" else { return region }
+
+            var filteredRegion = region
+            filteredRegion.nodes.removeAll { node in
+                let shouldRemove = node.subscriptionId == subscriptionId
+                    || (includeUnattributedSubscriptionContent && node.subscriptionId == nil)
+                if shouldRemove { removedNode = true }
+                return shouldRemove
+            }
+            return filteredRegion.nodes.isEmpty ? nil : filteredRegion
+        }
+
+        let previousRuleCount = rules.count
+        rules.removeAll { rule in
+            rule.subscriptionId == subscriptionId
+                || (includeUnattributedSubscriptionContent && rule.source == .subscription && rule.subscriptionId == nil)
+        }
+        removedRule = rules.count != previousRuleCount
+
+        guard removedNode || removedRule else { return false }
+
+        restoreProxySelection(preferredTarget: previousSelection, persistFallback: true)
+        saveState()
+        return true
+    }
+
+    @discardableResult
+    private func assignUnattributedSubscriptionRuntime(to subscriptionId: String) -> Bool {
+        var changed = false
+
+        for regionIndex in proxyRegions.indices where proxyRegions[regionIndex].id != "custom" {
+            for nodeIndex in proxyRegions[regionIndex].nodes.indices where proxyRegions[regionIndex].nodes[nodeIndex].subscriptionId == nil {
+                proxyRegions[regionIndex].nodes[nodeIndex].subscriptionId = subscriptionId
+                changed = true
+            }
+        }
+
+        for ruleIndex in rules.indices where rules[ruleIndex].source == .subscription && rules[ruleIndex].subscriptionId == nil {
+            rules[ruleIndex].subscriptionId = subscriptionId
+            changed = true
+        }
+
+        return changed
     }
 
     func startAutoUpdate(intervalHours: Int = 6) {
@@ -1254,6 +1332,10 @@ final class AppState {
             subscriptions = loadedSubscriptions
             if normalized {
                 await subscriptionManager.saveSubscriptions(loadedSubscriptions)
+            }
+            if let enabledSubscriptionId = loadedSubscriptions.first(where: \.isEnabled)?.id,
+               assignUnattributedSubscriptionRuntime(to: enabledSubscriptionId) {
+                saveState()
             }
             startAutoUpdate()
             // Auto-refresh subscriptions on launch to get latest traffic info

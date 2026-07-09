@@ -13,7 +13,7 @@ enum ProxyMode: String, CaseIterable {
 enum AppPage: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
     case subscriptions = "Subscriptions"
-    case proxies   = "Proxies"
+    case proxies   = "Nodes"
     case rules     = "Rules"
     case activity  = "Activity"
     case logs      = "Logs"

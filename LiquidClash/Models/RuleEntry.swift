@@ -37,6 +37,8 @@ struct RuleItem: Identifiable, Codable {
     var noResolve: Bool = false
     /// Where this rule came from — user-created or subscription-imported
     var source: RuleSource = .user
+    /// Subscription that provided this rule. nil keeps older saved data compatible.
+    var subscriptionId: String?
 
     /// Display name shown in UI — preserves original group names
     var displayPolicy: String { policyName ?? policy.rawValue }
@@ -63,7 +65,7 @@ struct RuleItem: Identifiable, Codable {
         }
     }
 
-    init(id: String = UUID().uuidString, type: String, value: String, policy: RulePolicy, policyName: String? = nil, noResolve: Bool = false, source: RuleSource = .user) {
+    init(id: String = UUID().uuidString, type: String, value: String, policy: RulePolicy, policyName: String? = nil, noResolve: Bool = false, source: RuleSource = .user, subscriptionId: String? = nil) {
         self.id = id
         self.type = type
         self.value = value
@@ -71,6 +73,7 @@ struct RuleItem: Identifiable, Codable {
         self.policyName = policyName
         self.noResolve = noResolve
         self.source = source
+        self.subscriptionId = subscriptionId
     }
 
     // Custom decoder to handle missing fields from older JSON
@@ -83,10 +86,11 @@ struct RuleItem: Identifiable, Codable {
         policyName = try container.decodeIfPresent(String.self, forKey: .policyName)
         noResolve = try container.decodeIfPresent(Bool.self, forKey: .noResolve) ?? false
         source = try container.decodeIfPresent(RuleSource.self, forKey: .source) ?? .user
+        subscriptionId = try container.decodeIfPresent(String.self, forKey: .subscriptionId)
     }
 
     /// Parse from Clash config line (e.g. "DOMAIN-SUFFIX,google.com,YouTube" or "GEOIP,CN,DIRECT,no-resolve")
-    static func from(clashString: String, source: RuleSource = .user) -> RuleItem? {
+    static func from(clashString: String, source: RuleSource = .user, subscriptionId: String? = nil) -> RuleItem? {
         var parts = clashString.split(separator: ",").map(String.init)
         guard parts.count >= 2 else { return nil }
 
@@ -96,12 +100,12 @@ struct RuleItem: Identifiable, Codable {
         let type = parts[0]
         if type == "MATCH" {
             let (policy, name) = parsePolicyWithName(parts[1])
-            return RuleItem(type: type, value: "", policy: policy, policyName: name, noResolve: noResolve, source: source)
+            return RuleItem(type: type, value: "", policy: policy, policyName: name, noResolve: noResolve, source: source, subscriptionId: subscriptionId)
         }
 
         guard parts.count >= 3 else { return nil }
         let (policy, name) = parsePolicyWithName(parts[2])
-        return RuleItem(type: type, value: parts[1], policy: policy, policyName: name, noResolve: noResolve, source: source)
+        return RuleItem(type: type, value: parts[1], policy: policy, policyName: name, noResolve: noResolve, source: source, subscriptionId: subscriptionId)
     }
 
     /// Parse policy string, preserving custom group names

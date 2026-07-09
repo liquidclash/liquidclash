@@ -391,7 +391,7 @@ struct ProxiesView: View {
 
     private var headerRow: some View {
         HStack(alignment: .center) {
-            Text("Proxies")
+            Text("Nodes")
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundStyle(.primary)
 
