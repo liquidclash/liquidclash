@@ -6,6 +6,7 @@ struct ProxiesView: View {
     @State private var showingAddNode = false
     @State private var editingNode: ProxyNode?
     @State private var isTesting = false
+    @State private var targetGroup: ProxyService.MihomoGroup?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -128,7 +129,11 @@ struct ProxiesView: View {
                         || group.name == appState.proxyService.activeNodeName
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) {
-                            appState.selectNode(group.name)
+                            if group.isSelector && !group.all.isEmpty {
+                                targetGroup = group
+                            } else {
+                                appState.selectNode(group.name)
+                            }
                         }
                     } label: {
                         HStack(spacing: 6) {
@@ -162,6 +167,9 @@ struct ProxiesView: View {
                         .contentShape(RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
+                    .popover(isPresented: groupPopoverBinding(for: group), arrowEdge: .bottom) {
+                        groupTargetPicker(currentProxyGroup(named: group.name) ?? group)
+                    }
                 }
             }
 
@@ -342,6 +350,169 @@ struct ProxiesView: View {
             return ConfigParser.extractFlag(from: now).cleanName
         }
         return groupTypeName(group.type)
+    }
+
+    private func currentProxyGroup(named name: String) -> ProxyService.MihomoGroup? {
+        proxyGroups.first { $0.name == name }
+    }
+
+    private func groupPopoverBinding(for group: ProxyService.MihomoGroup) -> Binding<Bool> {
+        Binding {
+            targetGroup?.id == group.id
+        } set: { isPresented in
+            if isPresented {
+                targetGroup = group
+            } else if targetGroup?.id == group.id {
+                targetGroup = nil
+            }
+        }
+    }
+
+    private func groupTargetPicker(_ group: ProxyService.MihomoGroup) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: groupIcons[group.name] ?? groupIcon(for: group))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(group.name)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text("Choose Target")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            Divider()
+                .opacity(0.35)
+
+            if !appState.isConnected {
+                emptyTargetMessage("Core not connected")
+            } else if group.all.isEmpty {
+                emptyTargetMessage("No targets available")
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(group.all.enumerated()), id: \.offset) { _, target in
+                            targetChoiceButton(target, in: group)
+                        }
+                    }
+                }
+                .frame(maxHeight: 320)
+                .scrollIndicators(.hidden)
+            }
+        }
+        .padding(12)
+        .frame(width: 300)
+    }
+
+    private func targetChoiceButton(_ target: String, in group: ProxyService.MihomoGroup) -> some View {
+        let isSelected = group.now == target
+        return Button {
+            appState.selectProxyTarget(target, inGroup: group.name)
+            targetGroup = nil
+        } label: {
+            HStack(spacing: 8) {
+                targetIcon(for: target)
+                    .frame(width: 18)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(targetDisplayName(target))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    if let meta = targetMeta(for: target) {
+                        Text(meta)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color(hex: "30D158"))
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(
+                isSelected ? Color.accentColor.opacity(0.12) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func emptyTargetMessage(_ text: LocalizedStringKey) -> some View {
+        Text(text)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, minHeight: 54)
+    }
+
+    @ViewBuilder
+    private func targetIcon(for target: String) -> some View {
+        if let node = mihomoNode(named: target) {
+            Text(node.flag)
+                .font(.system(size: 13))
+        } else {
+            Image(systemName: targetSystemIcon(for: target))
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func targetSystemIcon(for target: String) -> String {
+        if let icon = groupIcons[target] { return icon }
+        switch target {
+        case "DIRECT":
+            return "arrow.up.right.circle.fill"
+        case "REJECT", "REJECT-DROP":
+            return "xmark.octagon.fill"
+        case "PASS":
+            return "arrow.right.circle.fill"
+        default:
+            if let group = currentProxyGroup(named: target) {
+                return groupIcon(for: group)
+            }
+            return "circle.grid.2x2.fill"
+        }
+    }
+
+    private func targetDisplayName(_ target: String) -> String {
+        let cleanName = ConfigParser.extractFlag(from: target).cleanName
+        return cleanName.isEmpty ? target : cleanName
+    }
+
+    private func targetMeta(for target: String) -> String? {
+        if target == "DIRECT" {
+            return String(localized: "Direct")
+        }
+        if target == "REJECT" || target == "REJECT-DROP" {
+            return String(localized: "Reject")
+        }
+        if let group = currentProxyGroup(named: target) {
+            return groupTypeName(group.type)
+        }
+        return mihomoNode(named: target)?.type
+    }
+
+    private func mihomoNode(named target: String) -> ProxyService.MihomoNode? {
+        appState.proxyService.nodes.first {
+            $0.name == target || ConfigParser.extractFlag(from: $0.name).cleanName == target
+        }
     }
 
     private func groupTypeName(_ type: String) -> String {

@@ -2367,6 +2367,54 @@
         }
       }
     },
+    "Choose Target": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "接続先を選択"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择出口"
+          }
+        }
+      }
+    },
+    "Core not connected": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "コア未接続"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "内核未连接"
+          }
+        }
+      }
+    },
+    "No targets available": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "選択できる接続先がありません"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "暂无可选出口"
+          }
+        }
+      }
+    },
     "Proxy Groups": {
       "localizations": {
         "ja": {

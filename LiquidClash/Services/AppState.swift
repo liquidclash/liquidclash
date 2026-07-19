@@ -130,6 +130,29 @@ final class AppState {
         }
     }
 
+    private func localProxyNode(matching target: String) -> ProxyNode? {
+        proxyRegions.flatMap(\.nodes).first {
+            proxyTarget($0.name, matches: target) || proxyTarget($0.id, matches: target)
+        }
+    }
+
+    private func isMainProxyGroup(_ name: String) -> Bool {
+        name == "PROXY" || name == "Proxies"
+    }
+
+    private func mainProxyGroups(containing target: String) -> [ProxyService.MihomoGroup] {
+        let candidates = proxyService.groups.filter { $0.isSelector && $0.all.contains(target) }
+        let preferred = candidates.filter { isMainProxyGroup($0.name) }
+        if !preferred.isEmpty { return preferred }
+
+        if let activeGroupName = proxyService.activeGroupName,
+           let active = candidates.first(where: { $0.name == activeGroupName }) {
+            return [active]
+        }
+
+        return candidates.first.map { [$0] } ?? []
+    }
+
     func restoreProxySelection(preferredTarget: String? = nil, persistFallback: Bool = false) {
         if let target = normalizedProxyTarget(preferredTarget) ?? savedProxyTargetName,
            applyProxySelection(target) {
@@ -142,7 +165,7 @@ final class AppState {
     @discardableResult
     private func applyProxySelection(_ target: String) -> Bool {
         let localNodes = proxyRegions.flatMap(\.nodes)
-        if let node = localNodes.first(where: { proxyTarget($0.name, matches: target) || proxyTarget($0.id, matches: target) }) {
+        if let node = localProxyNode(matching: target) {
             selectedNodeId = node.id
             activeNode = node
             proxyService.activeNodeName = node.name
@@ -404,8 +427,7 @@ final class AppState {
     func selectNode(_ nameOrId: String) {
         // Update local selection state
         selectedNodeId = nameOrId
-        activeNode = proxyRegions.flatMap(\.nodes).first(where: { $0.name == nameOrId || $0.id == nameOrId })
-            ?? proxyRegions.flatMap(\.nodes).first(where: { ConfigParser.extractFlag(from: nameOrId).cleanName == $0.name })
+        activeNode = localProxyNode(matching: nameOrId)
 
         // Resolve to mihomo name: local names may lack emoji prefix that mihomo uses
         let nodeName: String
@@ -424,17 +446,19 @@ final class AppState {
         let isCustom = proxyRegions.first(where: { $0.id == "custom" })?.nodes.contains(where: { $0.name == nodeName || $0.id == nameOrId }) ?? false
         if isCustom {
             proxyService.activeGroupName = nil
+        } else if let mainGroup = mainProxyGroups(containing: nodeName).first {
+            proxyService.activeGroupName = mainGroup.name
         }
 
         guard isConnected else { return }
         // Cancel previous IP detection
         networkInfoTask?.cancel()
         networkInfo = NetworkInfo()
-        let groups = proxyService.groups
+        let mainGroups = mainProxyGroups(containing: nodeName)
         let api = clashAPI
         networkInfoTask = Task.detached { [weak self] in
-            // Batch: select in all matching groups via API, then refresh once
-            let matchingGroups = groups.filter { $0.isSelector && $0.all.contains(nodeName) }
+            // A node click changes the main proxy choice only. Service groups are configured separately.
+            let matchingGroups = mainGroups
             guard let api else { return }
             for group in matchingGroups {
                 try? await api.selectProxy(group: group.name, proxy: nodeName)
@@ -446,6 +470,30 @@ final class AppState {
             try? await Task.sleep(for: .seconds(1))
             guard !Task.isCancelled else { return }
             await self?.fetchNetworkInfo()
+        }
+    }
+
+    func selectProxyTarget(_ target: String, inGroup groupName: String) {
+        guard isConnected else { return }
+
+        networkInfoTask?.cancel()
+        networkInfo = NetworkInfo()
+        let isMainGroup = isMainProxyGroup(groupName)
+        networkInfoTask = Task.detached { [weak self] in
+            guard let appState = self else { return }
+            await appState.proxyService.selectProxy(group: groupName, proxy: target)
+            if isMainGroup {
+                await MainActor.run {
+                    appState.selectedNodeId = target
+                    appState.activeNode = appState.localProxyNode(matching: target)
+                    appState.proxyService.activeGroupName = groupName
+                    appState.proxyService.activeNodeName = target
+                    appState.persistProxySelection(target)
+                }
+            }
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            await appState.fetchNetworkInfo()
         }
     }
 
