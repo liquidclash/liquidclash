@@ -1,0 +1,21 @@
+pub mod autostart;
+pub mod backup;
+pub mod handle;
+pub mod hotkey;
+pub mod listener;
+pub mod logger;
+pub mod manager;
+mod notification;
+pub(crate) mod owner_identity;
+pub mod proxy_control;
+pub mod proxy_view;
+pub mod runstate;
+mod runtime_bundle;
+pub mod service;
+pub mod sysopt;
+pub mod timer;
+pub mod tray;
+pub mod validate;
+pub mod win_uwp;
+
+pub use self::{manager::CoreManager, timer::Timer};

@@ -1,0 +1,172 @@
+{
+  "nav": {
+    "dashboard": "Dashboard",
+    "nodes": "Nodes",
+    "account": "Account"
+  },
+  "login": {
+    "title": "Sign in to Tono",
+    "subtitle": "Enter your email to receive a sign-in code.",
+    "welcome": "Welcome to Tono",
+    "intro": "Sign in with a verified email to continue. No password is required.",
+    "emailLabel": "Email address",
+    "emailPlaceholder": "you@example.com",
+    "sendCode": "Email me a sign-in code",
+    "sendNewCode": "Send a new code",
+    "sending": "Sending…",
+    "resendIn": "Resend in {{seconds}}s",
+    "codeSent": "Code sent. Check your inbox.",
+    "codeLabel": "6-digit code",
+    "codePlaceholder": "123456",
+    "verify": "Verify email code",
+    "verifying": "Verifying…",
+    "validity": "If this address is eligible, the code is valid for 10 minutes.",
+    "changeEmail": "Use a different email",
+    "invalidEmail": "Please enter a valid email address",
+    "invalidCode": "Please enter the 6-digit code",
+    "suspended": {
+      "title": "Tono account suspended",
+      "description": "Your account has been suspended. Please contact support for assistance."
+    },
+    "restoreFailed": {
+      "title": "Couldn't restore your session",
+      "description": "Restoring your previous session failed. Retry, or sign in again below.",
+      "retry": "Retry"
+    }
+  },
+  "pill": {
+    "title": {
+      "notConnected": "Not Connected",
+      "connecting": "Connecting…",
+      "connected": "Connected",
+      "protectedOffline": "Protected Offline",
+      "disconnecting": "Disconnecting…"
+    },
+    "subtitle": {
+      "tapToConnect": "Tap to connect",
+      "tapToDisconnect": "Tap to disconnect",
+      "tapToRestore": "Tap to restore internet",
+      "restoringAccess": "Restoring network access",
+      "starting": "Starting…"
+    },
+    "statusProtected": "Protected cloud route",
+    "statusReality": "Reality cloud protection"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "connect": "Connect",
+    "connecting": "Connecting…",
+    "connected": "Connected",
+    "disconnecting": "Disconnecting…",
+    "protectedOffline": "Protected Offline",
+    "protectedOfflineDescription": "Your internet is blocked to prevent leaks. Click to restore.",
+    "server": "Server",
+    "noServer": "No server selected",
+    "killSwitchMode": "Kill switch: {{mode}}",
+    "killSwitchModes": {
+      "bootstrap": "Bootstrap",
+      "locked": "Locked",
+      "blocked": "Blocked"
+    },
+    "catalogRequiresChoice": "Your server is no longer available — please reselect",
+    "killSwitchError": "Kill switch: {{message}}",
+    "killSwitchErrorNote": "Most recent error — it may already be resolved.",
+    "info": {
+      "ip": "IP",
+      "asnType": "ASN Type",
+      "city": "City",
+      "dns": "DNS"
+    }
+  },
+  "node": {
+    "activeServer": "ACTIVE SERVER",
+    "selectedServer": "SELECTED SERVER",
+    "switch": "Switch",
+    "group": "Tono Cloud"
+  },
+  "progress": {
+    "total": "TOTAL {{elapsed}}",
+    "tryBadge": "TRY {{count}}",
+    "failedAt": "Failed at {{stage}}",
+    "unknownStage": "Unknown stage",
+    "retryIn": "Retry {{n}} in {{seconds}}s",
+    "retrying": "Retrying…",
+    "retryNow": "Retry Now",
+    "restore": "Restore Normal Internet",
+    "restoreConfirmTitle": "Restore normal internet",
+    "restoreConfirmMessage": "This will release network protection and restore normal Internet access.",
+    "copyDetails": "Copy details",
+    "copied": "Details copied",
+    "copyFailed": "Failed to copy details",
+    "steps": {
+      "preparing": "Preparing protection…",
+      "preparingService": "Preparing Windows Service…",
+      "startingKillSwitch": "Enabling WFP Kill Switch…",
+      "startingTunnel": "Starting mihomo/WinTUN…",
+      "lockingTraffic": "Locking traffic to protected interface…",
+      "applyingCloudPolicy": "Applying cloud routing policy…",
+      "securingDNS": "Securing and verifying DNS…",
+      "checkingExit": "Checking final exit…",
+      "verifyingTraffic": "Verifying real TUN data plane…"
+    }
+  },
+  "nodes": {
+    "title": "Nodes",
+    "testCurrent": "Test Current",
+    "cloudServers": "Cloud Servers",
+    "empty": "No servers available",
+    "timeout": "Timeout"
+  },
+  "servers": {
+    "title": "Servers",
+    "cloudGroup": "TONO CLOUD",
+    "empty": "No servers available",
+    "selected": "Selected"
+  },
+  "account": {
+    "title": "Account",
+    "email": "Email",
+    "devices": "Devices",
+    "deviceLimit": "{{count}} / {{limit}} devices",
+    "currentDevice": "This device",
+    "revoke": "Revoke",
+    "revokeConfirmTitle": "Revoke device",
+    "revokeConfirmMessage": "Revoke \"{{name}}\"? It will be signed out immediately.",
+    "signOut": "Sign Out",
+    "signOutConfirmTitle": "Sign out",
+    "signOutConfirmMessage": "Signing out will disconnect the VPN and remove this device from your account. Continue?"
+  },
+  "settings": {
+    "title": "Settings",
+    "account": "Tono Account",
+    "general": {
+      "title": "General",
+      "launchAtStartup": "Launch at Startup",
+      "language": "Interface Language"
+    },
+    "proxyEngine": {
+      "title": "Proxy Engine",
+      "tun": "TUN Mode",
+      "tunSubtitle": "Required by Tono to prevent application bypass",
+      "allowLan": "Allow LAN",
+      "allowLanSubtitle": "Managed by Tono",
+      "mixedPort": "Mixed Port"
+    },
+    "appearance": {
+      "title": "Appearance",
+      "themeMode": "Theme Mode",
+      "theme": {
+        "light": "Light",
+        "dark": "Dark",
+        "system": "System"
+      },
+      "glass": "Glass Transparency",
+      "glassSubtitle": "How much of the ambient background shows through"
+    },
+    "about": {
+      "title": "About",
+      "tagline": "Protected cloud connection",
+      "description": "Authenticated VLESS Reality routing with a fail-closed Kill Switch"
+    }
+  }
+}

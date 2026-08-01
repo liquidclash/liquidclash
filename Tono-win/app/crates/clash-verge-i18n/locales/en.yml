@@ -1,0 +1,87 @@
+_version: 1
+notifications:
+  dashboardToggled:
+    title: Dashboard
+    body: Dashboard visibility has been updated.
+  clashModeChanged:
+    title: Mode Switch
+    body: Switched to {mode}.
+  systemProxyToggled:
+    title: System Proxy
+    'on': System proxy has been enabled.
+    'off': System proxy has been disabled.
+  tunModeToggled:
+    title: TUN Mode
+    'on': TUN mode has been enabled.
+    'off': TUN mode has been disabled.
+  lightweightModeEntered:
+    title: Lightweight Mode
+    body: Entered lightweight mode.
+  profilesReactivated:
+    title: Profiles
+    body: Profile Reactivated.
+  appQuit:
+    title: About to Exit
+    body: Tono is about to exit.
+  appHidden:
+    title: Application Hidden
+    body: Tono is running in the background.
+  updateReady:
+    title: Tono Update
+    body: A new version (v{version}) has been downloaded and is ready to install.
+    installNow: Install Now
+    later: Later
+service:
+  adminInstallPrompt: Installing the Tono service requires administrator privileges.
+  adminUninstallPrompt: Uninstalling the Tono service requires administrator privileges.
+launchGuard:
+  currentExeError: 'Unable to determine the application location: {error}'
+  homeDirError: 'Unable to determine the current user''s home directory. The application will exit: {error}'
+  translocated: macOS is running this application from a temporary App Translocation path. In Finder, move it manually to /Applications or ~/Applications, then reopen it.
+  rejected: |-
+    This application must be launched from an Applications directory.
+
+    {reason}
+  notInBundle: The executable is not inside an application bundle.
+  canonicalizeBundleError: 'Unable to resolve the application bundle path: {error}'
+  bundleNameError: Unable to determine the application bundle name. The application will exit.
+  replacePrompt: An application already exists at {destination}. Replace it and relaunch from Applications?
+  movePrompt: To start the background service safely, the application must be moved to {destination}. Move and relaunch it now?
+  createApplicationsDirError: 'Unable to create the Applications directory: {error}'
+  moveFailed: Failed to move the application. Move it manually in Finder and try again.
+  replaceFailed: 'Unable to replace the existing application safely: {error}'
+  relaunchFailed: The application was copied, but it could not be relaunched automatically. Open it manually from Applications.
+  cancel: Cancel
+  move: Move
+  ok: OK
+tray:
+  dashboard: Dashboard
+  ruleMode: Rule Mode
+  globalMode: Global Mode
+  directMode: Direct Mode
+  outboundModes: Outbound Modes
+  rule: Rule
+  direct: Direct
+  global: Global
+  profiles: Profiles
+  proxies: Proxies
+  systemProxy: System Proxy
+  tunMode: TUN Mode
+  closeAllConnections: Close All Connections
+  lightweightMode: Lightweight Mode
+  copyEnv: Copy Environment Variables
+  confDir: Configuration Directory
+  coreDir: Core Directory
+  logsDir: Log Directory
+  openDir: Open Directory
+  appLog: Application Log
+  coreLog: Core Log
+  restartClash: Restart Clash Core
+  restartApp: Restart Application
+  vergeVersion: Verge Version
+  more: More
+  exit: Exit
+  tooltip:
+    systemProxy: System Proxy
+    tun: TUN
+    profile: Profile

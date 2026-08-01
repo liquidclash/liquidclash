@@ -1,0 +1,172 @@
+{
+  "nav": {
+    "dashboard": "仪表盘",
+    "nodes": "节点",
+    "account": "账号"
+  },
+  "login": {
+    "title": "登录 Tono",
+    "subtitle": "输入邮箱以接收登录验证码。",
+    "welcome": "欢迎使用 Tono",
+    "intro": "使用已验证的邮箱登录即可继续，无需密码。",
+    "emailLabel": "邮箱地址",
+    "emailPlaceholder": "you@example.com",
+    "sendCode": "将登录码发送到我的邮箱",
+    "sendNewCode": "发送新验证码",
+    "sending": "发送中…",
+    "resendIn": "{{seconds}} 秒后可重发",
+    "codeSent": "验证码已发送，请查收邮箱。",
+    "codeLabel": "6 位验证码",
+    "codePlaceholder": "123456",
+    "verify": "验证邮箱验证码",
+    "verifying": "验证中…",
+    "validity": "如果该邮箱符合条件，验证码 10 分钟内有效。",
+    "changeEmail": "使用其他邮箱",
+    "invalidEmail": "请输入有效的邮箱地址",
+    "invalidCode": "请输入 6 位验证码",
+    "suspended": {
+      "title": "Tono 账号已被暂停",
+      "description": "您的账号已被暂停使用，请联系客服获取帮助。"
+    },
+    "restoreFailed": {
+      "title": "会话恢复失败",
+      "description": "恢复此前的登录会话失败。请重试，或在下方重新登录。",
+      "retry": "重试"
+    }
+  },
+  "pill": {
+    "title": {
+      "notConnected": "未连接",
+      "connecting": "连接中…",
+      "connected": "已连接",
+      "protectedOffline": "离线保护中",
+      "disconnecting": "断开中…"
+    },
+    "subtitle": {
+      "tapToConnect": "点击连接",
+      "tapToDisconnect": "点击断开",
+      "tapToRestore": "点击恢复网络",
+      "restoringAccess": "正在恢复网络访问",
+      "starting": "正在启动…"
+    },
+    "statusProtected": "受保护的云端路由",
+    "statusReality": "Reality 云端保护"
+  },
+  "dashboard": {
+    "title": "仪表盘",
+    "connect": "连接",
+    "connecting": "连接中…",
+    "connected": "已连接",
+    "disconnecting": "断开中…",
+    "protectedOffline": "离线保护中",
+    "protectedOfflineDescription": "为防止流量泄漏，您的网络已被阻断。点击恢复连接。",
+    "server": "节点",
+    "noServer": "未选择节点",
+    "killSwitchMode": "Kill switch：{{mode}}",
+    "killSwitchModes": {
+      "bootstrap": "引导",
+      "locked": "锁定",
+      "blocked": "阻断"
+    },
+    "catalogRequiresChoice": "您选择的节点已下线 — 请重新选择",
+    "killSwitchError": "Kill switch：{{message}}",
+    "killSwitchErrorNote": "最近一次错误，可能已恢复。",
+    "info": {
+      "ip": "IP",
+      "asnType": "ASN 类型",
+      "city": "城市",
+      "dns": "DNS"
+    }
+  },
+  "node": {
+    "activeServer": "当前节点",
+    "selectedServer": "已选节点",
+    "switch": "切换",
+    "group": "Tono 云节点"
+  },
+  "progress": {
+    "total": "总计 {{elapsed}}",
+    "tryBadge": "第 {{count}} 次",
+    "failedAt": "失败于 {{stage}}",
+    "unknownStage": "未知阶段",
+    "retryIn": "第 {{n}} 次重试将于 {{seconds}} 秒后发起",
+    "retrying": "正在重试…",
+    "retryNow": "立即重试",
+    "restore": "恢复正常网络",
+    "restoreConfirmTitle": "恢复正常网络",
+    "restoreConfirmMessage": "将解除网络保护并恢复正常 Internet 连接。",
+    "copyDetails": "复制诊断信息",
+    "copied": "诊断信息已复制",
+    "copyFailed": "复制诊断信息失败",
+    "steps": {
+      "preparing": "正在准备保护…",
+      "preparingService": "正在准备 Windows 服务…",
+      "startingKillSwitch": "正在启用 WFP Kill Switch…",
+      "startingTunnel": "正在启动 mihomo/WinTUN…",
+      "lockingTraffic": "正在将流量锁定到受保护接口…",
+      "applyingCloudPolicy": "应用云端路由策略…",
+      "securingDNS": "正在保护并验证 DNS…",
+      "checkingExit": "正在检查最终出口…",
+      "verifyingTraffic": "正在验证真实 TUN 数据面…"
+    }
+  },
+  "nodes": {
+    "title": "节点",
+    "testCurrent": "测试当前节点",
+    "cloudServers": "云服务器",
+    "empty": "暂无可用节点",
+    "timeout": "超时"
+  },
+  "servers": {
+    "title": "服务器",
+    "cloudGroup": "TONO 云节点",
+    "empty": "暂无可用节点",
+    "selected": "已选择"
+  },
+  "account": {
+    "title": "账号",
+    "email": "邮箱",
+    "devices": "设备",
+    "deviceLimit": "设备 {{count}} / {{limit}}",
+    "currentDevice": "当前设备",
+    "revoke": "移除",
+    "revokeConfirmTitle": "移除设备",
+    "revokeConfirmMessage": "确定移除「{{name}}」吗？该设备将立即退出登录。",
+    "signOut": "退出登录",
+    "signOutConfirmTitle": "退出登录",
+    "signOutConfirmMessage": "退出登录将断开 VPN 连接，并从账号中移除此设备。是否继续？"
+  },
+  "settings": {
+    "title": "设置",
+    "account": "Tono 账号",
+    "general": {
+      "title": "通用",
+      "launchAtStartup": "开机自启",
+      "language": "界面语言"
+    },
+    "proxyEngine": {
+      "title": "代理引擎",
+      "tun": "TUN 模式",
+      "tunSubtitle": "Tono 需要它来防止应用绕过代理",
+      "allowLan": "允许局域网连接",
+      "allowLanSubtitle": "由 Tono 托管",
+      "mixedPort": "混合端口"
+    },
+    "appearance": {
+      "title": "外观",
+      "themeMode": "主题模式",
+      "theme": {
+        "light": "浅色",
+        "dark": "深色",
+        "system": "跟随系统"
+      },
+      "glass": "玻璃透明度",
+      "glassSubtitle": "背景环境图透出的程度"
+    },
+    "about": {
+      "title": "关于",
+      "tagline": "受保护的云端连接",
+      "description": "经认证的 VLESS Reality 路由，配备故障关闭式 Kill Switch"
+    }
+  }
+}

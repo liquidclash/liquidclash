@@ -1,0 +1,119 @@
+{
+  "page": {
+    "modes": {
+      "rule": "Rule",
+      "global": "Global",
+      "direct": "Direct"
+    },
+    "actions": {
+      "toggleChain": "Ketten-Proxy",
+      "connect": "Connect",
+      "disconnect": "Disconnect",
+      "connecting": "Connecting...",
+      "clearChainConfig": "Delete Chain Config"
+    },
+    "provider": {
+      "title": "Proxy-Sammlung",
+      "actions": {
+        "updateAll": "Alle aktualisieren",
+        "update": "Aktualisieren"
+      }
+    },
+    "rules": {
+      "title": "Proxy Rules",
+      "select": "Select Rules"
+    },
+    "labels": {
+      "proxyCount": "Anzahl der Knoten",
+      "delayCheckReset": "Latenztest durchführen, um Fixierung aufzuheben",
+      "nodeCount": "{{count}} Knoten"
+    },
+    "tooltips": {
+      "locate": "Aktueller Knoten",
+      "delayCheck": "Latenztest",
+      "sortDefault": "Standard Sortierung",
+      "sortDelay": "Nach Latenz sortieren",
+      "sortName": "Nach Name sortieren",
+      "delayCheckUrl": "Latenztest-URL",
+      "showBasic": "Knotendetails ausblenden",
+      "showDetail": "Knotendetails anzeigen",
+      "filter": "Knoten filtern"
+    },
+    "placeholders": {
+      "delayCheckUrl": "Latenztest-URL"
+    },
+    "empty": {
+      "noAvailableGroups": "Keine Proxy-Gruppen verfügbar",
+      "noProxies": "Keine Proxys",
+      "noSubscriptions": {
+        "title": "Kein Abonnement importiert",
+        "description": "Auf der Proxy-Seite gibt es nichts anzuzeigen. Öffnen Sie „Abonnement“, um ein Abonnement zu importieren und zu aktivieren."
+      },
+      "inactiveSubscription": {
+        "title": "Kein aktives Abonnement",
+        "description": "Es wurden Abonnements gefunden, aber keines ist derzeit aktiv. Öffnen Sie „Abonnement“, wählen Sie eines aus und aktivieren Sie es."
+      },
+      "coreUnavailable": {
+        "title": "Kern vorübergehend nicht verfügbar",
+        "description": "Die Proxy-Informationen konnten nicht vom Kern abgerufen werden. Starten Sie den Kern neu. Falls das Problem weiterhin besteht, öffnen Sie den Protokollordner und prüfen Sie die Kernprotokolle."
+      },
+      "noProxyInfo": {
+        "title": "Keine Proxy-Informationen verfügbar",
+        "description": "Es gibt keine Proxy-Gruppen oder -Knoten zum Anzeigen. Prüfen Sie, ob das aktive Abonnement gültige Proxy-Gruppen und -Knoten enthält, oder starten Sie den Kern neu und prüfen Sie die Protokolle."
+      },
+      "actions": {
+        "openProfiles": "Zum Abonnement",
+        "restartCore": "Kern neu starten",
+        "openLogs": "Protokollordner öffnen"
+      }
+    },
+    "chain": {
+      "header": "Chain Proxy Config",
+      "warning": "Chain proxy will significantly reduce network speed. If you do not have a clear business need, or do not understand this configuration, keep it disabled.",
+      "empty": "Chain proxy will significantly reduce network speed. If you do not have a clear business need, or do not understand this configuration, keep it disabled.",
+      "instruction": "Click nodes in order to add to proxy chain",
+      "minimumNodes": "Chain proxy requires at least 2 nodes",
+      "minimumNodesHint": "Chain proxy requires at least 2 nodes. Please add one more node.",
+      "connectFailed": "Failed to connect to proxy chain",
+      "disconnectFailed": "Failed to disconnect from proxy chain",
+      "duplicateNode": "Proxy node already exists in chain",
+      "entryNode": "Eingang",
+      "exitNode": "Ausgang"
+    },
+    "messages": {
+      "directMode": "Direktverbindungs-Modus"
+    },
+    "title": {
+      "default": "Proxy-Gruppen",
+      "chainMode": "Proxy Chain Mode"
+    }
+  },
+  "feedback": {
+    "notifications": {
+      "provider": {
+        "updateSuccess": "{{name}} updated successfully",
+        "updateFailed": "Failed to update {{name}}: {{message}}",
+        "genericError": "Update failed: {{message}}",
+        "none": "No providers available to update",
+        "allUpdated": "All providers updated successfully"
+      }
+    }
+  },
+  "components": {
+    "enums": {
+      "strategies": {
+        "select": "Proxy manuell auswählen",
+        "url-test": "Proxy basierend auf URL-Latenztest auswählen",
+        "fallback": "Bei Nichtverfügbarkeit zu einem anderen Proxy wechseln",
+        "load-balance": "Proxy basierend auf Lastverteilung zuweisen",
+        "relay": "Basierend auf definiertem Proxy-Kette weiterleiten"
+      },
+      "policies": {
+        "DIRECT": "Direktverbindung",
+        "REJECT": "Anfrage ablehnen",
+        "REJECT-DROP": "Anfrage verwerfen",
+        "PASS": "Diese Regel überspringen"
+      }
+    }
+  }
+}

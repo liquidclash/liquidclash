@@ -1,0 +1,17 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[alias]
+clippy-all = "clippy --all-targets --all-features -- -D warnings"
+clippy-only = "clippy --all-targets  --features clippy -- -D warnings"
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+rustflags = [
+  "-Lnative=/Users/rw/Downloads/Project/liquidclash/Tono-win/.toolchain/xwin/xwin/crt/lib/x86_64",
+  "-Lnative=/Users/rw/Downloads/Project/liquidclash/Tono-win/.toolchain/xwin/xwin/sdk/lib/um/x86_64",
+  "-Lnative=/Users/rw/Downloads/Project/liquidclash/Tono-win/.toolchain/xwin/xwin/sdk/lib/ucrt/x86_64",
+]

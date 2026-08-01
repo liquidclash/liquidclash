@@ -1,0 +1,87 @@
+_version: 1
+notifications:
+  dashboardToggled:
+    title: Gösterge Paneli
+    body: Gösterge panelinin görünürlüğü güncellendi.
+  clashModeChanged:
+    title: Mod Değişimi
+    body: '{mode} moduna geçildi.'
+  systemProxyToggled:
+    title: Sistem Vekil'i
+    'on': System proxy has been enabled.
+    'off': System proxy has been disabled.
+  tunModeToggled:
+    title: TUN Modu
+    'on': TUN mode has been enabled.
+    'off': TUN mode has been disabled.
+  lightweightModeEntered:
+    title: Hafif Mod
+    body: Hafif moda geçildi.
+  profilesReactivated:
+    title: Profiller
+    body: Profil yeniden etkinleştirildi.
+  appQuit:
+    title: Çıkış Yapılmak Üzere
+    body: Tono kapanmak üzere.
+  appHidden:
+    title: Uygulama Gizlendi
+    body: Tono arka planda çalışıyor.
+  updateReady:
+    title: Tono Update
+    body: A new version (v{version}) has been downloaded and is ready to install.
+    installNow: Install Now
+    later: Later
+service:
+  adminInstallPrompt: Tono hizmetini kurmak için yönetici ayrıcalıkları gerekir.
+  adminUninstallPrompt: Tono hizmetini kaldırmak için yönetici ayrıcalıkları gerekir.
+launchGuard:
+  currentExeError: 'Uygulamanın konumu belirlenemedi: {error}'
+  homeDirError: 'Geçerli kullanıcının ana dizini belirlenemedi. Uygulama kapatılacak: {error}'
+  translocated: macOS bu uygulamayı geçici bir App Translocation yolundan çalıştırıyor. Finder'da uygulamayı elle /Applications veya ~/Applications dizinine taşıyın ve yeniden açın.
+  rejected: |-
+    Bu uygulama bir Applications dizininden başlatılmalıdır.
+
+    {reason}
+  notInBundle: Yürütülebilir dosya bir uygulama paketinin içinde değil.
+  canonicalizeBundleError: 'Uygulama paketinin yolu çözümlenemedi: {error}'
+  bundleNameError: Uygulama paketinin adı belirlenemedi. Uygulama kapatılacak.
+  replacePrompt: '{destination} konumunda zaten bir uygulama var. Değiştirilsin ve Applications üzerinden yeniden başlatılsın mı?'
+  movePrompt: Arka plan hizmetini güvenli şekilde başlatmak için uygulamanın {destination} konumuna taşınması gerekir. Şimdi taşınıp yeniden başlatılsın mı?
+  createApplicationsDirError: 'Applications dizini oluşturulamadı: {error}'
+  moveFailed: Uygulama taşınamadı. Finder'da elle taşıyıp tekrar deneyin.
+  replaceFailed: 'Mevcut uygulama güvenli şekilde değiştirilemedi: {error}'
+  relaunchFailed: Uygulama kopyalandı ancak otomatik olarak yeniden başlatılamadı. Applications üzerinden elle açın.
+  cancel: İptal
+  move: Taşı
+  ok: Tamam
+tray:
+  dashboard: Gösterge Paneli
+  ruleMode: Kural Modu
+  globalMode: Küresel Mod
+  directMode: Doğrudan Mod
+  outboundModes: Giden Modlar
+  rule: Kural
+  direct: Doğrudan
+  global: Küresel
+  profiles: Profiller
+  proxies: Vekil'ler
+  systemProxy: Sistem Vekil'i
+  tunMode: TUN Modu
+  closeAllConnections: Tüm Bağlantıları Kapat
+  lightweightMode: Hafif Mod
+  copyEnv: Ortam Değişkenlerini Kopyala
+  confDir: Yapılandırma Dizini
+  coreDir: Çekirdek Dizini
+  logsDir: Günlük Dizini
+  openDir: Dizini Aç
+  appLog: Uygulama Günlüğü
+  coreLog: Çekirdek Günlüğü
+  restartClash: Clash Çekirdeğini Yeniden Başlat
+  restartApp: Uygulamayı Yeniden Başlat
+  vergeVersion: Verge Sürümü
+  more: Daha Fazla
+  exit: Çıkış
+  tooltip:
+    systemProxy: Sistem Vekil'i
+    tun: TUN
+    profile: Profil

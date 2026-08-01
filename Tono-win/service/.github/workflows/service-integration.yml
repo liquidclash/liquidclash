@@ -1,0 +1,215 @@
+name: Service Integration
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "resources/**"
+      - ".github/workflows/service-integration.yml"
+      - ".github/workflows/service-recovery.yml"
+  push:
+    branches:
+      - "**"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "resources/**"
+      - ".github/workflows/service-integration.yml"
+      - ".github/workflows/service-recovery.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-tests:
+    name: Cargo Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run production Clippy
+        run: cargo clippy --features "standalone client" --lib --bins -- -D warnings
+
+      - name: Run all-feature Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: Run cargo test
+        run: cargo test --all-features
+
+  service-flow:
+    name: Service Integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CLASH_VERGE_TEST_SESSION_TOKEN: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Build binaries
+        run: cargo build --release --features "standalone client test"
+
+      - name: Install service (Linux)
+        if: runner.os == 'Linux'
+        run: sudo target/release/tono-service-install --debug
+
+      - name: Verify service (Linux)
+        if: runner.os == 'Linux'
+        run: sudo systemctl is-active clash-verge-service.service
+
+      - name: Start mock_binary (Linux)
+        id: start_linux
+        if: runner.os == 'Linux'
+        run: |
+          generation="$(target/release/tono-service-integration-driver start)"
+          if [[ ! "$generation" =~ ^[0-9]+$ ]]; then
+            echo "tono-service-integration-driver returned invalid generation: '$generation'" >&2
+            exit 1
+          fi
+          echo "generation=$generation" >> "$GITHUB_OUTPUT"
+
+      - name: Verify mock_binary (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sleep 2
+          pgrep -f mock_binary
+
+      - name: Stop mock_binary (Linux)
+        if: ${{ always() && runner.os == 'Linux' && steps.start_linux.outputs.generation != '' }}
+        env:
+          CLASH_VERGE_TEST_SESSION_GENERATION: ${{ steps.start_linux.outputs.generation }}
+        run: target/release/tono-service-integration-driver stop
+
+      - name: Uninstall service (Linux)
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: |
+          if [ -x target/release/tono-service-uninstall ]; then
+            sudo target/release/tono-service-uninstall --debug
+          fi
+
+      - name: Install service (macOS)
+        if: runner.os == 'macOS'
+        run: sudo target/release/tono-service-install --debug
+
+      - name: Verify service (macOS)
+        if: runner.os == 'macOS'
+        run: sudo launchctl list | grep io.github.clash-verge-rev.clash-verge-rev.service
+
+      - name: Start mock_binary (macOS)
+        id: start_macos
+        if: runner.os == 'macOS'
+        run: |
+          generation="$(target/release/tono-service-integration-driver start)"
+          if [[ ! "$generation" =~ ^[0-9]+$ ]]; then
+            echo "tono-service-integration-driver returned invalid generation: '$generation'" >&2
+            exit 1
+          fi
+          echo "generation=$generation" >> "$GITHUB_OUTPUT"
+
+      - name: Verify mock_binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sleep 2
+          pgrep -f mock_binary
+
+      - name: Stop mock_binary (macOS)
+        if: ${{ always() && runner.os == 'macOS' && steps.start_macos.outputs.generation != '' }}
+        env:
+          CLASH_VERGE_TEST_SESSION_GENERATION: ${{ steps.start_macos.outputs.generation }}
+        run: target/release/tono-service-integration-driver stop
+
+      - name: Uninstall service (macOS)
+        if: ${{ always() && runner.os == 'macOS' }}
+        run: |
+          if [ -x target/release/tono-service-uninstall ]; then
+            sudo target/release/tono-service-uninstall --debug
+          fi
+
+      - name: Install service (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\\target\\release\\tono-service-install.exe"
+          Start-Sleep -Seconds 2
+
+      - name: Verify service (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $state = sc query TonoService | Select-String "STATE"
+          if ($state -notmatch "RUNNING") { exit 1 }
+
+      - name: Start mock_binary (Windows)
+        id: start_windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $driver = "$env:GITHUB_WORKSPACE\\target\\release\\tono-service-integration-driver.exe"
+          $output = & $driver start
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) { exit $exitCode }
+          $generation = [string]($output | Select-Object -Last 1)
+          $generation = $generation.Trim()
+          if ($generation -notmatch '^[0-9]+$') {
+            throw "tono-service-integration-driver returned invalid generation: '$generation'"
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "generation=$generation" -Encoding utf8
+
+      - name: Verify mock_binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 2
+          Get-Process -Name mock_binary
+
+      - name: Stop mock_binary (Windows)
+        if: ${{ always() && runner.os == 'Windows' && steps.start_windows.outputs.generation != '' }}
+        env:
+          CLASH_VERGE_TEST_SESSION_GENERATION: ${{ steps.start_windows.outputs.generation }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\\target\\release\\tono-service-integration-driver.exe" stop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Uninstall service (Windows)
+        if: ${{ always() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $service = Get-Service -Name "TonoService" -ErrorAction SilentlyContinue
+          if ($null -ne $service) {
+            $uninstaller = "$env:GITHUB_WORKSPACE\\target\\release\\tono-service-uninstall.exe"
+            if (-not (Test-Path -LiteralPath $uninstaller)) {
+              throw "service is installed but the uninstaller was not built"
+            }
+            & $uninstaller
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

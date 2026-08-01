@@ -1,0 +1,19 @@
+name: "Build for Linux"
+description: "Build release binaries for Linux targets"
+branding:
+  icon: user-check
+  color: gray-dark
+inputs:
+  target:
+    required: true
+    description: "Rust Target"
+  features:
+    required: false
+    default: standalone
+    description: "Cargo features"
+
+runs:
+  using: "docker"
+  image: "Dockerfile"
+  args:
+    - ${{ inputs.target }}

@@ -1,0 +1,17 @@
+[workspace]
+members = [
+  "crates/tono-core",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LicenseRef-Proprietary"
+authors = ["Raydocs"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

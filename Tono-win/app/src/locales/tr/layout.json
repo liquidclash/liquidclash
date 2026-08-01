@@ -1,0 +1,47 @@
+{
+  "components": {
+    "navigation": {
+      "tabs": {
+        "home": "Ana Sayfa",
+        "proxies": "Vekil'ler",
+        "profiles": "Profiller",
+        "connections": "Bağlantılar",
+        "rules": "Kurallar",
+        "logs": "Günlükler",
+        "unlock": "Test",
+        "settings": "Ayarlar"
+      },
+      "menu": {
+        "reorderMode": "Menu reorder mode",
+        "restoreDefaultOrder": "Restore default order",
+        "unlock": "Unlock menu order",
+        "lock": "Lock menu order",
+        "collapseNavBar": "Collapse navigation bar",
+        "expandNavBar": "Expand navigation bar"
+      }
+    },
+    "serviceMigration": {
+      "title": "Service update required",
+      "message": "An older Tono service installation was detected. Reinstall it to use the current secure IPC protocol, or continue with Sidecar for this session.",
+      "checkingMessage": "Checking the system service status and current running mode. Please wait…",
+      "unavailableMessage": "The required Tono service is not available. Install or repair it, or continue with Sidecar for this session.",
+      "reinstall": "Reinstall service",
+      "repair": "Repair service",
+      "continueSidecar": "Continue with Sidecar",
+      "success": "The Tono service was updated successfully",
+      "errors": {
+        "actionFailed": "Hizmet işlemi başarısız oldu",
+        "stateRefreshFailed": "Hizmet durumu yenilenemedi",
+        "restartFailed": "Çekirdek yeniden başlatılamadı",
+        "revalidationFailed": "Çalışma durumu yenilenemedi",
+        "sidecarFailed": "Sidecar ile devam edilemedi"
+      }
+    }
+  },
+  "feedback": {
+    "errors": {
+      "restartCoreStopFailed": "Çekirdek güvenli biçimde durdurulamadı, bu nedenle yeniden başlatma iptal edildi",
+      "quitCoreStopFailed": "Çekirdek güvenli biçimde durdurulamadı, bu nedenle çıkış iptal edildi"
+    }
+  }
+}

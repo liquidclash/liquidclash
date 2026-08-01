@@ -1,0 +1,65 @@
+import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined'
+import CloudOutlinedIcon from '@mui/icons-material/CloudOutlined'
+import DashboardOutlinedIcon from '@mui/icons-material/DashboardOutlined'
+import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
+import { type ComponentType, type ReactNode } from 'react'
+
+import SettingsSvg from '@/assets/image/itemicon/settings.svg?react'
+
+import { navigationItems } from './_navigation-meta'
+import SettingPage from './settings'
+import TonoAccountPage from './tono/account'
+import TonoDashboardPage from './tono/dashboard'
+import TonoLoginPage from './tono/login'
+import TonoServersPage from './tono/servers'
+
+type NavigationGroup = 'main' | 'advanced'
+
+type NavigationItem = {
+  label: (typeof navigationItems)[keyof typeof navigationItems]['label']
+  path: string
+  icon: ReactNode[]
+  group: NavigationGroup
+  Component: ComponentType
+}
+
+export const navItems: NavigationItem[] = [
+  {
+    ...navigationItems.dashboard,
+    icon: [
+      <DashboardOutlinedIcon key="mui" />,
+      <DashboardOutlinedIcon key="svg" />,
+    ],
+    group: 'main',
+    Component: TonoDashboardPage,
+  },
+  {
+    ...navigationItems.servers,
+    icon: [<CloudOutlinedIcon key="mui" />, <CloudOutlinedIcon key="svg" />],
+    group: 'main',
+    Component: TonoServersPage,
+  },
+  {
+    ...navigationItems.account,
+    icon: [
+      <AccountCircleOutlinedIcon key="mui" />,
+      <AccountCircleOutlinedIcon key="svg" />,
+    ],
+    group: 'main',
+    Component: TonoAccountPage,
+  },
+  {
+    ...navigationItems.settings,
+    icon: [<SettingsOutlinedIcon key="mui" />, <SettingsSvg key="svg" />],
+    group: 'main',
+    Component: SettingPage,
+  },
+]
+
+// Reachable by URL but not listed in the navigation: the sign-in screen,
+// which the auth guard routes through.
+export const hiddenRoutes = [
+  { path: '/login', Component: TonoLoginPage },
+]
+
+export type { NavigationGroup, NavigationItem }
