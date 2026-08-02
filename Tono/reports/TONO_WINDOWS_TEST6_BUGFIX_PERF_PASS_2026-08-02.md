@@ -75,10 +75,29 @@ The second review pass caught one regression introduced by this pass itself: an 
 | `cargo xwin check` service+app `x86_64-pc-windows-msvc` | clean (pinned `.toolchain`) |
 | frontend `tsc --noEmit` | clean |
 
-## 7. Next steps (unchanged from handoff §3)
+## 7. Release execution (updated 2026-08-02, second pass)
 
-1. Commit this pass (scoped `git add` of the 12 files under `Tono-win/` listed by `git diff --stat -- Tono-win`) — **not yet committed, not pushed**.
-2. Build Test 6 NSIS from the new tip; `7zz l -ba` payload gate + full `release:preflight`.
-3. Real Windows fault injection (S6): WFP/DNS/WinTUN/SCM/sleep-wake + measure connect timings to validate §3.
+All of the above is now **committed and built**:
 
-**Test 4 remains UNSAFE; Test 5 superseded; neither is for user testing.**
+| Item | Value |
+|---|---|
+| Fix commit | `e1a5a55` fix(windows): close residual Test 6 P1s and speed up the connect path |
+| Docs commit | `480be36` |
+| Gate-fix commit | `36b70c2` fix(windows): parse real 7zz NSIS listings in the release preflight |
+| Tag | `tono-windows-2.5.4-test6` → `36b70c2` (clean tree at tag time; **local only, not pushed**) |
+| Installer | `Tono-win/dist-windows/Tono_2.5.4_x64-setup.exe`, 30,852,322 bytes (Test 5 was 35.4 MB) |
+| Installer SHA-256 | `ef92f8bce4c4fdea9db4e44dcfd68d570f5bacb179892bcc6bf4b46eb97a4ece` |
+| tono-service.exe SHA-256 | `26852af3462596443105a60c6d8abbf4dc756e0005b8cac4c804ef042fec834b` |
+| verge-mihomo SHA-256 | `a064b52f2e4c476189edc7e078f22a45e16252d265afe9be1ee90afe0fec9969` |
+| Manifest | `Tono-win/dist-windows/Tono-Windows-2.5.4-test6-release-manifest.json` |
+
+**Payload proof (7zz, 18 entries):** exactly one `verge-mihomo.exe`; no `verge-mihomo-alpha`; no `clash-verge-service*`, `set_dns.sh`, `unset_dns.sh`; `Tono.exe` + `tono-service{,-install,-uninstall}.exe` all present. Full `release:preflight <tag> <installer> <manifest>` **passed** (clean tree, tag==commit, version triple-match, all three SHA cross-checks).
+
+Note on `36b70c2`: the full payload gate had **never run against a real installer** — real 7zz output (blank date/time + blank compressed columns) matched zero lines of the old inline regex, failing every candidate. Parser extracted to `windows-packaging.mjs::parseNsisListing` + unit tests (packaging suite now 5/5). The installer was built at `480be36`; `36b70c2` changes build scripts only (nothing that ships), so the tag points at the gate-complete commit.
+
+### Remaining (needs a real Windows machine — S6)
+- Fault injection: WFP/DNS/WinTUN/SCM/sleep-wake.
+- Measure connect timings to validate §3's estimates.
+- Push tag + attach installer to the GitHub release when the owner decides (`releaseURL` in the manifest anticipates `releases/tag/tono-windows-2.5.4-test6`).
+
+**Test 4 remains UNSAFE; Test 5 superseded; neither is for user testing. Test 6 is payload-proven but not yet real-machine-tested.**
