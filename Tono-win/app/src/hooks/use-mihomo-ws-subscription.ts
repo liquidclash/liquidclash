@@ -9,7 +9,9 @@ import {
   useQuery,
 } from '@/services/query-client'
 
-const RECONNECT_DELAY_MS = 1000
+const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000]
+const RECONNECT_JITTER = 0.2
+const CONNECT_TIMEOUT_MS = 10_000
 
 interface SharedSubscriptionOwner {
   handleMessage: (data: string) => void
@@ -79,6 +81,24 @@ export const createSharedSubscriptionEntry = (
     scheduleReconnect: async () => {},
   }
 
+  // Exponential backoff with jitter so a dead controller isn't hammered at
+  // 1 Hz forever; reset whenever a connect succeeds.
+  let reconnectAttempt = 0
+  // Epoch of the latest connect attempt. A hung attempt is superseded by
+  // bumping the epoch; the stale attempt then abandons its result instead of
+  // holding `connecting` (and thus all future reconnects) hostage.
+  let connectEpoch = 0
+  let connectStartedAt = 0
+
+  const nextReconnectDelay = () => {
+    const base =
+      RECONNECT_DELAYS_MS[
+        Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)
+      ]
+    reconnectAttempt += 1
+    return Math.round(base * (1 + (Math.random() * 2 - 1) * RECONNECT_JITTER))
+  }
+
   const clearReconnectTimer = () => {
     if (entry.reconnectTimer) {
       clearTimeout(entry.reconnectTimer)
@@ -87,12 +107,28 @@ export const createSharedSubscriptionEntry = (
   }
 
   entry.connectWs = async () => {
-    if (entry.closed || entry.connecting || entry.ws) return
+    if (entry.closed || entry.ws) return
+    if (
+      entry.connecting &&
+      Date.now() - connectStartedAt < CONNECT_TIMEOUT_MS
+    ) {
+      // An earlier attempt is still in flight and not yet stale: check back
+      // later instead of silently giving up, so a connect that never settles
+      // can never permanently block reconnection. Once the attempt ages past
+      // CONNECT_TIMEOUT_MS the epoch bump below supersedes it.
+      clearReconnectTimer()
+      entry.reconnectTimer = setTimeout(entry.connectWs, nextReconnectDelay())
+      return
+    }
 
     entry.connecting = true
+    connectStartedAt = Date.now()
+    const attempt = ++connectEpoch
     try {
       const ws = await connect()
-      if (entry.closed) {
+      if (attempt !== connectEpoch || entry.closed) {
+        // Superseded by a newer attempt or torn down while connecting; don't
+        // leak the late socket.
         await ws.close()
         return
       }
@@ -100,6 +136,7 @@ export const createSharedSubscriptionEntry = (
       entry.ws = ws
       syncSharedWsRefs(entry)
       clearReconnectTimer()
+      reconnectAttempt = 0
 
       // Install the message listener before optional initialization. Otherwise messages emitted
       // while `onConnected` awaits its snapshot can be lost, and an exception leaves a live
@@ -115,13 +152,14 @@ export const createSharedSubscriptionEntry = (
       const owner = pickActiveOwner(entry)
       if (owner?.onConnected) {
         await owner.onConnected(ws)
+        if (attempt !== connectEpoch) return
         if (entry.closed) {
           await closeSharedSocket(entry)
           return
         }
       }
     } catch (ignoreError) {
-      if (!entry.closed) {
+      if (attempt === connectEpoch && !entry.closed) {
         clearReconnectTimer()
         try {
           await closeSharedSocket(entry)
@@ -130,11 +168,16 @@ export const createSharedSubscriptionEntry = (
           // refuses its close handshake.
         }
         if (!entry.closed) {
-          entry.reconnectTimer = setTimeout(entry.connectWs, RECONNECT_DELAY_MS)
+          entry.reconnectTimer = setTimeout(
+            entry.connectWs,
+            nextReconnectDelay(),
+          )
         }
       }
     } finally {
-      entry.connecting = false
+      if (attempt === connectEpoch) {
+        entry.connecting = false
+      }
     }
   }
 
@@ -148,7 +191,10 @@ export const createSharedSubscriptionEntry = (
       // A broken socket must not be allowed to suppress its own reconnect.
     } finally {
       if (!entry.closed) {
-        entry.reconnectTimer = setTimeout(entry.connectWs, RECONNECT_DELAY_MS)
+        entry.reconnectTimer = setTimeout(
+          entry.connectWs,
+          nextReconnectDelay(),
+        )
       }
     }
   }

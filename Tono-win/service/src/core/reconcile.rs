@@ -3,21 +3,28 @@ use crate::core::runtime::{
     cleanup_core_socket, is_core_socket_reachable, read_core_runtime_record,
     remove_core_runtime_record,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 static STARTUP_RECONCILED: AtomicBool = AtomicBool::new(cfg!(feature = "test"));
+/// Serializes reconciliation runs so a retry from a start attempt can never overlap another pass.
+static RECONCILE_RUNNING: Mutex<()> = Mutex::const_new(());
 
-pub(super) fn ensure_startup_reconciled() -> Result<()> {
-    anyhow::ensure!(
-        STARTUP_RECONCILED.load(Ordering::Acquire),
-        "core startup reconciliation has not completed"
-    );
-    Ok(())
+pub(super) async fn ensure_startup_reconciled() -> Result<()> {
+    if STARTUP_RECONCILED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // A transient reconciliation failure at service startup must not block every core start
+    // until the service restarts; retry it here before this start is allowed to proceed.
+    reconcile_service_startup()
+        .await
+        .context("core startup reconciliation has not completed")
 }
 
 pub async fn reconcile_service_startup() -> Result<()> {
+    let _running = RECONCILE_RUNNING.lock().await;
     STARTUP_RECONCILED.store(false, Ordering::Release);
     info!("Running service startup reconciliation");
 
@@ -63,4 +70,23 @@ pub async fn reconcile_service_startup() -> Result<()> {
     remove_core_runtime_record().await;
     STARTUP_RECONCILED.store(true, Ordering::Release);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STARTUP_RECONCILED, ensure_startup_reconciled};
+    use serial_test::serial;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    #[serial]
+    async fn failed_startup_reconciliation_is_retried_by_the_start_gate() -> anyhow::Result<()> {
+        crate::core::runtime::remove_core_runtime_record().await;
+        STARTUP_RECONCILED.store(false, Ordering::Release);
+
+        ensure_startup_reconciled().await?;
+
+        assert!(STARTUP_RECONCILED.load(Ordering::Acquire));
+        Ok(())
+    }
 }

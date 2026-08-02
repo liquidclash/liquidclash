@@ -50,8 +50,19 @@ const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
 /// cold-start) PowerShell CIM call per adapter, with one retry each — sequential seconds per
 /// adapter on a machine with many NICs. All of these operations are idempotent and their
 /// state is inspectable through the status routes, so a slow handler is recoverable; a
-/// handler killed mid-transaction would not be.
+/// handler killed mid-transaction would not be. This is the [`OperationGuard`] budget for one
+/// privileged step inside a handler — the real bound on handler work — not a transport limit.
 const IPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Transport-level write timeout. `kode-bridge` enforces it by dropping the handler future and
+/// answering a plain 408 — which would release the owner-lifecycle lock and the
+/// [`OperationGuard`] while detached `spawn_blocking` work (WFP transactions, PowerShell DNS
+/// mutation) keeps running, letting a later privileged mutation interleave with it. Kept far
+/// above the worst bounded handler path so the transport never cancels a mutating handler;
+/// the per-step [`IPC_HANDLER_TIMEOUT`] budgets stay the real bound. The client's
+/// `LIFECYCLE_TIMEOUT` (65s) may now expire while a handler still runs — that is the
+/// already-supported lost-response case repaired late via session generations, and strictly
+/// safer than dropping a handler mid-transaction.
+const IPC_TRANSPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(any(test, all(windows, not(feature = "test"))))]
 const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;AU)";
 #[cfg(all(windows, feature = "test"))]
@@ -535,7 +546,7 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
     let server = IpcHttpServer::with_config(
         paths.ipc_path(),
         ServerConfig {
-            write_timeout: IPC_HANDLER_TIMEOUT,
+            write_timeout: IPC_TRANSPORT_WRITE_TIMEOUT,
             ..ServerConfig::default()
         },
     )?;
@@ -1490,8 +1501,9 @@ fn test_proxy_barrier_reset() {
 #[cfg(test)]
 mod owner_lifecycle_tests {
     use super::{
-        OwnerProxyTransition, WINDOWS_CONTROL_PIPE_SDDL, owner_proxy_transition,
-        require_active_owner, require_active_session,
+        IPC_HANDLER_TIMEOUT, IPC_TRANSPORT_WRITE_TIMEOUT, OwnerProxyTransition,
+        WINDOWS_CONTROL_PIPE_SDDL, owner_proxy_transition, require_active_owner,
+        require_active_session,
     };
     use crate::ServiceErrorCode;
     use crate::core::auth::AuthenticatedOwner;
@@ -1642,6 +1654,14 @@ mod owner_lifecycle_tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn transport_write_timeout_never_undercuts_a_handler_step() {
+        // The transport drops a handler future on expiry; a mutating handler cancelled
+        // mid-transaction releases its locks while detached blocking work keeps running.
+        // Keep the transport bound comfortably above the per-step handler budget.
+        assert!(IPC_TRANSPORT_WRITE_TIMEOUT >= IPC_HANDLER_TIMEOUT * 4);
     }
 
     #[test]

@@ -444,25 +444,46 @@ impl CoreManager {
     }
 
     pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
-        ensure_startup_reconciled()?;
+        ensure_startup_reconciled().await?;
         set_core_lifecycle_state(ServiceLifecycleState::Starting);
         if self.running_pid.load(Ordering::Relaxed) != 0 {
             info!("Core is already running, stopping existing instance");
-            self.stop_core().await?;
+            if let Err(error) = self.stop_core().await {
+                // The previous core could not be confirmed stopped, so it may still be alive
+                // and unsupervised; report that as Fatal rather than parking the state at
+                // Starting, which readers treat as an operation still settling.
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                return Err(error);
+            }
+            // A successful stop reports Running; re-assert Starting for the spawn below.
+            set_core_lifecycle_state(ServiceLifecycleState::Starting);
         }
 
         info!("Starting core with config: {:?}", config);
 
-        prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)?;
+        // Failures below that leave no live core roll the lifecycle back to Running, the same
+        // settled state a stop reports: a start that has already failed must not keep
+        // reporting Starting forever.
+        if let Err(error) = prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner) {
+            set_core_lifecycle_state(ServiceLifecycleState::Running);
+            return Err(error);
+        }
         let args = core_args(&config);
 
-        let mut child_guard = run_with_logging(
+        let mut child_guard = match run_with_logging(
             &config.core_config.core_path,
             &args,
             &config.log_config,
             &owner,
         )
-        .await?;
+        .await
+        {
+            Ok(child_guard) => child_guard,
+            Err(error) => {
+                set_core_lifecycle_state(ServiceLifecycleState::Running);
+                return Err(error);
+            }
+        };
         let child_pid = child_guard.id();
 
         if let Err(error) = secure_core_ipc_socket(
@@ -494,6 +515,7 @@ impl CoreManager {
                     "failed to secure core IPC: {error:#}; failed to terminate spawned core: {kill_error:#}"
                 ));
             }
+            set_core_lifecycle_state(ServiceLifecycleState::Running);
             return Err(error);
         }
 
@@ -513,6 +535,7 @@ impl CoreManager {
                     "{record_error:#}; failed to terminate unrecorded core: {kill_error:#}"
                 ));
             }
+            set_core_lifecycle_state(ServiceLifecycleState::Running);
             return Err(record_error);
         }
 
@@ -1179,7 +1202,9 @@ async fn secure_core_ipc_socket(
         let mut pipe: Vec<u16> = std::ffi::OsStr::new(&core_ipc_path).encode_wide().collect();
         pipe.push(0);
         let mut handle_value = INVALID_HANDLE_VALUE as isize;
-        for _ in 0..40 {
+        // The pipe usually appears well inside the first 50ms tick; poll fast early, then fall
+        // back to the coarse grid. The overall budget stays 2s (10 x 20ms + 36 x 50ms).
+        for attempt in 0..46 {
             handle_value = unsafe {
                 CreateFileW(
                     pipe.as_ptr(),
@@ -1194,7 +1219,8 @@ async fn secure_core_ipc_socket(
             if handle_value != INVALID_HANDLE_VALUE as isize {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let poll_ms = if attempt < 10 { 20 } else { 50 };
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         }
         if handle_value == INVALID_HANDLE_VALUE as isize {
             return Err(std::io::Error::last_os_error().into());
@@ -1277,8 +1303,10 @@ pub static LOGGER_MANAGER: Lazy<Arc<AsyncLogger>> = Lazy::new(|| Arc::new(AsyncL
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{prepare_core_ipc_socket, secure_core_ipc_socket};
-    use crate::OwnerIdentity;
+    use super::{CoreManager, prepare_core_ipc_socket, secure_core_ipc_socket};
+    use crate::core::state::core_lifecycle_state;
+    use crate::core::structure::{ClashConfig, CoreConfig, ServiceLifecycleState};
+    use crate::{OwnerIdentity, WriterConfig};
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
@@ -1311,6 +1339,40 @@ mod tests {
         }
         assert_eq!(mode, 0o600);
         drop(listener);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failed_core_spawn_rolls_lifecycle_back_to_settled() -> anyhow::Result<()> {
+        let directory = std::env::temp_dir().join(format!("cvs-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory)?;
+        let path_of = |name: &str| directory.join(name).to_string_lossy().into_owned();
+        let config = ClashConfig {
+            core_config: CoreConfig {
+                core_path: path_of("missing-core"),
+                core_ipc_path: path_of("verge-mihomo.sock"),
+                config_path: path_of("config.yaml"),
+                config_dir: directory.to_string_lossy().into_owned(),
+            },
+            log_config: WriterConfig {
+                directory: directory.to_string_lossy().into_owned(),
+                max_log_size: 1024 * 1024,
+                max_log_files: 1,
+            },
+        };
+        let owner = OwnerIdentity::Unix {
+            uid: unsafe { platform_lib::geteuid() },
+            gid: unsafe { platform_lib::getegid() },
+        };
+
+        let manager = CoreManager::new();
+        assert!(manager.start_core(config, owner).await.is_err());
+
+        // A start that failed without leaving a core must not stay parked at Starting.
+        assert_eq!(core_lifecycle_state(), ServiceLifecycleState::Running);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }

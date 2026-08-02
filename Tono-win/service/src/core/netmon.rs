@@ -14,8 +14,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MAX_RECORDED_EVENTS: usize = 32;
-#[cfg(not(feature = "test"))]
+#[cfg_attr(feature = "test", allow(dead_code))]
 const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
+/// Max-latency bound: sustained churn with gaps < `DEBOUNCE` must still surface an event.
+#[cfg_attr(feature = "test", allow(dead_code))]
+const DEBOUNCE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 static EVENTS: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
 static LAST_KIND: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
@@ -27,6 +30,8 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static PENDING_RAW: AtomicBool = AtomicBool::new(false);
 #[cfg(not(feature = "test"))]
 static LAST_RAW_MILLIS: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "test"))]
+static FIRST_RAW_MILLIS: AtomicU64 = AtomicU64::new(0);
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -78,6 +83,15 @@ pub fn change_count() -> u64 {
     CHANGE_COUNT.load(Ordering::Relaxed)
 }
 
+/// Debounce decision: fire after `DEBOUNCE` of raw-notification silence, or once the first
+/// still-pending raw event is `DEBOUNCE_MAX_WAIT` old — otherwise sustained churn (gaps all
+/// under `DEBOUNCE`) would starve `note_event` forever and freeze the `/status` counter.
+#[cfg_attr(feature = "test", allow(dead_code))]
+fn debounce_should_fire(quiet_millis: u64, pending_for_millis: u64) -> bool {
+    quiet_millis >= DEBOUNCE.as_millis() as u64
+        || pending_for_millis >= DEBOUNCE_MAX_WAIT.as_millis() as u64
+}
+
 /// Register the IP-interface and route change notifications plus the debounce task.
 /// Idempotent; the registrations live for the service's lifetime by design.
 pub fn start() {
@@ -87,7 +101,7 @@ pub fn start() {
 
 #[cfg(not(feature = "test"))]
 mod imp {
-    use super::{DEBOUNCE, LAST_RAW_MILLIS, PENDING_RAW, STARTED, note_event};
+    use super::{FIRST_RAW_MILLIS, LAST_RAW_MILLIS, PENDING_RAW, STARTED, note_event};
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
@@ -103,9 +117,18 @@ mod imp {
     }
 
     fn raw_notify(kind: &str, notification_type: MIB_NOTIFICATION_TYPE) {
-        let _ = anchor();
+        let now = anchor().elapsed().as_millis() as u64;
+        // Timestamps first, `PENDING_RAW` last (release): the debounce task acquires on
+        // `PENDING_RAW`, so publishing the flag before `LAST_RAW_MILLIS` would let it fire
+        // against a stale timestamp with effectively zero debounce.
+        LAST_RAW_MILLIS.store(now, Ordering::Relaxed);
+        if !PENDING_RAW.load(Ordering::Relaxed) {
+            // First raw event of this burst: anchor the max-latency cap. Racing the debounce
+            // task's clear can at worst duplicate or slightly delay one event — benign, since
+            // `note_event` never disarms anything.
+            FIRST_RAW_MILLIS.store(now, Ordering::Relaxed);
+        }
         PENDING_RAW.store(true, Ordering::Release);
-        LAST_RAW_MILLIS.store(anchor().elapsed().as_millis() as u64, Ordering::Relaxed);
         tracing::debug!("netmon raw notification: {kind} (type {notification_type})");
     }
 
@@ -141,6 +164,7 @@ mod imp {
             Box::leak(Box::new(std::ptr::null_mut()));
         // SAFETY: the out-handles live for the process lifetime; callbacks are valid
         // `extern "system"` fns with a null context.
+        let mut registered = false;
         unsafe {
             let status = NotifyIpInterfaceChange(
                 AF_UNSPEC,
@@ -151,6 +175,8 @@ mod imp {
             );
             if status != 0 {
                 tracing::warn!("NotifyIpInterfaceChange failed: Windows error {status}");
+            } else {
+                registered = true;
             }
             let status = NotifyRouteChange2(
                 AF_UNSPEC,
@@ -161,7 +187,16 @@ mod imp {
             );
             if status != 0 {
                 tracing::warn!("NotifyRouteChange2 failed: Windows error {status}");
+            } else {
+                registered = true;
             }
+        }
+        if !registered {
+            // Neither notification registered: release the latch so a later `start()` can
+            // retry instead of leaving the monitor permanently dead but marked started.
+            // (A partial success keeps the latch — retrying would double-register.)
+            STARTED.store(false, Ordering::Release);
+            return;
         }
 
         tokio::spawn(async {
@@ -173,8 +208,15 @@ mod imp {
                 }
                 let elapsed = anchor().elapsed().as_millis() as u64;
                 let quiet = elapsed.saturating_sub(LAST_RAW_MILLIS.load(Ordering::Relaxed));
-                if quiet >= DEBOUNCE.as_millis() as u64 && PENDING_RAW.swap(false, Ordering::AcqRel)
+                let pending_for =
+                    elapsed.saturating_sub(FIRST_RAW_MILLIS.load(Ordering::Relaxed));
+                if super::debounce_should_fire(quiet, pending_for)
+                    && PENDING_RAW.swap(false, Ordering::AcqRel)
                 {
+                    // Re-anchor the cap alongside the cleared flag so a callback racing the
+                    // swap can't leave a stale first-pending stamp (worst case: one early
+                    // extra event — benign).
+                    FIRST_RAW_MILLIS.store(elapsed, Ordering::Relaxed);
                     note_event("network-change (ip-interface/route)");
                 }
             }
@@ -193,5 +235,18 @@ mod tests {
         assert_eq!(events.len(), super::MAX_RECORDED_EVENTS);
         assert!(events.last().unwrap().contains("test-event-"));
         assert!(super::change_count() >= super::MAX_RECORDED_EVENTS as u64);
+    }
+
+    #[test]
+    fn debounce_fires_on_quiet_or_max_wait() {
+        let debounce = super::DEBOUNCE.as_millis() as u64;
+        let max_wait = super::DEBOUNCE_MAX_WAIT.as_millis() as u64;
+        // Quiet gap reached: fires regardless of burst age.
+        assert!(super::debounce_should_fire(debounce, 0));
+        // Sustained churn (gaps under the debounce) must still fire once the first
+        // pending raw event hits the max-latency cap.
+        assert!(super::debounce_should_fire(0, max_wait));
+        // Neither threshold reached: keep waiting.
+        assert!(!super::debounce_should_fire(debounce - 1, max_wait - 1));
     }
 }

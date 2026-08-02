@@ -443,6 +443,13 @@ pub(crate) async fn enable() -> Result<DnsProtectionStatus> {
     }
     .await;
     record_outcome(outcome)?;
+    // Loopback is applied and verified: flush the resolver cache best-effort. Real-IP answers
+    // cached before the switch are otherwise served without consulting the loopback core, so the
+    // fake-ip readiness probe never sees a 198.18/16 answer until the entries expire. A failed
+    // flush must not fail enable — DNS protection itself is already in place.
+    if let Err(error) = engine_flush_cache().await {
+        tracing::warn!("DNS cache flush after enable failed: {error:#}");
+    }
     status_unlocked().await
 }
 

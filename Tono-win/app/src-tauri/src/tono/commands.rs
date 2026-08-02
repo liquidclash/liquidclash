@@ -390,9 +390,11 @@ pub async fn tono_sign_out(state: tauri::State<'_, Arc<TonoState>>, app: AppHand
             if inner.sign_in_generation != generation {
                 return Err("sign-out was superseded by a newer authentication action".to_string());
             }
-            if inner.fsm.kill_switch_armed() {
-                inner.fsm.connect_failed();
-            }
+            // `initial_release_failed`, not `connect_failed`: for an armed-but-unverified
+            // session the latter resolves to FullRelease and clears the armed latch even
+            // though the Service release just failed (mirrors
+            // `stay_armed_after_failed_release`).
+            inner.fsm.initial_release_failed();
             emit_status(&app, &status_of(&inner));
             drop(inner);
             // L4: the user is still signed in — restart the catalog sync
@@ -725,11 +727,14 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
                     return;
                 }
                 let mut inner = state.lock().await;
-                inner.fsm.sign_out_or_quit();
-                inner.kill_switch = None;
+                // Generation first, like every sibling block: a user who signed in while the
+                // startup release reconciled may already own a fresh connect transaction, and
+                // `sign_out_or_quit` here would wipe its FSM mid-flight.
                 if inner.sign_in_generation != generation {
                     return;
                 }
+                inner.fsm.sign_out_or_quit();
+                inner.kill_switch = None;
             }
             let mut inner = state.lock().await;
             if inner.sign_in_generation != generation {

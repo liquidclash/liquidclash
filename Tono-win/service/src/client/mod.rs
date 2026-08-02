@@ -27,9 +27,14 @@ static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
 /// Keep synchronous Windows named-pipe and Service Control Manager verification away from the
 /// application's Tauri runtime. `kode-bridge` performs those checks inline before its first
 /// async pipe operation, so a slow SCM can otherwise occupy every worker on a small Windows VM.
+/// Four workers, not two: that SCM verification runs synchronously inside `kode-bridge`'s async
+/// connect path (not `spawn_blocking`), so a stuck verify parks a whole worker where no tokio
+/// timeout can fire, and two concurrent stuck connects would starve the runtime completely.
+/// The extra workers keep Disconnect/Release IPC responsive until the kode-bridge fix (moving
+/// the verify off-thread) lands.
 static IPC_RUNTIME: Lazy<std::result::Result<tokio::runtime::Runtime, String>> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .thread_name("tono-service-ipc")
         .enable_all()
         .build()
@@ -37,13 +42,19 @@ static IPC_RUNTIME: Lazy<std::result::Result<tokio::runtime::Runtime, String>> =
 });
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
-/// The Service bounds one handler at 60 seconds. A mutating client must wait slightly longer so
-/// it cannot time out, retry, and race the still-running handler on a second connection.
+/// The Service budgets each privileged step inside a handler at 60 seconds and never cancels a
+/// handler at the transport. A mutating client must wait at least slightly longer than one step
+/// so it cannot time out, retry, and race the still-running handler on a second connection. A
+/// multi-step handler can still outlive this — that is the lost-response case (the mutation may
+/// have committed), which mutating routes never replay and session generations repair late.
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(65);
 /// Read-only status calls still round-trip through the service's state (and, on Windows,
 /// cached verify results), so they get more than the interactive default but far less than
 /// a lifecycle mutation.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Log fetches ship whole in-memory buffers across the pipe, so they get well beyond a status
+/// probe but stay explicit — no route may fall through to the transport's interactive default.
+const LOG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// `kode-bridge` applies `max_retries` to both connection establishment and the complete HTTP
 /// request. The Run State already owns startup retry/backoff, so an individual read must stay
 /// small and bounded; otherwise two status calls can occupy the dedicated IPC runtime for
@@ -469,7 +480,7 @@ pub async fn get_clash_logs(
         credentials,
         None,
         (),
-        None,
+        Some(LOG_FETCH_TIMEOUT),
     )
     .await
 }
@@ -481,7 +492,7 @@ pub async fn get_clash_log_snapshot(credentials: &OwnerCredentials) -> Result<Re
         credentials,
         None,
         (),
-        None,
+        Some(LOG_FETCH_TIMEOUT),
     )
     .await
 }
@@ -550,7 +561,7 @@ pub async fn update_writer(
         credentials,
         Some(session),
         body.clone(),
-        None,
+        Some(LIFECYCLE_TIMEOUT),
     )
     .await
 }
@@ -566,14 +577,17 @@ pub async fn set_system_proxy(
         credentials,
         Some(session),
         body.clone(),
-        None,
+        Some(LIFECYCLE_TIMEOUT),
     )
     .await
 }
 
 #[cfg(test)]
 mod retry_safety_tests {
-    use super::{MUTATING_REQUEST_ATTEMPTS, READ_REQUEST_ATTEMPTS, Verb, run_on_ipc_runtime};
+    use super::{
+        LIFECYCLE_TIMEOUT, LOG_FETCH_TIMEOUT, MUTATING_REQUEST_ATTEMPTS, READ_REQUEST_ATTEMPTS,
+        STATUS_TIMEOUT, Verb, run_on_ipc_runtime,
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -588,6 +602,16 @@ mod retry_safety_tests {
         assert_eq!(Verb::Get.max_attempts(), READ_REQUEST_ATTEMPTS);
         assert_eq!(Verb::Post.max_attempts(), MUTATING_REQUEST_ATTEMPTS);
         assert_eq!(Verb::Delete.max_attempts(), MUTATING_REQUEST_ATTEMPTS);
+    }
+
+    #[test]
+    fn mutating_timeout_outwaits_a_service_handler_step() {
+        // The service budgets one privileged handler step at 60 seconds; a mutating client
+        // must outwait that so it cannot give up and race the still-running handler. Reads
+        // stay far below it so they cannot queue a safety-critical release behind them.
+        assert!(LIFECYCLE_TIMEOUT > Duration::from_secs(60));
+        assert!(STATUS_TIMEOUT < LIFECYCLE_TIMEOUT);
+        assert!(LOG_FETCH_TIMEOUT < LIFECYCLE_TIMEOUT);
     }
 
     #[test]

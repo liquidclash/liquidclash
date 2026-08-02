@@ -238,11 +238,22 @@ impl TonoInner {
     /// token. `release_on_stale` preserves the existing late-commit contract: releasing flows
     /// patch a late arm; protected reconnect/switch flows keep the barrier.
     pub fn invalidate_connection(&mut self, release_on_stale: bool) {
+        self.retire_connection_generation(release_on_stale);
+        self.tasks.abort_connection_tasks();
+    }
+
+    /// [`invalidate_connection`] minus the task aborts, for the connect-timeout path only. The
+    /// timed-out attempt may itself be running inside a registered connection task (the
+    /// reconnect loop, the network monitor's re-entry, a node switch); aborting the registry
+    /// there would abort the caller at its next await, so `fail_connect` and the reconnect
+    /// scheduling never run and the FSM is stranded in Connecting. The generation bump plus
+    /// token cancellation already retire every other task's in-flight work at its next stage
+    /// boundary.
+    pub fn retire_connection_generation(&mut self, release_on_stale: bool) {
         self.connect_generation = self.connect_generation.wrapping_add(1);
         self.release_on_stale = release_on_stale;
         self.connect_cancellation.cancel();
         self.connect_cancellation = CancellationToken::new();
-        self.tasks.abort_connection_tasks();
     }
 
     /// Build the on-disk catalog cache rooted at the state's directory.

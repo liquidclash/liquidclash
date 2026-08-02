@@ -7,6 +7,7 @@ import { showNotice } from '@/services/notice-service'
 import { useQuery } from '@/services/query-client'
 import { useThemeMode } from '@/services/states'
 import {
+  formatTonoActionError,
   subscribeTonoStatus,
   tonoAuditLogPath,
   tonoConnectProgress,
@@ -64,6 +65,12 @@ const useConnectProgress = (active: boolean) => {
   useEffect(() => {
     refetchRef.current = refetch
   })
+  // Every status push refetches unconditionally. A gate on "idle with no
+  // failure record" looks tempting, but any ref-based idleness snapshot lags
+  // the pushes by a React commit: a connect that fails pre-arm within
+  // milliseconds emits `connecting` and the terminal failure push back to
+  // back, both land before the ref updates, and the uncleared failure record
+  // then stays invisible with no polling or focus revalidation to recover it.
   useEffect(() => subscribeTonoStatus(() => void refetchRef.current()), [])
 
   return progress
@@ -159,7 +166,7 @@ export const ConnectProgressCard = ({
       await tonoRetryNow()
       await onRefreshStatus()
     } catch (error) {
-      setRetryError(error instanceof Error ? error.message : String(error))
+      setRetryError(formatTonoActionError(error, t))
     } finally {
       setRetrying(false)
     }
@@ -170,7 +177,7 @@ export const ConnectProgressCard = ({
     try {
       await tonoDisconnect()
     } catch (error) {
-      setRestoreError(error instanceof Error ? error.message : String(error))
+      setRestoreError(formatTonoActionError(error, t))
       return
     }
     setRestoreOpen(false)
@@ -369,7 +376,7 @@ export const ConnectProgressCard = ({
               background: hex(TONO_COLORS.error, 0.1),
             }}
           >
-            {progress.error}
+            {formatTonoActionError(progress.error, t)}
           </pre>
         </div>
       )}

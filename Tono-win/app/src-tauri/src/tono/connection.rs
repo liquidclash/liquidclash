@@ -44,8 +44,13 @@ use crate::{
 const EXIT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// §6.8: the probe also proves fake-ip DNS via this lookup.
 const FAKE_IP_LOOKUP: &str = "www.gstatic.com:443";
-/// §6.4: controller readiness poll budget.
-const VERSION_POLL_ATTEMPTS: u32 = 40;
+/// §6.4: controller readiness poll budget. Mihomo's controller is usually up within a few
+/// hundred milliseconds, so the first polls run on a tight 50 ms grid before falling back to
+/// the coarse 250 ms interval — the fixed grid alone overshot a typical readiness by ~200 ms.
+/// The attempt count is sized so the 15 s deadline, not the counter, is the effective budget.
+const VERSION_POLL_ATTEMPTS: u32 = 64;
+const VERSION_POLL_FAST_ATTEMPTS: u32 = 8;
+const VERSION_POLL_FAST_INTERVAL: Duration = Duration::from_millis(50);
 const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// A localhost controller poll must never inherit the general 6 s HTTP timeout. Forty such
 /// timeouts would turn the documented ~10 s readiness window into a multi-minute apparent hang.
@@ -306,7 +311,10 @@ async fn retire_timed_out_generation(state: &Arc<TonoState>, generation: u64) {
     // A first attempt may release a late unverified arm. A previously verified protected
     // reconnect keeps the barrier, matching the normal failure decision table.
     let release_late_commit = !inner.fsm.session_verified();
-    inner.invalidate_connection(release_late_commit);
+    // The abort-free variant: this handler frequently runs *inside* a registered connection
+    // task (reconnect loop / monitor re-entry / switch), and aborting the registry here would
+    // kill the caller before `fail_connect` + `schedule_reconnect` run, stranding Connecting.
+    inner.retire_connection_generation(release_late_commit);
 }
 
 /// §6.1 guards: forced values live in the owned runtime; here we check the
@@ -435,11 +443,6 @@ async fn run_stages(
     // §6.2: proxy endpoints (public IPv4/port/TCP) from the selected node;
     // the bootstrap API hosts are the only control-plane recovery channel.
     let proxy_endpoints = vec![proxy_endpoint_of(node)];
-    // F1: pinned bootstrap IPs merged with the live resolution — the WFP
-    // bootstrap permit must not depend on the system resolver once
-    // blocking starts, and the app's own API client is pinned to the same
-    // addresses (see `tono::bootstrap` / `tono::transport`).
-    let bootstrap_api_hosts = transaction.wait("bootstrap DNS", bootstrap_hosts()).await?;
 
     transaction.check("preparing service")?;
     set_stage(state, app, ConnectStage::PreparingService, generation, false, started).await?;
@@ -448,31 +451,52 @@ async fn run_stages(
     // Re-reading either after the first Core start can select the Tono adapter itself and makes
     // the runtime plan disagree with the WFP preflight that was actually performed.
     let traffic_policy = { state.lock().await.traffic_policy.clone() };
-    let physical_interface = if traffic_policy.as_ref().is_some_and(|policy| {
+    let needs_physical_interface = traffic_policy.as_ref().is_some_and(|policy| {
         !policy.domains.is_empty() || !policy.media_endpoints.is_empty() || !policy.web_domains.is_empty()
-    }) {
-        let interface = transaction
-            .wait("physical interface discovery", detect_physical_interface())
-            .await?
-            .map_err(StageFailure::error)?;
-        tono_core::config::DirectPlan::validate_physical_interface(&interface).map_err(StageFailure::error)?;
-        Some(interface)
-    } else {
-        None
-    };
+    });
 
-    // Tono is TUN-only, so it does not expose Mihomo's legacy mixed listener. A fresh controller
-    // port eliminates collisions with another proxy or a stale 9090 listener. DNS stays fixed at
-    // loopback:53 because Windows adapter protection points resolvers there, therefore prove both
-    // TCP and UDP are available before installing WFP rather than timing out after the arm.
-    let controller_port = transaction
-        .wait("controller port allocation", allocate_controller_port())
-        .await?
-        .map_err(StageFailure::error)?;
-    transaction
-        .wait("DNS listener preflight", preflight_dns_listener())
-        .await?
-        .map_err(StageFailure::error)?;
+    // The five preparation probes are independent of each other and all read-only /
+    // cancellation-safe (the two port binds are released immediately; the core-path query is a
+    // read IPC), so they run concurrently under one transaction wait instead of paying their
+    // worst cases back to back (the bootstrap DNS lookup alone budgets 2 s):
+    //  - F1: pinned bootstrap IPs merged with the live resolution — the WFP bootstrap permit
+    //    must not depend on the system resolver once blocking starts, and the app's own API
+    //    client is pinned to the same addresses (see `tono::bootstrap` / `tono::transport`).
+    //  - The physical egress interface, still strictly before the first Core start (above).
+    //  - Tono is TUN-only, so it does not expose Mihomo's legacy mixed listener. A fresh
+    //    controller port eliminates collisions with another proxy or a stale 9090 listener.
+    //  - DNS stays fixed at loopback:53 because Windows adapter protection points resolvers
+    //    there, therefore prove both TCP and UDP are available before installing WFP rather
+    //    than timing out after the arm.
+    //  - The Service-side core binary path validation.
+    let (bootstrap_api_hosts, physical_interface_probe, controller_port, dns_preflight, core_path) = transaction
+        .wait("preparing service", async {
+            tokio::join!(
+                bootstrap_hosts(),
+                async {
+                    if needs_physical_interface {
+                        Some(detect_physical_interface().await)
+                    } else {
+                        None
+                    }
+                },
+                allocate_controller_port(),
+                preflight_dns_listener(),
+                service::tono_core_binary_path(),
+            )
+        })
+        .await?;
+    let controller_port = controller_port.map_err(StageFailure::error)?;
+    dns_preflight.map_err(StageFailure::error)?;
+    let core_path = core_path.map_err(StageFailure::error)?;
+    let physical_interface = match physical_interface_probe {
+        Some(interface) => {
+            let interface = interface.map_err(StageFailure::error)?;
+            tono_core::config::DirectPlan::validate_physical_interface(&interface).map_err(StageFailure::error)?;
+            Some(interface)
+        }
+        None => None,
+    };
     let runtime_ports = RuntimePorts {
         mixed_port: 0,
         controller_port,
@@ -484,10 +508,6 @@ async fn run_stages(
     let runtime =
         build_owned_runtime_with_ports(nodes, &node.name, &secret, None, runtime_ports).map_err(StageFailure::error)?;
     write_redacted_copy(state, &runtime.redacted_yaml()).await;
-    let core_path = transaction
-        .wait("core path validation", service::tono_core_binary_path())
-        .await?
-        .map_err(StageFailure::error)?;
     let bundle = RuntimeBundle {
         yaml: runtime.yaml().to_string(),
         assets: Vec::new(),
@@ -619,6 +639,15 @@ async fn run_stages(
         inner.kill_switch = Some(kill_status);
         inner.fsm.mark_session_verified();
         inner.fsm.connect_succeeded().map_err(StageFailure::error)?;
+        // M4 seeds must reset on *every* success, not only on disconnect: a
+        // reconnect's own StartClash always changes the core pid and bumps
+        // the netmon counter, so comparing against pre-reconnect values made
+        // the fresh monitor's first poll re-invalidate immediately — a
+        // self-sustaining connect/teardown loop. Clearing them re-enters the
+        // documented "first sample seeds without firing" path.
+        inner.network_events_counter = None;
+        inner.last_core_pid = None;
+        inner.last_restart_count = None;
         // F3: every step completed; retry bookkeeping resets.
         let elapsed = inner
             .step_started_at
@@ -1188,12 +1217,17 @@ pub async fn disconnect(state: Arc<TonoState>, app: AppHandle) -> Result<(), Str
 }
 
 /// A releasing step failed mid-disconnect: fall back to Protected Offline
-/// without ever disarming (§6).
+/// without ever disarming (§6). `initial_release_failed`, not
+/// `connect_failed`: for an armed-but-unverified session the latter's
+/// decision table resolves to FullRelease and clears the armed latch even
+/// though the Service release just failed — the UI would show notConnected
+/// over a still-blocking WFP barrier and `quit_release` would then skip the
+/// release entirely. `initial_release_failed` keeps the real armed state
+/// visible in every combination (and also clears a stuck `is_disconnecting`
+/// when the release failed before any arm existed).
 async fn stay_armed_after_failed_release(state: &Arc<TonoState>, app: &AppHandle) {
     let mut inner = state.lock().await;
-    if inner.fsm.kill_switch_armed() {
-        inner.fsm.connect_failed();
-    }
+    inner.fsm.initial_release_failed();
     commands::emit_status(app, &commands::status_of(&inner));
 }
 
@@ -1631,7 +1665,12 @@ async fn wait_controller(secret: &str, controller_port: u16) -> Result<(), Strin
         if remaining.is_zero() {
             break;
         }
-        tokio::time::sleep(remaining.min(VERSION_POLL_INTERVAL)).await;
+        let interval = if attempt < VERSION_POLL_FAST_ATTEMPTS {
+            VERSION_POLL_FAST_INTERVAL
+        } else {
+            VERSION_POLL_INTERVAL
+        };
+        tokio::time::sleep(remaining.min(interval)).await;
     }
     Err(format!("mihomo controller not ready: {last}"))
 }
@@ -1681,15 +1720,18 @@ async fn verify_fake_ip() -> Result<(), String> {
     Err(format!("fake-ip verification failed: {last}"))
 }
 
-/// §6.8: delay-probe the exit group through the selected node (3 tries).
+/// §6.8: delay-probe the exit group through the selected node (3 tries; no
+/// sleep after the last failure — it only delayed the error).
 async fn probe_exit(secret: &str, controller_port: u16) -> Result<(), String> {
     let mut last = String::from("no response");
-    for _ in 0..VERIFY_ATTEMPTS {
+    for attempt in 0..VERIFY_ATTEMPTS {
         match probe_exit_once(secret, controller_port).await {
             Ok(_) => return Ok(()),
             Err(err) => {
                 last = err;
-                tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+                if attempt + 1 < VERIFY_ATTEMPTS {
+                    tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+                }
             }
         }
     }

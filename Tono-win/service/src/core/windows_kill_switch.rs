@@ -287,6 +287,18 @@ async fn remove_all_filters_unlocked() -> Result<()> {
     }
 }
 
+/// Upgrade/migration sweep: remove sublayers left by older builds (filters included). Must
+/// run strictly *after* the current expected set is committed (or all filters were removed
+/// on purpose): an older build's PERSISTENT block-all pair may be the only protection at
+/// boot after an upgrade reboot, and deleting it before the replacement floor is live would
+/// open a zero-filter window. Best-effort — a failed sweep leaves extra blocking, never less.
+async fn sweep_legacy_sublayers_unlocked() {
+    #[cfg(all(windows, not(feature = "test")))]
+    if let Err(error) = engine_call(crate::core::wfp::remove_legacy_sublayers).await {
+        tracing::warn!("legacy WFP sublayer cleanup failed: {error:#}");
+    }
+}
+
 fn record_outcome(result: Result<()>) -> Result<()> {
     match result {
         Ok(()) => {
@@ -301,35 +313,59 @@ fn record_outcome(result: Result<()>) -> Result<()> {
 }
 
 /// Literal IPs are used directly; hostnames resolve once here, before the block exists.
+/// Lookups run concurrently — this sits on the connect critical path before WFP arms, and
+/// sequential per-host timeouts would stack — but results are collected in the caller's host
+/// order, so the sanitizer's first-wins dedup and cap keep favoring earlier hosts.
 /// Everything is then funnelled through the model's public-only, bounded sanitizer.
 async fn resolve_api_hosts(hosts: &[String]) -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-    for host in hosts.iter().take(16) {
-        let host = host.trim();
-        if host.is_empty() {
-            continue;
-        }
+    let hosts = hosts
+        .iter()
+        .take(16)
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty())
+        .collect::<Vec<_>>();
+    let mut ips_per_host: Vec<Vec<IpAddr>> = vec![Vec::new(); hosts.len()];
+    #[cfg(all(windows, not(feature = "test")))]
+    let mut lookups = Vec::new();
+    for (index, host) in hosts.iter().enumerate() {
         if let Ok(ip) = host.parse::<IpAddr>() {
-            ips.push(ip);
+            ips_per_host[index].push(ip);
             continue;
         }
         #[cfg(all(windows, not(feature = "test")))]
-        match tokio::time::timeout(
-            API_HOST_LOOKUP_TIMEOUT,
-            tokio::net::lookup_host(format!("{host}:443")),
-        )
-        .await
         {
-            Ok(Ok(resolved)) => ips.extend(resolved.map(|address| address.ip())),
-            Ok(Err(error)) => {
-                tracing::warn!("kill-switch API host {host:?} did not resolve: {error}")
-            }
-            Err(_) => tracing::warn!(
-                "kill-switch API host {host:?} resolution exceeded {API_HOST_LOOKUP_TIMEOUT:?}"
-            ),
+            let host = host.clone();
+            lookups.push((
+                index,
+                host.clone(),
+                tokio::spawn(async move {
+                    tokio::time::timeout(
+                        API_HOST_LOOKUP_TIMEOUT,
+                        tokio::net::lookup_host(format!("{host}:443")),
+                    )
+                    .await
+                }),
+            ));
         }
     }
-    wfp_model::sanitize_api_host_ips(ips)
+    #[cfg(all(windows, not(feature = "test")))]
+    for (index, host, lookup) in lookups {
+        match lookup.await {
+            Ok(Ok(Ok(resolved))) => {
+                ips_per_host[index].extend(resolved.map(|address| address.ip()))
+            }
+            Ok(Ok(Err(error))) => {
+                tracing::warn!("kill-switch API host {host:?} did not resolve: {error}")
+            }
+            Ok(Err(_)) => tracing::warn!(
+                "kill-switch API host {host:?} resolution exceeded {API_HOST_LOOKUP_TIMEOUT:?}"
+            ),
+            Err(error) => {
+                tracing::warn!("kill-switch API host {host:?} lookup task failed: {error}")
+            }
+        }
+    }
+    wfp_model::sanitize_api_host_ips(ips_per_host.into_iter().flatten())
 }
 
 /// First phase of the two-phase arm: floor + session rules up, API channel open, tunnel not
@@ -580,19 +616,43 @@ pub(crate) async fn transition_after_stop(release_requested: bool) -> Result<()>
     restrict_bootstrap_unlocked().await
 }
 
+/// The ownerless emergency block ("damaged/unknown state = armed"): strict Blocked, no app
+/// or endpoint permits, marked verified so startup recovery never retires it as stale. The
+/// missing `owner_key` is the documented escape hatch — any authenticated owner may release
+/// it (see `authorize_write_for`).
+fn emergency_armed() -> Armed {
+    Armed {
+        intent: IntentRecord {
+            wanted: true,
+            mode: KillSwitchStatusMode::Blocked,
+            verified: Some(true),
+            tunnel_interface: String::new(),
+            app_path: String::new(),
+            endpoints: Vec::new(),
+            api_host_ips: Vec::new(),
+            updated_at: now_unix(),
+            owner_key: None,
+        },
+        tun_luid: None,
+        direct_endpoints: Vec::new(),
+    }
+}
+
 /// Service-start recovery (design doc §3): read the intent record and reconcile.
+///
+/// Ordering invariant: the intent is reconciled and the current expected filter set is
+/// installed *before* the legacy-sublayer upgrade sweep runs. Across an upgrade reboot an
+/// older build's PERSISTENT block-all pair may be the only protection on the machine;
+/// sweeping it away before the replacement floor is committed would open a zero-filter
+/// window at boot — and leave the machine open for good if the reconcile then failed.
+/// `install` itself swaps legacy filters for the current set in a single transaction, so
+/// the sweep afterwards only clears the emptied legacy sublayer objects.
 pub async fn restore_on_service_start() -> Result<()> {
     if !SUPPORTED {
         return Ok(());
     }
     let _operation = WFP_OPERATION.lock().await;
     RESTORE_WAS_LOCKED.store(false, Ordering::Release);
-    // Upgrade/migration first: remove sublayers left by older builds (filters included) so
-    // the reconcile below reasons only about the current object set.
-    #[cfg(all(windows, not(feature = "test")))]
-    if let Err(error) = engine_call(crate::core::wfp::remove_legacy_sublayers).await {
-        tracing::warn!("legacy WFP sublayer cleanup failed: {error:#}");
-    }
     match tokio::fs::read(intent_path()).await {
         Ok(bytes) => match serde_json::from_slice::<IntentRecord>(&bytes) {
             Ok(intent) if intent_is_valid(&intent) => {
@@ -613,7 +673,11 @@ pub async fn restore_on_service_start() -> Result<()> {
                     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?)
                         .await?;
                     *ARMED.lock().unwrap() = Some(armed.clone());
-                    return record_outcome(install_unlocked(&armed).await);
+                    let installed = record_outcome(install_unlocked(&armed).await);
+                    if installed.is_ok() {
+                        sweep_legacy_sublayers_unlocked().await;
+                    }
+                    return installed;
                 }
                 let mut armed = Armed {
                     intent,
@@ -638,7 +702,11 @@ pub async fn restore_on_service_start() -> Result<()> {
                     RESTORE_WAS_LOCKED.store(true, Ordering::Release);
                 }
                 *ARMED.lock().unwrap() = Some(armed.clone());
-                record_outcome(install_unlocked(&armed).await)
+                let installed = record_outcome(install_unlocked(&armed).await);
+                if installed.is_ok() {
+                    sweep_legacy_sublayers_unlocked().await;
+                }
+                installed
             }
             Ok(intent) => {
                 // wanted == false (or unwanted-but-parseable) with possible residual objects:
@@ -646,7 +714,10 @@ pub async fn restore_on_service_start() -> Result<()> {
                 // (e.g. from an emergency disarm whose restore could not be proven) is swept
                 // here too — protection is off, so the machine must not stay on loopback DNS.
                 let _ = intent;
+                // `remove_all_filters` is provider-scoped, so filters in legacy sublayers go
+                // with it; the sweep afterwards only clears the emptied sublayer objects.
                 remove_all_filters_unlocked().await?;
+                sweep_legacy_sublayers_unlocked().await;
                 match tokio::fs::remove_file(intent_path()).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -664,25 +735,15 @@ pub async fn restore_on_service_start() -> Result<()> {
                 // Corrupt intent = wanted (fail-closed), exactly the macOS helper's "damaged
                 // state file ⇒ install emergency block". The corrupt file is left on disk as
                 // evidence; the in-memory intent below is what the watchdog reconciles.
-                let emergency = Armed {
-                    intent: IntentRecord {
-                        wanted: true,
-                        mode: KillSwitchStatusMode::Blocked,
-                        verified: Some(true),
-                        tunnel_interface: String::new(),
-                        app_path: String::new(),
-                        endpoints: Vec::new(),
-                        api_host_ips: Vec::new(),
-                        updated_at: now_unix(),
-                        owner_key: None,
-                    },
-                    tun_luid: None,
-                    direct_endpoints: Vec::new(),
-                };
+                let emergency = emergency_armed();
                 *ARMED.lock().unwrap() = Some(emergency.clone());
-                install_unlocked(&emergency)
+                let installed = install_unlocked(&emergency)
                     .await
-                    .context("corrupt kill-switch intent: failed to install emergency block")
+                    .context("corrupt kill-switch intent: failed to install emergency block");
+                if installed.is_ok() {
+                    sweep_legacy_sublayers_unlocked().await;
+                }
+                installed
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -692,26 +753,21 @@ pub async fn restore_on_service_start() -> Result<()> {
                 .await
                 .unwrap_or(true)
             {
-                let emergency = Armed {
-                    intent: IntentRecord {
-                        wanted: true,
-                        mode: KillSwitchStatusMode::Blocked,
-                        verified: Some(true),
-                        tunnel_interface: String::new(),
-                        app_path: String::new(),
-                        endpoints: Vec::new(),
-                        api_host_ips: Vec::new(),
-                        updated_at: now_unix(),
-                        owner_key: None,
-                    },
-                    tun_luid: None,
-                    direct_endpoints: Vec::new(),
-                };
+                let emergency = emergency_armed();
                 *ARMED.lock().unwrap() = Some(emergency.clone());
-                return install_unlocked(&emergency).await.context(
-                    "missing intent with residual WFP objects: failed to reinstall block",
-                );
+                let installed = install_unlocked(&emergency)
+                    .await
+                    .context("missing intent with residual WFP objects: failed to reinstall block");
+                if installed.is_ok() {
+                    sweep_legacy_sublayers_unlocked().await;
+                }
+                return installed;
             }
+            // Not armed and no filters anywhere (the residual check is provider-scoped, legacy
+            // sublayers included): sweeping empty leftover sublayer objects cannot remove
+            // protection, and on a fresh install the sweep is a read-only no-op because the
+            // Tono provider does not exist.
+            sweep_legacy_sublayers_unlocked().await;
             // Not armed and nothing residual: still sweep a leftover DNS snapshot (see above).
             if let Err(error) = crate::core::dns::ensure_restored().await {
                 tracing::warn!(
@@ -720,7 +776,23 @@ pub async fn restore_on_service_start() -> Result<()> {
             }
             Ok(())
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            // The file may exist but be unreadable (ACL damage, transient I/O). Returning the
+            // error would leave `ARMED` empty and the watchdog idle — fully open even though a
+            // wanted intent may sit on disk. Treat it like the corrupt case above: fail closed
+            // with the emergency block. A clean NotFound never reaches here, so a fresh
+            // install stays a no-op.
+            tracing::warn!("kill-switch intent could not be read: {error:#}");
+            let emergency = emergency_armed();
+            *ARMED.lock().unwrap() = Some(emergency.clone());
+            let installed = install_unlocked(&emergency)
+                .await
+                .context("unreadable kill-switch intent: failed to install emergency block");
+            if installed.is_ok() {
+                sweep_legacy_sublayers_unlocked().await;
+            }
+            installed
+        }
     }
 }
 
@@ -1228,6 +1300,28 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn restore_with_unreadable_intent_arms_emergency_block() -> Result<()> {
+        cleanup().await;
+        // A directory at the intent path makes the read fail with a non-NotFound error on
+        // every platform — the stand-in for ACL damage or transient I/O on a real service.
+        tokio::fs::create_dir_all(intent_path()).await?;
+
+        restore_on_service_start().await?;
+
+        let armed = ARMED.lock().unwrap().clone().expect("unreadable = armed");
+        assert_eq!(armed.intent.mode, KillSwitchStatusMode::Blocked);
+        assert!(armed.intent.wanted);
+        assert!(armed.intent.is_verified());
+        assert!(armed.intent.endpoints.is_empty());
+        assert!(status().await.wanted);
+
+        tokio::fs::remove_dir(intent_path()).await?;
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn restore_with_missing_intent_is_a_noop() -> Result<()> {
         cleanup().await;
 
@@ -1237,6 +1331,27 @@ mod tests {
         assert!(!status().await.wanted);
         cleanup().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_api_hosts_keeps_priority_order_and_dedups() {
+        // Test builds skip live DNS, so only the literal handling is exercised: order is the
+        // caller's, duplicates collapse first-wins, blanks and hostnames drop out.
+        let ips = resolve_api_hosts(&[
+            " 1.1.1.1 ".to_owned(),
+            "api.example.invalid".to_owned(),
+            String::new(),
+            "8.8.8.8".to_owned(),
+            "1.1.1.1".to_owned(),
+        ])
+        .await;
+        assert_eq!(
+            ips,
+            vec![
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+                "8.8.8.8".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]
