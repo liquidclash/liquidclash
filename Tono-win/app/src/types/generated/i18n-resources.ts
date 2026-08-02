@@ -1601,11 +1601,16 @@ export interface TranslationResources {
         connected: string
         connecting: string
         disconnecting: string
+        errors: {
+          releaseReconciling: string
+          serviceBusy: string
+          serviceTooOld: string
+        }
         info: {
-          asnType: string
-          city: string
           dns: string
-          ip: string
+          download: string
+          protection: string
+          upload: string
         }
         killSwitchError: string
         killSwitchErrorNote: string
@@ -1631,6 +1636,12 @@ export interface TranslationResources {
         intro: string
         invalidCode: string
         invalidEmail: string
+        networkBlocked: {
+          description: string
+          restore: string
+          restoring: string
+          title: string
+        }
         resendIn: string
         restoreFailed: {
           description: string
@@ -1745,6 +1756,7 @@ export interface TranslationResources {
         proxyEngine: {
           allowLan: string
           allowLanSubtitle: string
+          disabled: string
           mixedPort: string
           title: string
           tun: string

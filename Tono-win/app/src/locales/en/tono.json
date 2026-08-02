@@ -32,6 +32,12 @@
       "title": "Couldn't restore your session",
       "description": "Restoring your previous session failed. Retry, or sign in again below.",
       "retry": "Retry"
+    },
+    "networkBlocked": {
+      "title": "Internet access is currently blocked",
+      "description": "Tono restored its leak protection from an earlier connection. Restore normal internet access before signing in.",
+      "restore": "Restore normal internet",
+      "restoring": "Restoring internet…"
     }
   },
   "pill": {
@@ -43,9 +49,9 @@
       "disconnecting": "Disconnecting…"
     },
     "subtitle": {
-      "tapToConnect": "Tap to connect",
-      "tapToDisconnect": "Tap to disconnect",
-      "tapToRestore": "Tap to restore internet",
+      "tapToConnect": "Click to connect",
+      "tapToDisconnect": "Click to disconnect",
+      "tapToRestore": "Click to restore internet",
       "restoringAccess": "Restoring network access",
       "starting": "Starting…"
     },
@@ -71,16 +77,21 @@
     "catalogRequiresChoice": "Your server is no longer available — please reselect",
     "killSwitchError": "Kill switch: {{message}}",
     "killSwitchErrorNote": "Most recent error — it may already be resolved.",
+    "errors": {
+      "serviceBusy": "Tono Service is installing or repairing. Approve any pending admin prompt, or restart Tono.",
+      "releaseReconciling": "Network protection is still releasing. Wait a moment, then connect again.",
+      "serviceTooOld": "This Tono Service is too old for this app. Reinstall Tono from the latest installer so the Service is replaced."
+    },
     "info": {
-      "ip": "IP",
-      "asnType": "ASN Type",
-      "city": "City",
-      "dns": "DNS"
+      "protection": "Traffic protection",
+      "dns": "Secure DNS",
+      "upload": "Upload",
+      "download": "Download"
     }
   },
   "node": {
-    "activeServer": "ACTIVE SERVER",
-    "selectedServer": "SELECTED SERVER",
+    "activeServer": "Active server",
+    "selectedServer": "Selected server",
     "switch": "Switch",
     "group": "Tono Cloud"
   },
@@ -150,7 +161,8 @@
       "tunSubtitle": "Required by Tono to prevent application bypass",
       "allowLan": "Allow LAN",
       "allowLanSubtitle": "Managed by Tono",
-      "mixedPort": "Mixed Port"
+      "mixedPort": "Mixed Port",
+      "disabled": "Disabled (TUN only)"
     },
     "appearance": {
       "title": "Appearance",

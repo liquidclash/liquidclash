@@ -29,6 +29,9 @@ const ENGINE_LIVE: bool = cfg!(all(windows, not(feature = "test")));
 struct IntentRecord {
     wanted: bool,
     mode: KillSwitchStatusMode,
+    /// `None` is a legacy record: Locked migrated as verified, earlier phases as stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified: Option<bool>,
     tunnel_interface: String,
     /// Staged core binary path the `ALE_APP_ID` permit is resolved from.
     app_path: String,
@@ -43,6 +46,13 @@ struct IntentRecord {
     /// any authenticated owner (see `authorize_write_for`).
     #[serde(default)]
     owner_key: Option<String>,
+}
+
+impl IntentRecord {
+    fn is_verified(&self) -> bool {
+        self.verified
+            .unwrap_or(self.mode == KillSwitchStatusMode::Locked)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,20 +82,13 @@ static LAST_VERIFY: Lazy<Mutex<Option<(std::time::Instant, bool)>>> =
 /// How long a status read may trust the cached verify: the watchdog re-verifies every
 /// second, so this keeps reads at most one tick stale while staying off the RPC path.
 const VERIFY_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// Resolution is best-effort because the App also supplies pinned literal bootstrap addresses.
+/// A broken resolver must never occupy the Service lifecycle queue without a bound.
+#[cfg(all(windows, not(feature = "test")))]
+const API_HOST_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn note_verify(ok: bool) {
     *LAST_VERIFY.lock().unwrap() = Some((std::time::Instant::now(), ok));
-}
-
-async fn verify_cached(armed: &Armed) -> bool {
-    if let Some((at, ok)) = *LAST_VERIFY.lock().unwrap()
-        && at.elapsed() < VERIFY_CACHE_TTL
-    {
-        return ok;
-    }
-    let ok = verify_live_unlocked(armed).await.is_ok();
-    note_verify(ok);
-    ok
 }
 
 fn intent_path() -> PathBuf {
@@ -288,11 +291,19 @@ async fn resolve_api_hosts(hosts: &[String]) -> Vec<IpAddr> {
             continue;
         }
         #[cfg(all(windows, not(feature = "test")))]
-        match tokio::net::lookup_host(format!("{host}:443")).await {
-            Ok(resolved) => ips.extend(resolved.map(|address| address.ip())),
-            Err(error) => {
+        match tokio::time::timeout(
+            API_HOST_LOOKUP_TIMEOUT,
+            tokio::net::lookup_host(format!("{host}:443")),
+        )
+        .await
+        {
+            Ok(Ok(resolved)) => ips.extend(resolved.map(|address| address.ip())),
+            Ok(Err(error)) => {
                 tracing::warn!("kill-switch API host {host:?} did not resolve: {error}")
             }
+            Err(_) => tracing::warn!(
+                "kill-switch API host {host:?} resolution exceeded {API_HOST_LOOKUP_TIMEOUT:?}"
+            ),
         }
     }
     wfp_model::sanitize_api_host_ips(ips)
@@ -316,10 +327,15 @@ pub(crate) async fn arm_bootstrap(
         bail!("enabled kill switch requires the authenticated owner key");
     }
     let api_host_ips = resolve_api_hosts(&config.bootstrap_api_hosts).await;
+    let _operation = WFP_OPERATION.lock().await;
+    let inherited_verified = ARMED.lock().unwrap().as_ref().is_some_and(|armed| {
+        armed.intent.owner_key.as_deref() == Some(owner_key) && armed.intent.is_verified()
+    });
     let armed = Armed {
         intent: IntentRecord {
             wanted: true,
             mode: KillSwitchStatusMode::Bootstrap,
+            verified: Some(inherited_verified),
             tunnel_interface: config.tunnel_interface.trim().to_owned(),
             app_path: app_path.to_owned(),
             endpoints: config.proxy_endpoints.clone(),
@@ -331,12 +347,36 @@ pub(crate) async fn arm_bootstrap(
         // In memory only — the intent file deliberately never carries these (omission = clear).
         direct_endpoints: config.direct_endpoints.clone(),
     };
-    let _operation = WFP_OPERATION.lock().await;
     // Persist fail-closed intent before touching WFP: a daemon restart installs at least the
     // floor if this process dies during the following transaction.
     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?).await?;
     *ARMED.lock().unwrap() = Some(armed.clone());
     record_outcome(install_unlocked(&armed).await)
+}
+
+/// Commit the full app verification barrier for the active logical session.
+pub(crate) async fn mark_verified(owner_key: &str) -> Result<()> {
+    ensure_supported()?;
+    let _operation = WFP_OPERATION.lock().await;
+    let mut armed = ARMED
+        .lock()
+        .unwrap()
+        .clone()
+        .context("kill switch is not armed")?;
+    if armed.intent.owner_key.as_deref() != Some(owner_key) {
+        bail!("kill switch belongs to a different owner");
+    }
+    if armed.intent.mode != KillSwitchStatusMode::Locked {
+        bail!("kill switch must be locked before verification");
+    }
+    if armed.intent.is_verified() && armed.intent.verified == Some(true) {
+        return Ok(());
+    }
+    armed.intent.verified = Some(true);
+    armed.intent.updated_at = now_unix();
+    atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?).await?;
+    *ARMED.lock().unwrap() = Some(armed);
+    Ok(())
 }
 
 /// Whether `caller_key` may mutate the armed protection (release / restrict / DNS restore).
@@ -533,6 +573,25 @@ pub async fn restore_on_service_start() -> Result<()> {
     match tokio::fs::read(intent_path()).await {
         Ok(bytes) => match serde_json::from_slice::<IntentRecord>(&bytes) {
             Ok(intent) if intent_is_valid(&intent) => {
+                if !intent.is_verified() {
+                    // Do not open the machine yet. Startup reconciliation runs immediately after
+                    // this function and must first prove that any previous Core is gone. It then
+                    // calls `retire_unverified_on_service_start`, which durably retires the desired
+                    // owner, proves DNS restoration, and only then removes WFP. Keeping a strict
+                    // Blocked snapshot here closes the old Core/WFP ordering window and preserves
+                    // the DNS-before-disarm invariant when recovery itself fails.
+                    let mut armed = Armed {
+                        intent,
+                        tun_luid: None,
+                        direct_endpoints: Vec::new(),
+                    };
+                    armed.intent.mode = KillSwitchStatusMode::Blocked;
+                    armed.intent.updated_at = now_unix();
+                    atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?)
+                        .await?;
+                    *ARMED.lock().unwrap() = Some(armed.clone());
+                    return record_outcome(install_unlocked(&armed).await);
+                }
                 let mut armed = Armed {
                     intent,
                     tun_luid: None,
@@ -545,6 +604,10 @@ pub async fn restore_on_service_start() -> Result<()> {
                 // Blocked (fail-closed, API recovery channel open) until the tunnel is
                 // re-locked — by `relock_restored_tunnel` after a core restore, or by the GUI.
                 if armed.intent.mode == KillSwitchStatusMode::Locked {
+                    // Materialize the legacy Locked => verified migration before changing mode.
+                    // Otherwise a second service restart would reinterpret the now-Blocked
+                    // field-less record as stale and incorrectly open an established session.
+                    armed.intent.verified = Some(true);
                     armed.intent.mode = KillSwitchStatusMode::Blocked;
                     armed.intent.updated_at = now_unix();
                     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?)
@@ -582,6 +645,7 @@ pub async fn restore_on_service_start() -> Result<()> {
                     intent: IntentRecord {
                         wanted: true,
                         mode: KillSwitchStatusMode::Blocked,
+                        verified: Some(true),
                         tunnel_interface: String::new(),
                         app_path: String::new(),
                         endpoints: Vec::new(),
@@ -609,6 +673,7 @@ pub async fn restore_on_service_start() -> Result<()> {
                     intent: IntentRecord {
                         wanted: true,
                         mode: KillSwitchStatusMode::Blocked,
+                        verified: Some(true),
                         tunnel_interface: String::new(),
                         app_path: String::new(),
                         endpoints: Vec::new(),
@@ -633,6 +698,58 @@ pub async fn restore_on_service_start() -> Result<()> {
             Ok(())
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Finish startup recovery for an initial attempt that never crossed the durable verification
+/// barrier. This must run only *after* `reconcile_service_startup` has stopped and identified any
+/// surviving Core. The order is deliberately irreversible-safe:
+///
+/// 1. retire the matching owner's desired run state;
+/// 2. prove DNS restoration;
+/// 3. remove WFP and its intent record.
+///
+/// Any ambiguity leaves the stricter Blocked policy installed and IPC available for recovery.
+/// Returns `true` when an unverified intent was retired, `false` when there was none.
+pub async fn retire_unverified_on_service_start() -> Result<bool> {
+    if !SUPPORTED {
+        return Ok(false);
+    }
+    let _operation = WFP_OPERATION.lock().await;
+    let Some(armed) = ARMED.lock().unwrap().clone() else {
+        return Ok(false);
+    };
+    if armed.intent.is_verified() {
+        return Ok(false);
+    }
+
+    let result = async {
+        if let Some(owner_key) = armed.intent.owner_key.as_deref() {
+            if !crate::core::desired::retire_owner_if_active(owner_key)
+                .await
+                .context("failed to retire stale unverified owner")?
+            {
+                bail!(
+                    "stale unverified protection owner {owner_key:?} does not match the active Core owner"
+                );
+            }
+        } else {
+            crate::core::desired::retire_legacy_active_owner()
+                .await
+                .context("failed to retire active owner paired with legacy unowned protection")?;
+        }
+        disarm_unlocked().await
+    }
+    .await;
+
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            *LAST_ERROR.lock().unwrap() = Some(format!(
+                "stale unverified session remains fail-closed: {error:#}"
+            ));
+            Err(error)
+        }
     }
 }
 
@@ -715,6 +832,7 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     .unwrap_or(IntentRecord {
         wanted: false,
         mode: KillSwitchStatusMode::Blocked,
+        verified: Some(false),
         tunnel_interface: String::new(),
         app_path: String::new(),
         endpoints: Vec::new(),
@@ -748,25 +866,33 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
 }
 
 pub(crate) async fn status() -> KillSwitchStatus {
+    // Never join the WFP writer queue. The watchdog refreshes `LAST_VERIFY`; mutations publish
+    // `ARMED` only at their commit boundary, so a concurrent read gets the previous committed
+    // state rather than blocking behind an RPC that may itself be the thing under diagnosis.
     let armed = { ARMED.lock().unwrap().clone() };
     let Some(armed) = armed else {
         return KillSwitchStatus {
             wanted: false,
+            verified: false,
             live: false,
             mode: KillSwitchStatusMode::Blocked,
             endpoints: Vec::new(),
             last_error: LAST_ERROR.lock().unwrap().clone(),
         };
     };
-    let _operation = WFP_OPERATION.lock().await;
     let live = if ENGINE_LIVE {
-        verify_cached(&armed).await
+        LAST_VERIFY
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(at, ok)| *ok && at.elapsed() < VERIFY_CACHE_TTL)
     } else {
         // No engine behind this build: report the recorded intent without claiming liveness.
         false
     };
     KillSwitchStatus {
         wanted: armed.intent.wanted,
+        verified: armed.intent.is_verified(),
         live,
         mode: armed.intent.mode,
         endpoints: armed.intent.endpoints.clone(),
@@ -831,6 +957,9 @@ mod tests {
         IntentRecord {
             wanted,
             mode,
+            // Existing tests use this as an established-session fixture; migration behavior is
+            // covered separately with JSON that omits the field.
+            verified: Some(true),
             tunnel_interface: "Tono".to_owned(),
             app_path: "/opt/tono/mihomo".to_owned(),
             endpoints: test_config().proxy_endpoints,
@@ -838,6 +967,49 @@ mod tests {
             updated_at: 1,
             owner_key: None,
         }
+    }
+
+    #[test]
+    fn legacy_verification_migration_depends_on_mode() {
+        for (mode, expected) in [
+            (KillSwitchStatusMode::Locked, true),
+            (KillSwitchStatusMode::Blocked, false),
+            (KillSwitchStatusMode::Bootstrap, false),
+        ] {
+            let mut value = serde_json::to_value(valid_intent(mode, true)).unwrap();
+            value.as_object_mut().unwrap().remove("verified");
+            let intent: IntentRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(intent.verified, None);
+            assert_eq!(intent.is_verified(), expected, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn arm_inherits_verification_only_for_same_owner() -> Result<()> {
+        cleanup().await;
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        lock(None).await?;
+        mark_verified("owner-alice").await?;
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        assert!(ARMED.lock().unwrap().as_ref().unwrap().intent.is_verified());
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-bob").await?;
+        assert!(!ARMED.lock().unwrap().as_ref().unwrap().intent.is_verified());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mark_verified_requires_locked_matching_owner_and_is_idempotent() -> Result<()> {
+        cleanup().await;
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        assert!(mark_verified("owner-alice").await.is_err());
+        lock(None).await?;
+        assert!(mark_verified("owner-bob").await.is_err());
+        mark_verified("owner-alice").await?;
+        mark_verified("owner-alice").await?;
+        assert!(ARMED.lock().unwrap().as_ref().unwrap().intent.is_verified());
+        Ok(())
     }
 
     async fn cleanup() {
@@ -872,7 +1044,124 @@ mod tests {
         // The downgrade is persisted too.
         let on_disk: IntentRecord = serde_json::from_slice(&tokio::fs::read(intent_path()).await?)?;
         assert_eq!(on_disk.mode, KillSwitchStatusMode::Blocked);
+        assert_eq!(on_disk.verified, Some(true));
         assert!(status().await.wanted);
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_locked_migration_stays_verified_across_a_second_restart() -> Result<()> {
+        cleanup().await;
+        let mut value = serde_json::to_value(valid_intent(KillSwitchStatusMode::Locked, true))?;
+        value.as_object_mut().unwrap().remove("verified");
+        atomic_write(&intent_path(), &serde_json::to_vec_pretty(&value)?).await?;
+
+        restore_on_service_start().await?;
+        *ARMED.lock().unwrap() = None;
+        restore_on_service_start().await?;
+
+        let armed = ARMED
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("must remain fail-closed");
+        assert!(armed.intent.is_verified());
+        assert_eq!(armed.intent.mode, KillSwitchStatusMode::Blocked);
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unverified_startup_intent_stays_blocked_until_core_and_dns_reconcile() -> Result<()> {
+        cleanup().await;
+        let mut intent = valid_intent(KillSwitchStatusMode::Blocked, true);
+        intent.verified = Some(false);
+        atomic_write(&intent_path(), &serde_json::to_vec_pretty(&intent)?).await?;
+        atomic_write(&dns_snapshot_path(), b"{ corrupt").await?;
+
+        restore_on_service_start().await?;
+
+        assert!(ARMED.lock().unwrap().is_some());
+        assert!(status().await.wanted);
+        assert!(tokio::fs::metadata(intent_path()).await.is_ok());
+
+        let error = retire_unverified_on_service_start()
+            .await
+            .expect_err("unproven DNS restoration must keep the startup barrier armed");
+        assert!(format!("{error:#}").contains("corrupt"));
+        assert!(ARMED.lock().unwrap().is_some());
+        assert!(tokio::fs::metadata(intent_path()).await.is_ok());
+        assert!(
+            tokio::fs::metadata(dns_snapshot_path()).await.is_ok(),
+            "failed DNS evidence must remain available for recovery"
+        );
+
+        tokio::fs::remove_file(dns_snapshot_path()).await?;
+        assert!(retire_unverified_on_service_start().await?);
+        assert!(ARMED.lock().unwrap().is_none());
+        assert!(tokio::fs::metadata(intent_path()).await.is_err());
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verified_startup_intent_is_never_retired_by_initial_attempt_cleanup() -> Result<()> {
+        cleanup().await;
+        let intent = valid_intent(KillSwitchStatusMode::Locked, true);
+        atomic_write(&intent_path(), &serde_json::to_vec_pretty(&intent)?).await?;
+
+        restore_on_service_start().await?;
+
+        assert!(!retire_unverified_on_service_start().await?);
+        assert!(ARMED.lock().unwrap().is_some());
+        assert!(tokio::fs::metadata(intent_path()).await.is_ok());
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_unowned_unverified_cleanup_cannot_resurrect_desired_core() -> Result<()> {
+        use crate::core::auth::AuthenticatedOwner;
+        use crate::{ClashConfig, CoreConfig, OwnerIdentity};
+
+        cleanup().await;
+        crate::core::desired::clear_active_owner().await?;
+        let owner = AuthenticatedOwner {
+            key: "legacy-unowned-wfp-owner".to_owned(),
+            identity: OwnerIdentity::Unix {
+                uid: 91_001,
+                gid: 20,
+            },
+            app_data_root: std::env::temp_dir(),
+        };
+        let config = ClashConfig {
+            core_config: CoreConfig {
+                core_path: "/tmp/legacy-unowned-core".to_owned(),
+                ..Default::default()
+            },
+            log_config: Default::default(),
+        };
+        crate::core::desired::persist_owner_core_started(&owner, &config).await?;
+        crate::core::desired::persist_active_owner(&owner).await?;
+
+        let mut intent = valid_intent(KillSwitchStatusMode::Blocked, true);
+        intent.verified = Some(false);
+        intent.owner_key = None;
+        atomic_write(&intent_path(), &serde_json::to_vec_pretty(&intent)?).await?;
+        restore_on_service_start().await?;
+
+        assert!(retire_unverified_on_service_start().await?);
+        assert!(crate::core::desired::load_active_owner().await?.is_none());
+        assert!(
+            !crate::core::desired::load_owner_desired_state(&owner.key)
+                .await?
+                .core_should_be_running
+        );
         cleanup().await;
         Ok(())
     }
@@ -1279,7 +1568,9 @@ mod tests {
             2
         );
 
-        // While the same armed session continues (any mode), the permits stay.
+        // Establish the logical session; while it continues (any mode), the permits stay.
+        lock(None).await?;
+        mark_verified("owner-alice").await?;
         restrict_bootstrap().await?;
         assert_eq!(
             ARMED

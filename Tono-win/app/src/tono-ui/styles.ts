@@ -9,6 +9,8 @@ export const TONO_CSS = `
   width: 100vw;
   height: 100vh;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 .tono-shell {
   position: relative;
@@ -21,6 +23,16 @@ export const TONO_CSS = `
   min-width: 0;
   overflow-y: auto;
   position: relative;
+  scrollbar-gutter: stable;
+}
+.tono-main::-webkit-scrollbar {
+  width: 8px;
+}
+.tono-main::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(128, 138, 164, 0.35);
+  background-clip: padding-box;
 }
 .tono-titlebar {
   position: absolute;
@@ -36,54 +48,71 @@ export const TONO_CSS = `
 
 /* Sidebar */
 .tono-sidebar {
-  width: 200px;
+  width: 190px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  padding: 14px 10px 16px;
+  padding: 18px 12px;
   box-sizing: border-box;
+  backdrop-filter: blur(12px) saturate(1.08);
+  -webkit-backdrop-filter: blur(12px) saturate(1.08);
 }
 .tono-brand {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 6px;
-  margin-bottom: 16px;
-  height: 22px;
+  gap: 10px;
+  padding: 0 10px;
+  margin-bottom: 22px;
+  height: 30px;
 }
 .tono-brand-name {
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.25px;
   flex: 1;
 }
 .tono-nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
 }
 .tono-nav__item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
-  padding: 7px 10px;
+  min-height: 40px;
+  padding: 9px 11px;
   border: none;
-  border-radius: 8px;
+  border-radius: 11px;
   background: transparent;
   font-family: inherit;
   font-size: 13px;
+  line-height: 1.2;
   text-align: left;
   cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+}
+.tono-nav__item:not([aria-current="page"]):hover {
+  background: rgba(128, 140, 170, 0.11) !important;
+}
+.tono-nav__item:focus-visible,
+.tono-button:focus-visible,
+.tono-link:focus-visible,
+.tono-pill:focus-visible,
+.tono-server-card:focus-visible {
+  outline: 2px solid rgba(75, 110, 255, 0.9);
+  outline-offset: 2px;
 }
 .tono-nav__icon {
-  width: 22px;
+  width: 20px;
   display: flex;
   justify-content: center;
   flex-shrink: 0;
 }
 .tono-nav__icon svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
 }
 .tono-nav__spacer {
   flex: 1;
@@ -109,11 +138,13 @@ export const TONO_CSS = `
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  padding: 32px 12px;
+  padding: 48px 40px 36px;
 }
 .tono-page-title {
-  font-size: 24px;
-  font-weight: 600;
+  font-size: 26px;
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.5px;
   margin: 0;
 }
 
@@ -138,7 +169,8 @@ export const TONO_CSS = `
   font-family: inherit;
   font-weight: 600;
   cursor: pointer;
-  transition: filter 0.15s ease, transform 0.1s ease, background 0.15s ease;
+  min-height: 36px;
+  transition: filter 0.15s ease, transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 .tono-button:disabled {
   cursor: default;
@@ -147,12 +179,53 @@ export const TONO_CSS = `
 .tono-button:not(:disabled):active {
   transform: scale(0.98);
 }
+.tono-button:not(:disabled):hover {
+  filter: brightness(1.06);
+}
 .tono-link {
   background: none;
   border: none;
   padding: 0;
   font-family: inherit;
   cursor: pointer;
+  border-radius: 7px;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+/* Dashboard */
+.tono-dashboard {
+  height: 100vh;
+  padding-top: 42px;
+}
+.tono-dashboard__content {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 24px 0;
+}
+.tono-pill:not(:disabled):hover {
+  transform: translateY(-2px);
+}
+.tono-pill:not(:disabled):active {
+  transform: translateY(0) scale(0.99);
+}
+.tono-server-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+.tono-server-card {
+  transition: transform 0.16s ease, background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.tono-server-card:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 28px -22px rgba(30, 45, 90, 0.6);
 }
 
 /* Settings rows */
@@ -194,5 +267,51 @@ export const TONO_CSS = `
   background: #ffffff;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   cursor: pointer;
+}
+
+@media (max-width: 760px) {
+  .tono-sidebar {
+    width: 168px;
+    padding-inline: 10px;
+  }
+  .tono-page {
+    padding: 44px 24px 28px;
+  }
+}
+
+@media (max-height: 680px) {
+  .tono-page {
+    padding-top: 38px;
+    padding-bottom: 24px;
+  }
+  .tono-dashboard__content {
+    justify-content: flex-start;
+    gap: 14px;
+    padding-block: 16px;
+  }
+}
+
+/* RDP, VM and accessibility mode: remove expensive compositing and non-essential motion. */
+@media (prefers-reduced-motion: reduce) {
+  .tono-root *,
+  .tono-root *::before,
+  .tono-root *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .tono-sidebar,
+  .tono-glass-card,
+  .tono-pill,
+  .tono-button,
+  .tono-server-card {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+  .tono-pill:hover,
+  .tono-server-card:hover {
+    transform: none !important;
+  }
 }
 `

@@ -133,6 +133,7 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; Installer icon
 !if "${INSTALLERICON}" != ""
   !define MUI_ICON "${INSTALLERICON}"
+  !define MUI_UNICON "${INSTALLERICON}"
 !endif
 
 ; Installer sidebar image
@@ -371,11 +372,8 @@ Function PageLeaveReinstall
   reinst_done:
 FunctionEnd
 
-; 5. Choose install directory page
-!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
-!insertmacro MUI_PAGE_DIRECTORY
-
-; 6. Start menu shortcut page
+; 5. Start menu shortcut page. Tono's privileged core allowlist requires the per-machine
+; Program Files location selected in .onInit, so do not offer an unsupported custom directory.
 Var AppStartMenuFolder
 !if "${STARTMENUFOLDER}" != ""
   !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
@@ -385,10 +383,10 @@ Var AppStartMenuFolder
 !endif
 !insertmacro MUI_PAGE_STARTMENU Application $AppStartMenuFolder
 
-; 7. Installation page
+; 6. Installation page
 !insertmacro MUI_PAGE_INSTFILES
 
-; 8. Finish page
+; 7. Finish page
 ;
 ; Don't auto jump to finish page after installation page,
 ; because the installation page has useful info that can be used debug any issues with the installer.
@@ -466,6 +464,10 @@ FunctionEnd
   !include "{{this}}"
 {{/each}}
 
+LangString legacyLocationAbort ${LANG_SIMPCHINESE} "检测到 ${PRODUCTNAME} 安装在不受支持的位置：$4$\r$\n$\r$\n此版本必须安装在 Program Files 中。请先卸载现有版本（不要勾选删除应用数据），然后重新运行此安装程序。"
+LangString legacyLocationAbort ${LANG_ENGLISH} "${PRODUCTNAME} is installed in an unsupported location: $4$\r$\n$\r$\nThis version must be installed under Program Files. Uninstall the existing version first (do not select Delete application data), then run this installer again."
+LangString legacyLocationAbort ${LANG_RUSSIAN} "${PRODUCTNAME} установлен в неподдерживаемой папке: $4$\r$\n$\r$\nЭта версия должна быть установлена в Program Files. Сначала удалите текущую версию (не выбирайте удаление данных приложения), затем снова запустите этот установщик."
+
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
@@ -503,26 +505,40 @@ Function .onInit
 
   !insertmacro SetContext
 
-  ${If} $INSTDIR == "${PLACEHOLDER_INSTALL_DIR}"
-    ; Set default install location
-    !if "${INSTALLMODE}" == "perMachine"
-      ${If} ${RunningX64}
-        !if "${ARCH}" == "x64"
-          StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"
-        !else if "${ARCH}" == "arm64"
-          StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"
-        !else
-          StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCTNAME}"
-        !endif
-      ${Else}
+  !if "${INSTALLMODE}" == "perMachine"
+    ; The privileged Service only trusts its core under Program Files. Force the supported
+    ; location even when /D= is passed, which bypasses NSIS's directory page handling.
+    ${If} ${RunningX64}
+      !if "${ARCH}" == "x64"
+        StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"
+      !else if "${ARCH}" == "arm64"
+        StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"
+      !else
         StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCTNAME}"
-      ${EndIf}
-    !else if "${INSTALLMODE}" == "currentUser"
-      StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"
-    !endif
+      !endif
+    ${Else}
+      StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCTNAME}"
+    ${EndIf}
 
-    Call RestorePreviousInstallLocation
-  ${EndIf}
+    ; Refuse to layer a second copy over a legacy custom-location install. Automatic migration
+    ; would leave its shortcuts and scheduled-task autostart pointing at the old executable.
+    ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
+    ${If} $4 != ""
+    ${AndIf} $4 != $INSTDIR
+      ${IfNot} ${Silent}
+        MessageBox MB_ICONSTOP "$(legacyLocationAbort)"
+      ${EndIf}
+      SetErrorLevel 5
+      Abort
+    ${EndIf}
+  !else
+    ${If} $INSTDIR == "${PLACEHOLDER_INSTALL_DIR}"
+      !if "${INSTALLMODE}" == "currentUser"
+        StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}"
+      !endif
+      Call RestorePreviousInstallLocation
+    ${EndIf}
+  !endif
 
 
   !if "${INSTALLMODE}" == "both"

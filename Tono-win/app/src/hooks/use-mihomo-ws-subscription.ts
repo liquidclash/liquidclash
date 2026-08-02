@@ -63,7 +63,7 @@ const closeSharedSocket = async (entry: SharedSubscriptionEntry) => {
   await ws.close()
 }
 
-const createSharedSubscriptionEntry = (
+export const createSharedSubscriptionEntry = (
   connect: () => Promise<MihomoWebSocket>,
 ): SharedSubscriptionEntry => {
   const entry: SharedSubscriptionEntry = {
@@ -101,15 +101,9 @@ const createSharedSubscriptionEntry = (
       syncSharedWsRefs(entry)
       clearReconnectTimer()
 
-      const owner = pickActiveOwner(entry)
-      if (owner?.onConnected) {
-        await owner.onConnected(ws)
-        if (entry.closed) {
-          await ws.close()
-          return
-        }
-      }
-
+      // Install the message listener before optional initialization. Otherwise messages emitted
+      // while `onConnected` awaits its snapshot can be lost, and an exception leaves a live
+      // socket with neither listener nor reconnect path.
       ws.addListener((msg: Message) => {
         if (msg.type !== 'Text') return
         const activeOwner = pickActiveOwner(entry)
@@ -117,10 +111,27 @@ const createSharedSubscriptionEntry = (
 
         activeOwner.handleMessage(msg.data)
       })
+
+      const owner = pickActiveOwner(entry)
+      if (owner?.onConnected) {
+        await owner.onConnected(ws)
+        if (entry.closed) {
+          await closeSharedSocket(entry)
+          return
+        }
+      }
     } catch (ignoreError) {
-      if (!entry.closed && !entry.ws) {
+      if (!entry.closed) {
         clearReconnectTimer()
-        entry.reconnectTimer = setTimeout(entry.connectWs, RECONNECT_DELAY_MS)
+        try {
+          await closeSharedSocket(entry)
+        } catch {
+          // State was cleared before close; reconnect remains safe even when the stale transport
+          // refuses its close handshake.
+        }
+        if (!entry.closed) {
+          entry.reconnectTimer = setTimeout(entry.connectWs, RECONNECT_DELAY_MS)
+        }
       }
     } finally {
       entry.connecting = false
@@ -131,9 +142,14 @@ const createSharedSubscriptionEntry = (
     if (entry.closed) return
 
     clearReconnectTimer()
-    await closeSharedSocket(entry)
-    if (!entry.closed) {
-      entry.reconnectTimer = setTimeout(entry.connectWs, RECONNECT_DELAY_MS)
+    try {
+      await closeSharedSocket(entry)
+    } catch {
+      // A broken socket must not be allowed to suppress its own reconnect.
+    } finally {
+      if (!entry.closed) {
+        entry.reconnectTimer = setTimeout(entry.connectWs, RECONNECT_DELAY_MS)
+      }
     }
   }
 
@@ -333,7 +349,9 @@ export const useMihomoWsSubscription = <T>(
         entry.activeOwner = null
         const nextOwner = pickActiveOwner(entry)
         if (entry.ws && nextOwner?.onConnected) {
-          void nextOwner.onConnected(entry.ws)
+          Promise.resolve(nextOwner.onConnected(entry.ws)).catch(() => {
+            void entry.scheduleReconnect()
+          })
         }
       }
 

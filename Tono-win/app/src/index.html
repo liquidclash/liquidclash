@@ -43,6 +43,38 @@
         background: var(--bg-color);
         z-index: 9999;
         transition: opacity 0.2s ease-out;
+        display: grid;
+        place-content: center;
+        justify-items: center;
+        gap: 14px;
+      }
+
+      #initial-loading-overlay::before {
+        content: 'Tono';
+        font: 600 24px/1 system-ui, sans-serif;
+        letter-spacing: 0.04em;
+      }
+
+      #initial-loading-overlay::after {
+        content: '';
+        width: 24px;
+        height: 24px;
+        border: 2px solid color-mix(in srgb, var(--text-color) 22%, transparent);
+        border-top-color: var(--text-color);
+        border-radius: 50%;
+        animation: tono-initial-spin 0.8s linear infinite;
+      }
+
+      @keyframes tono-initial-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #initial-loading-overlay::after {
+          animation-duration: 1.8s;
+        }
       }
 
       #initial-loading-overlay[data-hidden='true'] {

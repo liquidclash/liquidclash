@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use anyhow::Context as _;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -165,14 +167,39 @@ pub(super) fn is_process_alive(pid: u32) -> bool {
 
     #[cfg(windows)]
     {
-        let filter = format!("PID eq {pid}");
-        std::process::Command::new("tasklist")
-            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::Foundation::{
+            ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+        };
+
+        if pid == 0 {
+            return false;
+        }
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION
+                    | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if raw.is_null() {
+            // Invalid PID means gone. Access-denied or another inspection failure is treated as
+            // alive: startup reconciliation must fail closed rather than open the network around
+            // a process it could not prove had exited.
+            return std::io::Error::last_os_error().raw_os_error()
+                != Some(ERROR_INVALID_PARAMETER as i32);
+        }
+        // SAFETY: `OpenProcess` returned an owned process handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        match unsafe { WaitForSingleObject(handle.as_raw_handle() as HANDLE, 0) } {
+            WAIT_OBJECT_0 => false,
+            WAIT_TIMEOUT => true,
+            _ => true,
+        }
     }
 }
 
@@ -211,19 +238,58 @@ pub(super) async fn terminate_process(pid: u32) -> Result<()> {
     #[cfg(windows)]
     {
         warn!("Terminating process {}", pid);
-        let pid_arg = pid.to_string();
-        let status = std::process::Command::new("taskkill")
-            .args(["/PID", pid_arg.as_str(), "/T", "/F"])
-            .status()?;
-        if !status.success() && is_process_alive(pid) {
-            bail!("taskkill failed for process {pid} with status {status}");
+        tokio::task::spawn_blocking(move || terminate_process_windows(pid))
+            .await
+            .context("Windows process termination worker failed")??;
+        Ok(())
+    }
+}
+
+/// Native, locale-independent Windows process termination with a hard wait bound. This is the
+/// recovery path for a core left by an older Service; cores started by this build additionally
+/// live in a kill-on-close Job Object (see `manager.rs`).
+#[cfg(windows)]
+fn terminate_process_windows(pid: u32) -> Result<()> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    if pid == 0 {
+        return Ok(());
+    }
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(());
         }
-        for _ in 0..20 {
-            if !is_process_alive(pid) {
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        return Err(error).with_context(|| format!("failed to open process {pid} for termination"));
+    }
+    // SAFETY: `OpenProcess` returned an owned process handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    let raw = handle.as_raw_handle() as HANDLE;
+
+    if unsafe { TerminateProcess(raw, 1) } == 0 {
+        // The process may have exited between OpenProcess and TerminateProcess.
+        if unsafe { WaitForSingleObject(raw, 0) } != WAIT_OBJECT_0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to terminate process {pid}"));
         }
-        bail!("process {pid} is still alive after taskkill");
+    }
+    match unsafe { WaitForSingleObject(raw, 2_000) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => bail!("process {pid} did not terminate within 2 seconds"),
+        _ => Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed while waiting for process {pid} to terminate")),
     }
 }

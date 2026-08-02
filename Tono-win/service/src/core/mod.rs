@@ -9,7 +9,8 @@ pub use structure::{
     OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle, OwnerSessionProof,
     ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, ProxyEndpoint, ProxyProtocol, RemoteProvider,
     RuntimeAsset, RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
-    ServiceLifecycleState, ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome,
+    ServiceLifecycleState, ServiceOperationKind, ServiceOperationSnapshot, ServiceStatusSnapshot,
+    StageRejection, StageRuntimeOutcome,
     StartClashRequest, StartClashResult, StopClashOptions, StopClashPayload, WriterConfig,
     owner_key,
 };
@@ -41,6 +42,8 @@ mod manager;
 mod netmon;
 #[cfg(feature = "standalone")]
 mod owner;
+#[cfg(feature = "standalone")]
+mod operation;
 #[cfg(feature = "standalone")]
 mod process;
 #[cfg(feature = "standalone")]
@@ -89,6 +92,8 @@ pub use desired::{
     restore_desired_state,
 };
 #[cfg(feature = "standalone")]
+pub use dns::{initialize_status_cache as initialize_protected_dns_status, spawn_status_watchdog as spawn_protected_dns_watchdog};
+#[cfg(feature = "standalone")]
 pub use macos_kill_switch::{
     add_restored_kill_switch_tunnel, emergency_disarm_kill_switch, restore_kill_switch,
     spawn_kill_switch_watchdog,
@@ -122,5 +127,6 @@ pub use test_credentials::test_owner_credentials_for_uid;
 #[cfg(feature = "standalone")]
 pub use windows_kill_switch::{
     emergency_disarm_windows_kill_switch, relock_restored_tunnel,
+    retire_unverified_on_service_start as retire_unverified_windows_kill_switch,
     restore_on_service_start as restore_windows_kill_switch, spawn_windows_kill_switch_watchdog,
 };

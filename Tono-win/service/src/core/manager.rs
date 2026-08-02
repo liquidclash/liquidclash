@@ -1,6 +1,6 @@
 use crate::core::ClashConfig;
 use crate::core::logger::{get_writer, set_or_update_writer};
-use crate::core::process::process_identity;
+use crate::core::process::{process_identity, terminate_process};
 use crate::core::reconcile::ensure_startup_reconciled;
 use crate::core::runtime::{
     CoreRuntimeRecord, remove_core_runtime_record, write_core_runtime_record,
@@ -18,7 +18,7 @@ use std::process::Stdio;
 #[cfg(feature = "test")]
 use std::sync::Mutex as StdMutex;
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +30,13 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{error, info, warn};
+
+/// Core teardown must not hold the owner lifecycle lock indefinitely. On Windows the Job Object
+/// terminates the whole tree; this bound is only the confirmation wait for the direct child.
+const CORE_TERMINATION_TIMEOUT: Duration = Duration::from_secs(3);
+/// A watchdog normally exits immediately after its shutdown signal. This catches a task stuck in
+/// restart preparation or an OS wait, then falls back to PID-based termination and reconciliation.
+const WATCHDOG_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct CoreExitInfo {
@@ -64,6 +71,92 @@ impl CoreExitInfo {
 pub struct ChildGuard {
     child: Option<Child>,
     readers: Vec<JoinHandle<()>>,
+    #[cfg(windows)]
+    job: Option<WindowsCoreJob>,
+}
+
+/// Every Windows core belongs to a private kill-on-close Job Object. Closing the Service, aborting
+/// the watchdog, or dropping a partially initialized guard therefore terminates Mihomo and any
+/// descendants without shelling out to localized `taskkill` output.
+#[cfg(windows)]
+struct WindowsCoreJob(std::os::windows::io::OwnedHandle);
+
+#[cfg(windows)]
+impl WindowsCoreJob {
+    fn attach(pid: u32) -> Result<Self> {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw_job.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create core Job Object");
+        }
+        // SAFETY: `CreateJobObjectW` returned a new owned handle.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw_job.cast()) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle() as HANDLE,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to configure kill-on-close core Job Object");
+        }
+
+        let raw_process = unsafe {
+            OpenProcess(
+                PROCESS_SET_QUOTA
+                    | PROCESS_TERMINATE
+                    | PROCESS_QUERY_LIMITED_INFORMATION
+                    | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if raw_process.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open core process {pid} for Job assignment"));
+        }
+        // SAFETY: `OpenProcess` returned a new owned handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw_process.cast()) };
+        if unsafe {
+            AssignProcessToJobObject(
+                job.as_raw_handle() as HANDLE,
+                process.as_raw_handle() as HANDLE,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to assign core process {pid} to Job Object"));
+        }
+        Ok(Self(job))
+    }
+
+    fn terminate(&self) -> Result<()> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.0.as_raw_handle() as HANDLE, 1) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to terminate core Job Object");
+        }
+        Ok(())
+    }
 }
 
 impl ChildGuard {
@@ -86,11 +179,37 @@ impl ChildGuard {
 
         if let Some(child) = self.child.as_mut() {
             let child_id = child.id();
+            #[cfg(windows)]
+            if let Some(job) = self.job.as_ref() {
+                if let Err(error) = job.terminate() {
+                    warn!(
+                        "Job Object termination failed; falling back to direct core kill: {error:#}"
+                    );
+                    child
+                        .start_kill()
+                        .with_context(|| format!("failed to kill child {child_id:?}"))?;
+                }
+            } else {
+                child
+                    .start_kill()
+                    .with_context(|| format!("failed to kill child {child_id:?}"))?;
+            }
+            #[cfg(not(windows))]
             child
-                .kill()
-                .await
+                .start_kill()
                 .with_context(|| format!("failed to kill child {child_id:?}"))?;
+
+            tokio::time::timeout(CORE_TERMINATION_TIMEOUT, child.wait())
+                .await
+                .with_context(|| {
+                    format!(
+                        "child {child_id:?} did not terminate within {CORE_TERMINATION_TIMEOUT:?}"
+                    )
+                })?
+                .with_context(|| format!("failed to wait for child {child_id:?}"))?;
             self.child.take();
+            #[cfg(windows)]
+            self.job.take();
             info!("Successfully killed child ({:?})", child_id);
         } else {
             info!("No running core process found");
@@ -265,13 +384,27 @@ pub struct CoreManager {
     failed_child: Arc<Mutex<Option<ChildGuard>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct CoreStatusSnapshot {
     pub(super) core_pid: Option<u32>,
     pub(super) core_started_at: Option<u64>,
     pub(super) last_core_exit_reason: Option<String>,
     pub(super) restart_count: u32,
     pub(super) last_recovery_at: Option<u64>,
+}
+
+/// Last fully collected core state. `/status` uses this when a Start/Stop handler currently owns
+/// the outer manager lock, so a diagnostic read never joins a potentially long process teardown.
+static LAST_CORE_STATUS: Lazy<RwLock<CoreStatusSnapshot>> =
+    Lazy::new(|| RwLock::new(CoreStatusSnapshot::default()));
+
+pub(super) async fn status_snapshot_nonblocking() -> CoreStatusSnapshot {
+    let Ok(manager) = CORE_MANAGER.try_lock() else {
+        return LAST_CORE_STATUS.read().unwrap().clone();
+    };
+    let snapshot = manager.status().await;
+    *LAST_CORE_STATUS.write().unwrap() = snapshot.clone();
+    snapshot
 }
 
 impl CoreManager {
@@ -671,9 +804,27 @@ impl CoreManager {
             let _ = shutdown_tx.send(());
         }
 
-        if let Some(handle) = self.watchdog_handle.lock().await.take() {
-            handle.await.context("watchdog task failed to join")??;
-            info!("Watchdog stopped");
+        if let Some(mut handle) = self.watchdog_handle.lock().await.take() {
+            match tokio::time::timeout(WATCHDOG_JOIN_TIMEOUT, &mut handle).await {
+                Ok(joined) => {
+                    joined.context("watchdog task failed to join")??;
+                    info!("Watchdog stopped");
+                }
+                Err(_) => {
+                    warn!(
+                        "Core watchdog did not stop within {WATCHDOG_JOIN_TIMEOUT:?}; aborting and reconciling the process"
+                    );
+                    handle.abort();
+                    let _ = handle.await;
+                    let pid = self.running_pid.load(Ordering::Acquire);
+                    if pid != 0 {
+                        terminate_process(pid).await.with_context(|| {
+                            format!("failed to terminate core {pid} after watchdog timeout")
+                        })?;
+                    }
+                    info!("Watchdog aborted and core process reconciled");
+                }
+            }
         }
 
         Ok(())
@@ -760,7 +911,28 @@ pub async fn run_with_logging(
     let mut child_guard = ChildGuard {
         child: Some(child),
         readers: Vec::new(),
+        #[cfg(windows)]
+        job: None,
     };
+
+    #[cfg(windows)]
+    {
+        let pid = child_guard
+            .id()
+            .context("spawned Windows core did not expose a PID")?;
+        match WindowsCoreJob::attach(pid) {
+            Ok(job) => child_guard.job = Some(job),
+            Err(error) => {
+                let cleanup = child_guard.kill_now().await;
+                return Err(match cleanup {
+                    Ok(()) => error.context("failed to contain Windows core in a Job Object"),
+                    Err(cleanup) => anyhow!(
+                        "failed to contain Windows core in a Job Object: {error:#}; cleanup also failed: {cleanup:#}"
+                    ),
+                });
+            }
+        }
+    }
 
     let (Some(stdout), Some(stderr)) = (
         child_guard.inner().and_then(|c| c.stdout.take()),

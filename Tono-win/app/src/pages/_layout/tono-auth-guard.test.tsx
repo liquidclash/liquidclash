@@ -45,12 +45,14 @@ const {
   tonoSignInStartMock,
   tonoSignInVerifyMock,
   tonoRetryRestoreMock,
+  tonoDisconnectMock,
 } = vi.hoisted(() => ({
   tonoStatusMock: vi.fn(),
   subscribeTonoStatusMock: vi.fn((_handler: unknown) => () => {}),
   tonoSignInStartMock: vi.fn(),
   tonoSignInVerifyMock: vi.fn(),
   tonoRetryRestoreMock: vi.fn(),
+  tonoDisconnectMock: vi.fn(),
 }))
 
 vi.mock('@/services/tono', () => ({
@@ -59,6 +61,7 @@ vi.mock('@/services/tono', () => ({
   tonoSignInStart: tonoSignInStartMock,
   tonoSignInVerify: tonoSignInVerifyMock,
   tonoRetryRestore: tonoRetryRestoreMock,
+  tonoDisconnect: tonoDisconnectMock,
   TONO_STATUS_EVENT: 'tono://status',
 }))
 
@@ -109,6 +112,7 @@ beforeEach(() => {
   tonoSignInStartMock.mockReset()
   tonoSignInVerifyMock.mockReset()
   tonoRetryRestoreMock.mockReset()
+  tonoDisconnectMock.mockReset().mockResolvedValue(undefined)
 })
 
 afterEach(async () => {
@@ -200,6 +204,83 @@ describe('TonoAuthGuard', () => {
 })
 
 describe('login flow under status pushes', () => {
+  it('can restore normal internet from the signed-out login screen', async () => {
+    tonoStatusMock.mockResolvedValue({
+      ...statusPayload('signedOut'),
+      uiState: 'protectedOffline',
+      protectionBlocked: true,
+      killSwitch: {
+        wanted: true,
+        live: true,
+        mode: 'blocked',
+        endpoints: [],
+        last_error: null,
+      },
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/login']}>
+        <TonoAuthGuard>
+          <LoginPage />
+        </TonoAuthGuard>
+      </MemoryRouter>,
+      { wrapper: freshSWR },
+    )
+
+    const restoreButton = await screen.findByRole('button', {
+      name: 'tono.login.networkBlocked.restore',
+    })
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'tono.login.sendCode',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true)
+    fireEvent.click(restoreButton)
+
+    await waitFor(() => expect(tonoDisconnectMock).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(tonoStatusMock).toHaveBeenCalledTimes(2))
+    expect(tonoSignInStartMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps the login recovery visible when releasing protection fails', async () => {
+    tonoDisconnectMock.mockRejectedValue(new Error('kill switch still armed'))
+    tonoStatusMock.mockResolvedValue({
+      ...statusPayload('error'),
+      protectionBlocked: true,
+      killSwitch: {
+        wanted: true,
+        live: true,
+        mode: 'blocked',
+        endpoints: [],
+        last_error: null,
+      },
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/login']}>
+        <TonoAuthGuard>
+          <LoginPage />
+        </TonoAuthGuard>
+      </MemoryRouter>,
+      { wrapper: freshSWR },
+    )
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: 'tono.login.networkBlocked.restore',
+      }),
+    )
+
+    await screen.findByText('kill switch still armed')
+    expect(
+      screen.getByRole('button', {
+        name: 'tono.login.networkBlocked.restore',
+      }),
+    ).toBeDefined()
+  })
+
   it('keeps the sign-in form mounted when the backend flips to authenticating', async () => {
     // The P0 regression: requesting a code makes the backend emit
     // `authenticating`; mapping that to the loading placeholder unmounted the
@@ -242,9 +323,7 @@ describe('login flow under status pushes', () => {
       'tono.login.emailPlaceholder',
     )) as HTMLInputElement
     fireEvent.change(emailInput, { target: { value: 'tester@example.com' } })
-    fireEvent.click(
-      screen.getByRole('button', { name: 'tono.login.sendCode' }),
-    )
+    fireEvent.click(screen.getByRole('button', { name: 'tono.login.sendCode' }))
 
     await waitFor(() => expect(tonoSignInStartMock).toHaveBeenCalled())
     const codeInput = await screen.findByPlaceholderText(

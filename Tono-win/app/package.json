@@ -1,6 +1,6 @@
 {
   "name": "tono-windows",
-  "version": "2.5.3",
+  "version": "2.5.4",
   "license": "GPL-3.0-only",
   "scripts": {
     "prepare": "husky || true",
@@ -23,6 +23,7 @@
     "portable-fixed-webview2": "node scripts/portable-fixed-webview2.mjs",
     "fix-alpha-version": "node scripts/fix-alpha_version.mjs",
     "release-version": "node scripts/release-version.mjs",
+    "release:preflight": "node scripts/windows-release-preflight.mjs",
     "release:autobuild": "pnpm release-version autobuild",
     "release:deploytest": "pnpm release-version deploytest",
     "publish-version": "node scripts/publish-version.mjs",
@@ -37,7 +38,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:dev-control": "node --test scripts/dev-control.test.mjs scripts/service-release.test.mjs",
+    "test:dev-control": "node --test scripts/dev-control.test.mjs scripts/service-release.test.mjs scripts/windows-packaging.test.mjs",
     "knip:check": "knip",
     "knip:report": "knip --no-exit-code"
   },

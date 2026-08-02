@@ -5,11 +5,18 @@
 //! Long-running work (catalog sync, reconnect backoff, network monitoring)
 //! lives in spawned tasks whose abort handles are registered here.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, Mutex as StdMutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::KillSwitchStatus;
 use tauri::async_runtime::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tono_core::{
     CatalogTracker,
     auth::{ApiClient, User, new_installation_id},
@@ -25,6 +32,50 @@ use crate::{
 
 /// Concrete account API client used across the product layer.
 pub type TonoApiClient = ApiClient<TonoTransport, SessionCredentialStore>;
+
+/// One explicit DNS/Core/WFP release shared by Disconnect, Sign Out, Quit, and startup
+/// reconciliation. The result lives outside `TonoInner`, so waiting for it never holds the large
+/// product-state mutex. `Notify` also lets a later caller join an operation whose original UI
+/// waiter already timed out without launching a second, racing release.
+pub struct ReleaseOperation {
+    id: u64,
+    result: StdMutex<Option<std::result::Result<(), String>>>,
+    notify: tokio::sync::Notify,
+}
+
+impl ReleaseOperation {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            result: StdMutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn complete(&self, result: std::result::Result<(), String>) {
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+        self.notify.notify_waiters();
+    }
+
+    pub async fn wait(&self) -> std::result::Result<(), String> {
+        loop {
+            // Register before reading the result so completion cannot slip between the check and
+            // the await. `enable` is required for `notify_waiters`: merely constructing a
+            // `Notified` future does not enroll it until its first poll.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = self.result.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+                return result;
+            }
+            notified.as_mut().await;
+        }
+    }
+}
 
 /// Account state machine (product-contract.md §2, macOS parity):
 /// `restoring → signedOut | authenticating | ready | suspended | error`.
@@ -94,11 +145,6 @@ impl TaskRegistry {
         self.abort_network_monitor();
         self.abort_switch();
     }
-
-    pub fn abort_all(&mut self) {
-        self.abort_catalog_sync();
-        self.abort_connection_tasks();
-    }
 }
 
 pub struct TonoInner {
@@ -139,10 +185,18 @@ pub struct TonoInner {
     pub network_events_counter: Option<u64>,
     /// Per-start controller secret of the running runtime (memory only, §5).
     pub controller_secret: Option<String>,
+    /// Per-generation loopback controller port. It is chosen before each first Core start and
+    /// reused by the optional policy restart, so another local proxy cannot hold Tono hostage on
+    /// a globally fixed 9090 listener.
+    pub controller_port: Option<u16>,
     /// Connect transaction generation. Disconnect, sign-out, and node
     /// switches bump it; an in-flight attempt re-checks it at every stage
     /// boundary and exits without side effects when it moved.
     pub connect_generation: u64,
+    /// Immediate cancellation signal for read-only/current-stage work. Privileged IPC mutations
+    /// are deliberately detached and reconcile after commit, but the user-facing transaction no
+    /// longer waits for them after Disconnect, node replacement, Quit, or its absolute deadline.
+    pub connect_cancellation: CancellationToken,
     /// The intent of the latest generation bump (H-1): `true` when the
     /// bumper releases the barrier (disconnect / sign-out / quit), `false`
     /// when it re-arms or keeps blocking (node switch, catalog teardown).
@@ -180,6 +234,17 @@ pub struct TonoInner {
 }
 
 impl TonoInner {
+    /// Retire the current connection generation and wake every stage waiting on its cancellation
+    /// token. `release_on_stale` preserves the existing late-commit contract: releasing flows
+    /// patch a late arm; protected reconnect/switch flows keep the barrier.
+    pub fn invalidate_connection(&mut self, release_on_stale: bool) {
+        self.connect_generation = self.connect_generation.wrapping_add(1);
+        self.release_on_stale = release_on_stale;
+        self.connect_cancellation.cancel();
+        self.connect_cancellation = CancellationToken::new();
+        self.tasks.abort_connection_tasks();
+    }
+
     /// Build the on-disk catalog cache rooted at the state's directory.
     pub fn catalog_cache(&self) -> CatalogCache {
         catalog_cache_at(&self.catalog_dir)
@@ -198,6 +263,12 @@ impl TonoInner {
 pub struct TonoState {
     inner: tokio::sync::Mutex<TonoInner>,
     audit: Arc<crate::tono::audit::Audit>,
+    release_operation: tokio::sync::Mutex<Option<Arc<ReleaseOperation>>>,
+    /// A late StartClash or DNS-enable commit must settle before explicit release reaches the
+    /// Service. Connect mutations hold a read guard inside their detached reconciliation task;
+    /// the one release worker holds the write guard through the atomic Service release.
+    privileged_transition: Arc<tokio::sync::RwLock<()>>,
+    next_release_id: AtomicU64,
 }
 
 impl TonoState {
@@ -243,7 +314,9 @@ impl TonoState {
                 kill_switch: None,
                 network_events_counter: None,
                 controller_secret: None,
+                controller_port: None,
                 connect_generation: 0,
+                connect_cancellation: CancellationToken::new(),
                 release_on_stale: false,
                 last_core_pid: None,
                 last_restart_count: None,
@@ -260,6 +333,9 @@ impl TonoState {
                 tasks: TaskRegistry::default(),
             }),
             audit,
+            release_operation: tokio::sync::Mutex::new(None),
+            privileged_transition: Arc::new(tokio::sync::RwLock::new(())),
+            next_release_id: AtomicU64::new(1),
         })
     }
 
@@ -269,6 +345,38 @@ impl TonoState {
 
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, TonoInner> {
         self.inner.lock().await
+    }
+
+    /// Start one release or join the already-running one. The boolean is true only for the caller
+    /// responsible for spawning the supervisor.
+    pub async fn begin_release(&self) -> (Arc<ReleaseOperation>, bool) {
+        let mut slot = self.release_operation.lock().await;
+        if let Some(operation) = slot.as_ref() {
+            return (Arc::clone(operation), false);
+        }
+        let id = self.next_release_id.fetch_add(1, Ordering::Relaxed);
+        let operation = Arc::new(ReleaseOperation::new(id));
+        *slot = Some(Arc::clone(&operation));
+        (operation, true)
+    }
+
+    pub async fn finish_release(&self, id: u64) {
+        let mut slot = self.release_operation.lock().await;
+        if slot.as_ref().is_some_and(|operation| operation.id() == id) {
+            slot.take();
+        }
+    }
+
+    pub async fn release_in_progress(&self) -> bool {
+        self.release_operation.lock().await.is_some()
+    }
+
+    pub async fn begin_connect_mutation(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.privileged_transition).read_owned().await
+    }
+
+    pub async fn begin_privileged_release(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        Arc::clone(&self.privileged_transition).write_owned().await
     }
 }
 
@@ -676,7 +784,8 @@ impl Drop for CurrentUserSid {
 
 #[cfg(test)]
 mod tests {
-    use super::AccountState;
+    use super::{AccountState, ReleaseOperation};
+    use std::{sync::Arc, time::Duration};
 
     #[test]
     fn account_state_keys_are_stable() {
@@ -686,5 +795,29 @@ mod tests {
         assert_eq!(AccountState::Ready.key(), "ready");
         assert_eq!(AccountState::Suspended.key(), "suspended");
         assert_eq!(AccountState::Error("x".to_string()).key(), "error");
+    }
+
+    #[tokio::test]
+    async fn release_operation_wakes_every_joiner_and_replays_the_result() {
+        let operation = Arc::new(ReleaseOperation::new(7));
+        let first = tokio::spawn({
+            let operation = Arc::clone(&operation);
+            async move { operation.wait().await }
+        });
+        let second = tokio::spawn({
+            let operation = Arc::clone(&operation);
+            async move { operation.wait().await }
+        });
+        tokio::task::yield_now().await;
+        operation.complete(Err("kept protected".to_string()));
+
+        for waiter in [first, second] {
+            let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("every registered waiter must wake")
+                .expect("waiter task must not fail");
+            assert_eq!(result, Err("kept protected".to_string()));
+        }
+        assert_eq!(operation.wait().await, Err("kept protected".to_string()));
     }
 }

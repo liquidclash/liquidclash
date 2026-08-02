@@ -1,6 +1,6 @@
 [package]
 name = "clash_verge_service_ipc"
-version = "2.6.1"
+version = "2.6.2"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
@@ -97,6 +97,9 @@ test = [
     "tracing",
     "tracing-subscriber/env-filter",
     "tracing-log",
+    # Unit tests in structure/auth wire types need JSON round-trips even when
+    # the full standalone/client surface is not enabled for a focused check.
+    "serde_json",
 ]
 default = []
 
@@ -144,6 +147,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Registry",

@@ -105,9 +105,24 @@ pub fn total_elapsed_ms(steps: &[StepRecord]) -> Option<u64> {
     any.then_some(total)
 }
 
+/// Clone the stored transaction record and add a live duration to its in-flight step. Stored
+/// records remain transition-only; this read-time projection lets diagnostics visibly advance
+/// while a Service operation is slow.
+pub fn snapshot_with_current_elapsed(steps: &[StepRecord], current_elapsed_ms: Option<u64>) -> Vec<StepRecord> {
+    let mut snapshot = steps.to_vec();
+    if let Some(elapsed_ms) = current_elapsed_ms
+        && let Some(current) = snapshot.iter_mut().find(|step| step.state == StepState::Current)
+    {
+        current.elapsed_ms = Some(elapsed_ms);
+    }
+    snapshot
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StepState, advance, complete_all, fail_current, initial_steps, total_elapsed_ms};
+    use super::{
+        StepState, advance, complete_all, fail_current, initial_steps, snapshot_with_current_elapsed, total_elapsed_ms,
+    };
     use tono_core::connection::ConnectStage;
 
     #[test]
@@ -182,5 +197,19 @@ mod tests {
         complete_all(&mut steps, 20);
         assert!(steps.iter().all(|step| step.state == StepState::Completed));
         assert_eq!(total_elapsed_ms(&steps), Some(30));
+    }
+
+    #[test]
+    fn progress_snapshot_includes_live_current_step_elapsed() {
+        let mut steps = initial_steps();
+        advance(&mut steps, ConnectStage::PreparingService, 10);
+        advance(&mut steps, ConnectStage::StartingKillSwitch, 20);
+
+        let snapshot = snapshot_with_current_elapsed(&steps, Some(3_000));
+
+        assert_eq!(steps[2].elapsed_ms, None);
+        assert_eq!(snapshot[2].state, StepState::Current);
+        assert_eq!(snapshot[2].elapsed_ms, Some(3_000));
+        assert_eq!(total_elapsed_ms(&snapshot), Some(3_030));
     }
 }

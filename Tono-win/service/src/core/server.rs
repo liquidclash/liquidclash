@@ -11,6 +11,7 @@ use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::set_or_update_writer;
 use crate::core::macos_kill_switch;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
+use crate::core::operation::OperationGuard;
 use crate::core::paths::service_paths;
 use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, stage_runtime};
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
@@ -21,8 +22,8 @@ use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, dns, validate
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, KillSwitchLockRequest,
     MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig, OwnerSessionHandle, ProtocolInfo,
-    ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, SERVICE_PROTOCOL_HEADER, StartClashRequest,
-    StartClashResult, StopClashPayload, WriterConfig,
+    ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, SERVICE_PROTOCOL_HEADER,
+    ServiceOperationKind, StartClashRequest, StartClashResult, StopClashPayload, WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -688,11 +689,9 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(authenticated) => authenticated,
                 ControlFlow::Break(response) => return response,
             };
-            let _lifecycle_guard =
-                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::Unchecked).await {
-                    ControlFlow::Continue(guard) => guard,
-                    ControlFlow::Break(response) => return response,
-                };
+            // Authenticated diagnostics deliberately do not join the lifecycle writer queue.
+            // The aggregate carries `active_operation` and uses committed/cached subsystem
+            // snapshots when a mutation is in flight.
             match service_status_snapshot(&owner).await {
                 Ok(status) => ok_json(status),
                 Err(error) => {
@@ -716,18 +715,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetKillSwitchStatus.as_ref(), |ctx| async move {
             trace!("Received GetKillSwitchStatus command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
+            let (_request, _owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
                 ControlFlow::Continue(authenticated) => authenticated,
                 ControlFlow::Break(response) => return response,
             };
-            // Unchecked: status is part of the disconnect/Protected Offline surface, which
-            // must stay readable after a stop cleared the active-owner record. Identity was
-            // already proven by `authenticate_owner`; the lifecycle lock is still held.
-            let _lifecycle_guard =
-                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::Unchecked).await {
-                    ControlFlow::Continue(guard) => guard,
-                    ControlFlow::Break(response) => return response,
-                };
+            // Status must remain readable while Start/Stop/DNS/WFP owns the lifecycle writer.
             ok_json(windows_kill_switch::status().await)
         })
         .post(IpcCommand::LockKillSwitch.as_ref(), |ctx| async move {
@@ -749,9 +741,37 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
+            let _operation_guard =
+                OperationGuard::begin(ServiceOperationKind::LockKillSwitch, IPC_HANDLER_TIMEOUT);
             match windows_kill_switch::lock(request.payload.tunnel_interface.as_deref()).await {
                 Ok(()) => ok_empty("Kill switch locked"),
                 Err(error) => service_unavailable(format!("Failed to lock kill switch: {error:#}")),
+            }
+        })
+        .post(IpcCommand::MarkKillSwitchVerified.as_ref(), |ctx| async move {
+            trace!("Received MarkKillSwitchVerified command");
+            let (request, owner) = match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx) {
+                ControlFlow::Continue(authenticated) => authenticated,
+                ControlFlow::Break(response) => return response,
+            };
+            let _lifecycle_guard = match enter_owner_lifecycle(
+                &owner,
+                OwnerLifecycleGate::ActiveSession(&request.session),
+            )
+            .await
+            {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
+            };
+            let _operation_guard = OperationGuard::begin(
+                ServiceOperationKind::VerifyKillSwitch,
+                IPC_HANDLER_TIMEOUT,
+            );
+            match windows_kill_switch::mark_verified(&owner.key).await {
+                Ok(()) => ok_empty("Kill switch session marked verified"),
+                Err(error) => service_unavailable(format!(
+                    "Failed to mark kill switch session verified: {error:#}"
+                )),
             }
         })
         .post(IpcCommand::RestrictKillSwitchBootstrap.as_ref(), |ctx| async move {
@@ -769,6 +789,10 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Continue(guard) => guard,
                     ControlFlow::Break(response) => return response,
                 };
+            let _operation_guard = OperationGuard::begin(
+                ServiceOperationKind::RestrictKillSwitch,
+                IPC_HANDLER_TIMEOUT,
+            );
             match windows_kill_switch::restrict_bootstrap().await {
                 Ok(()) => ok_empty("Kill switch restricted to the bootstrap recovery channel"),
                 Err(error) => {
@@ -791,6 +815,10 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Continue(guard) => guard,
                     ControlFlow::Break(response) => return response,
                 };
+            let _operation_guard = OperationGuard::begin(
+                ServiceOperationKind::ReleaseKillSwitch,
+                IPC_HANDLER_TIMEOUT,
+            );
             #[cfg(windows)]
             {
                 // Make the owner-gated release a complete last-resort Disconnect. The App may
@@ -843,6 +871,8 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
+            let _operation_guard =
+                OperationGuard::begin(ServiceOperationKind::EnableDns, IPC_HANDLER_TIMEOUT);
             match dns::enable().await {
                 Ok(status) => ok_json(status),
                 Err(error) => service_unavailable(format!("Failed to enable protected DNS: {error:#}")),
@@ -862,6 +892,8 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Continue(guard) => guard,
                     ControlFlow::Break(response) => return response,
                 };
+            let _operation_guard =
+                OperationGuard::begin(ServiceOperationKind::RestoreDns, IPC_HANDLER_TIMEOUT);
             match dns::restore_protected().await {
                 Ok(status) => ok_json(status),
                 Err(error) => service_unavailable(format!("Failed to restore DNS: {error:#}")),
@@ -869,17 +901,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetProtectedDnsStatus.as_ref(), |ctx| async move {
             trace!("Received GetProtectedDnsStatus command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
+            let (_request, _owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
                 ControlFlow::Continue(authenticated) => authenticated,
                 ControlFlow::Break(response) => return response,
             };
-            // Unchecked: readable on the disconnect/Protected Offline path, like
-            // `/kill-switch/status` — after a stop cleared the owner record.
-            let _lifecycle_guard =
-                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::Unchecked).await {
-                    ControlFlow::Continue(guard) => guard,
-                    ControlFlow::Break(response) => return response,
-                };
+            // Authenticated and lock-free: the DNS watchdog/mutations publish this snapshot.
             ok_json(dns::status().await)
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
@@ -919,6 +945,8 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Continue(guard) => guard,
                     ControlFlow::Break(response) => return response,
                 };
+            let _operation_guard =
+                OperationGuard::begin(ServiceOperationKind::StartCore, IPC_HANDLER_TIMEOUT);
             let previous_owner = match load_active_owner().await {
                 Ok(owner) => owner,
                 Err(error) => {
@@ -1066,6 +1094,8 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
+            let _operation_guard =
+                OperationGuard::begin(ServiceOperationKind::StopCore, IPC_HANDLER_TIMEOUT);
             if let Err(error) = clear_proxy_with_direct_compensation().await {
                 return service_error(error);
             }
@@ -1123,6 +1153,8 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
+            let _operation_guard =
+                OperationGuard::begin(ServiceOperationKind::StageRuntime, IPC_HANDLER_TIMEOUT);
             match stage_runtime(&owner, &request.payload).await {
                 Ok(outcome) => ok_json(outcome),
                 Err(error) => service_error(error),
@@ -1145,6 +1177,8 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
+            let _operation_guard =
+                OperationGuard::begin(ServiceOperationKind::UpdateWriter, IPC_HANDLER_TIMEOUT);
             // The client does not get to choose where the service writes: whatever it sent is
             // replaced with the owner's own log directory.
             writer_config.directory = service_paths()
@@ -1182,6 +1216,10 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
+            let _operation_guard = OperationGuard::begin(
+                ServiceOperationKind::SetSystemProxy,
+                IPC_HANDLER_TIMEOUT,
+            );
             if let Err(error) = validate_proxy_config(&request.payload) {
                 return service_error(ServiceError::invalid_proxy_config(error.to_string()));
             }
@@ -1238,6 +1276,7 @@ async fn release_kill_switch_for_platform() -> Result<HttpResponse> {
             let (wanted, live, _mode) = macos_kill_switch::status().await;
             ok_json(crate::KillSwitchStatus {
                 wanted,
+                verified: false,
                 live,
                 mode: crate::KillSwitchStatusMode::Blocked,
                 endpoints: Vec::new(),

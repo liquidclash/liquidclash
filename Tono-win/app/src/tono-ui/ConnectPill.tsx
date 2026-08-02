@@ -7,10 +7,9 @@ import { TONO_COLORS, TONO_EASE, tonoText } from './theme'
 import { TonoLogo } from './TonoLogo'
 
 /**
- * ConnectPill — the centerpiece of the Tono dashboard, pixel-matched to
- * ConnectPill.swift: a 240×72 glass capsule with a radial halo behind the
- * mark, a five-state color system, and easeOut(0.22) transitions. No
- * breathing, no rotation.
+ * ConnectPill — the primary dashboard action. The wider desktop target keeps
+ * the five-state color system while making the click affordance and live stage
+ * text legible at Windows display scaling.
  */
 
 interface StateSpec {
@@ -26,18 +25,18 @@ interface StateSpec {
 
 const STATE_SPECS: Record<TonoUiState, StateSpec> = {
   notConnected: {
-    color: TONO_COLORS.notConnected,
-    glowOpacity: 0.48,
-    glowScale: 0.96,
+    color: TONO_COLORS.accent,
+    glowOpacity: 0.18,
+    glowScale: 1,
     titleKey: 'tono.pill.title.notConnected',
     titleColored: false,
     indicator: 'dot',
     disabled: false,
   },
   connecting: {
-    color: TONO_COLORS.connecting,
-    glowOpacity: 0.78,
-    glowScale: 1.08,
+    color: TONO_COLORS.accent,
+    glowOpacity: 0.26,
+    glowScale: 1.03,
     titleKey: 'tono.pill.title.connecting',
     titleColored: true,
     indicator: 'spinner',
@@ -45,8 +44,8 @@ const STATE_SPECS: Record<TonoUiState, StateSpec> = {
   },
   connected: {
     color: TONO_COLORS.connected,
-    glowOpacity: 0.78,
-    glowScale: 1.08,
+    glowOpacity: 0.25,
+    glowScale: 1.03,
     titleKey: 'tono.pill.title.connected',
     titleColored: true,
     indicator: 'dot',
@@ -54,17 +53,17 @@ const STATE_SPECS: Record<TonoUiState, StateSpec> = {
   },
   protectedOffline: {
     color: TONO_COLORS.protectedOffline,
-    glowOpacity: 0.48,
-    glowScale: 0.96,
+    glowOpacity: 0.22,
+    glowScale: 1,
     titleKey: 'tono.pill.title.protectedOffline',
     titleColored: true,
     indicator: 'dot',
     disabled: false,
   },
   disconnecting: {
-    color: TONO_COLORS.connecting,
-    glowOpacity: 0.78,
-    glowScale: 1.08,
+    color: TONO_COLORS.accent,
+    glowOpacity: 0.24,
+    glowScale: 1.03,
     titleKey: 'tono.pill.title.disconnecting',
     titleColored: true,
     indicator: 'spinner',
@@ -77,13 +76,6 @@ const hex = (color: string, alpha: number) =>
     .toString(16)
     .padStart(2, '0')
     .toUpperCase()}`
-
-/** 96×96 halo: clear inner radius 12 → main color at 0.72 by radius 44. */
-const haloBackground = (color: string) =>
-  `radial-gradient(circle 44px at 50% 50%, ${hex(color, 0)} 12px, ${hex(
-    color,
-    0.18,
-  )} 22px, ${hex(color, 0.48)} 33px, ${hex(color, 0.72)} 44px)`
 
 interface ConnectPillProps {
   uiState: TonoUiState
@@ -132,40 +124,43 @@ export const ConnectPill = ({
       className="tono-pill"
       disabled={spec.disabled}
       onClick={handleClick}
+      aria-label={`${t(spec.titleKey)} — ${subtitle}`}
       style={{
         position: 'relative',
         display: 'flex',
         alignItems: 'center',
-        width: 240,
-        height: 72,
-        padding: 0,
-        border: 'none',
-        borderRadius: 36,
+        gap: 12,
+        width: 340,
+        maxWidth: 'calc(100vw - 230px)',
+        minHeight: 96,
+        padding: '11px 14px 11px 11px',
+        border: `1px solid ${hex(spec.color, dark ? 0.32 : 0.24)}`,
+        borderRadius: 28,
         cursor: spec.disabled ? 'default' : 'pointer',
         color: text.primary,
-        background: dark
-          ? 'rgba(0, 0, 0, 0.55)'
-          : 'rgba(255, 255, 255, 0.06)',
-        backdropFilter: 'blur(20px)',
-        WebkitBackdropFilter: 'blur(20px)',
+        background: `linear-gradient(120deg, ${hex(spec.color, dark ? 0.12 : 0.09)} 0%, ${hex(spec.color, 0)} 58%), ${
+          dark ? 'rgba(13,18,29,0.84)' : 'rgba(255,255,255,0.82)'
+        }`,
+        backdropFilter: 'blur(12px) saturate(1.08)',
+        WebkitBackdropFilter: 'blur(12px) saturate(1.08)',
         boxShadow:
           uiState === 'connected'
-            ? `0 5px 15px ${hex(TONO_COLORS.connected, 0.25)}`
+            ? `0 18px 42px -28px ${hex(TONO_COLORS.connected, 0.72)}, inset 0 1px 0 ${hex('#FFFFFF', dark ? 0.06 : 0.65)}`
             : dark
-              ? '0 5px 15px rgba(0, 0, 0, 0.35)'
-              : '0 5px 15px rgba(0, 0, 0, 0.1)',
-        transition: `background ${transition}, box-shadow ${transition}`,
+              ? '0 22px 48px -32px rgba(0,0,0,0.9), inset 0 1px 0 rgba(255,255,255,0.05)'
+              : '0 22px 48px -32px rgba(55,72,110,0.38), inset 0 1px 0 rgba(255,255,255,0.65)',
+        transition: `background ${transition}, border-color ${transition}, box-shadow ${transition}, transform ${transition}`,
       }}
     >
-      {/* Icon zone: 80 wide, halo 96×96 behind the 52×52 mark. */}
+      {/* Icon zone */}
       <span
         style={{
           position: 'relative',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 80,
-          height: '100%',
+          width: 72,
+          height: 72,
           flexShrink: 0,
         }}
       >
@@ -173,35 +168,38 @@ export const ConnectPill = ({
           aria-hidden
           style={{
             position: 'absolute',
-            width: 96,
-            height: 96,
-            borderRadius: '50%',
-            background: haloBackground(spec.color),
+            width: 64,
+            height: 64,
+            borderRadius: 20,
+            background: `radial-gradient(circle at 50% 45%, ${hex(spec.color, 0.42)} 0%, ${hex(spec.color, 0.16)} 46%, ${hex(spec.color, 0)} 74%)`,
+            filter: 'blur(7px)',
             opacity: spec.glowOpacity,
             transform: `scale(${spec.glowScale})`,
             transition: `opacity ${transition}, transform ${transition}, background ${transition}`,
           }}
         />
-        <TonoLogo connected={uiState === 'connected'} size={52} />
+        <TonoLogo connected={uiState === 'connected'} size={54} />
       </span>
 
-      {/* Text zone: 160 wide, pulled 20 towards the mark. */}
+      {/* Text zone */}
       <span
         style={{
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'flex-start',
-          gap: 3,
-          width: 160,
-          transform: 'translateX(-20px)',
+          justifyContent: 'center',
+          gap: 6,
+          flex: 1,
+          minWidth: 0,
           textAlign: 'left',
         }}
       >
         <span
           style={{
-            fontSize: 22,
-            fontWeight: 600,
+            fontSize: 21,
+            fontWeight: 650,
             lineHeight: 1.15,
+            letterSpacing: -0.35,
             color: spec.titleColored ? spec.color : text.primary,
             transition: `color ${transition}`,
           }}
@@ -213,9 +211,10 @@ export const ConnectPill = ({
             display: 'flex',
             alignItems: 'center',
             gap: 5,
-            fontSize: 11,
+            maxWidth: '100%',
+            fontSize: 12,
             fontWeight: 500,
-            letterSpacing: 1.1,
+            lineHeight: 1.25,
             color: text.secondary,
           }}
         >
@@ -245,8 +244,42 @@ export const ConnectPill = ({
               }}
             />
           )}
-          <span>{subtitle}</span>
+          <span
+            style={{
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {subtitle}
+          </span>
         </span>
+      </span>
+
+      <span
+        aria-hidden
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 36,
+          height: 36,
+          flexShrink: 0,
+          borderRadius: 12,
+          color: spec.color,
+          background: hex(spec.color, dark ? 0.14 : 0.1),
+          border: `1px solid ${hex(spec.color, 0.18)}`,
+        }}
+      >
+        <svg aria-hidden width="17" height="17" viewBox="0 0 24 24" fill="none">
+          <title>Connection power</title>
+          <path
+            d="M12 2v10M5.9 5.9a8.5 8.5 0 1 0 12.2 0"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+          />
+        </svg>
       </span>
     </button>
   )

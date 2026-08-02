@@ -700,6 +700,9 @@ const tasks = [
     func: () =>
       getLatestAlphaVersion().then(() => resolveSidecar(clashMetaAlpha())),
     retry: 5,
+    // Tono Windows has one audited stable core. Do not spend release time or cache space fetching
+    // a second ~45 MB binary that tauri.conf.json deliberately does not bundle.
+    skipWindows: true,
   },
   {
     name: 'verge-mihomo',
@@ -745,6 +748,7 @@ async function runTask() {
   const task = tasks.shift()
   if (!task) return
   if (task.unixOnly && platform === 'win32') return runTask()
+  if (task.skipWindows && platform === 'win32') return runTask()
   if (task.winOnly && platform !== 'win32') return runTask()
   if (task.macosOnly && platform !== 'darwin') return runTask()
   if (task.linuxOnly && platform !== 'linux') return runTask()
@@ -761,4 +765,39 @@ async function runTask() {
   return runTask()
 }
 
+/**
+ * After resources/sidecars are staged, refuse to leave a Windows release tree that would
+ * recreate Test 5's dual-Mihomo / Unix-helper payload. Pure config validation — does not
+ * delete cross-platform leftovers under resources/ (only the bundle map controls packaging).
+ */
+async function assertWindowsPackagingConfig() {
+  if (platform !== 'win32') return
+  const { validateExternalBin, validateResourcesWhitelist } = await import(
+    './windows-packaging.mjs'
+  )
+  const tauriConfig = JSON.parse(
+    await fsp.readFile(path.join(cwd, 'src-tauri', 'tauri.conf.json'), 'utf8'),
+  )
+  const externalError = validateExternalBin(tauriConfig.bundle?.externalBin)
+  if (externalError) throw new Error(externalError)
+  const resourcesError = validateResourcesWhitelist(tauriConfig.bundle?.resources)
+  if (resourcesError) throw new Error(resourcesError)
+
+  const alphaSidecar = path.join(
+    SIDECAR_DIR,
+    `verge-mihomo-alpha-${SIDECAR_HOST}.exe`,
+  )
+  if (fs.existsSync(alphaSidecar)) {
+    log_info(
+      `alpha sidecar exists on disk but is not in externalBin (will not be packaged): ${path.basename(alphaSidecar)}`,
+    )
+  }
+  log_success('Windows packaging config: stable-only Mihomo + resource whitelist')
+}
+
 runTask()
+  .then(() => assertWindowsPackagingConfig())
+  .catch((error) => {
+    log_error(error.message || error)
+    process.exitCode = 1
+  })

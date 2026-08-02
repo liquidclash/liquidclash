@@ -90,6 +90,12 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_KILL_SWITCH_RELEASE
     }
+
+    /// Whether this service persists the post-verification logical-session marker.
+    pub const fn supports_kill_switch_verification(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_KILL_SWITCH_VERIFICATION
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +256,9 @@ pub enum KillSwitchStatusMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KillSwitchStatus {
     pub wanted: bool,
+    /// This logical protection session has completed the app's full verification barrier.
+    #[serde(default)]
+    pub verified: bool,
     /// All expected WFP objects verified by key in the last check.
     pub live: bool,
     pub mode: KillSwitchStatusMode,
@@ -267,7 +276,7 @@ pub struct KillSwitchLockRequest {
 }
 
 /// `GET /dns/status` response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DnsProtectionStatus {
     /// The service currently holds adapters on loopback DNS.
     pub enabled: bool,
@@ -462,8 +471,46 @@ impl ServiceLifecycleState {
     }
 }
 
+/// The privileged mutation currently owning the Service lifecycle writer.
+///
+/// This is intentionally a small wire enum rather than an arbitrary route string: status is an
+/// authenticated diagnostic surface and must not reflect untrusted request paths or payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceOperationKind {
+    StartCore,
+    StopCore,
+    StageRuntime,
+    LockKillSwitch,
+    VerifyKillSwitch,
+    RestrictKillSwitch,
+    ReleaseKillSwitch,
+    EnableDns,
+    RestoreDns,
+    UpdateWriter,
+    SetSystemProxy,
+}
+
+/// Observable metadata for the lifecycle writer. Reads never wait for this operation; they show
+/// the last committed state plus this record so the UI can distinguish "old snapshot while a
+/// mutation is running" from a frozen or unreachable Service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceOperationSnapshot {
+    pub id: u64,
+    pub kind: ServiceOperationKind,
+    pub started_at_ms: u64,
+    pub deadline_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatusSnapshot {
+    /// Monotonic within one Service process. It changes when a lifecycle operation starts or
+    /// finishes, allowing polling clients to discard an older aggregate response.
+    #[serde(default)]
+    pub snapshot_generation: u64,
+    /// Present only while a privileged mutation owns the lifecycle writer.
+    #[serde(default)]
+    pub active_operation: Option<ServiceOperationSnapshot>,
     pub is_active: bool,
     pub active_generation: Option<u64>,
     pub service_state: ServiceLifecycleState,
@@ -727,6 +774,19 @@ mod tests {
     }
 
     #[test]
+    fn kill_switch_verification_requires_revision_eight_in_the_current_epoch() {
+        let mut info = ProtocolInfo::current();
+        info.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_KILL_SWITCH_VERIFICATION - 1;
+        assert!(!info.supports_kill_switch_verification());
+
+        info.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_KILL_SWITCH_VERIFICATION;
+        assert!(info.supports_kill_switch_verification());
+
+        info.protocol.epoch += 1;
+        assert!(!info.supports_kill_switch_verification());
+    }
+
+    #[test]
     fn windows_kill_switch_config_is_absent_from_older_clients() {
         use super::{KillSwitchConfig, KillSwitchStatus, KillSwitchStatusMode, ProxyProtocol};
 
@@ -758,6 +818,7 @@ mod tests {
 
         let status = KillSwitchStatus {
             wanted: true,
+            verified: false,
             live: true,
             mode: KillSwitchStatusMode::Bootstrap,
             endpoints: config.proxy_endpoints.clone(),

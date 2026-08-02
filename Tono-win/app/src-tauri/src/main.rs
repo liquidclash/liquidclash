@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn main() {
     let default_parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let worker_limit = std::cmp::min(default_parallelism, 8);
+    // Small Windows VMs commonly report one or two CPUs. Keep enough workers for the window,
+    // status and recovery tasks even when a dependency briefly enters synchronous OS IPC.
+    let worker_limit = default_parallelism.clamp(4, 8);
     let blocking_limit = 2 * worker_limit;
 
     #[allow(clippy::unwrap_used)]

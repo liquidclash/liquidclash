@@ -19,6 +19,7 @@ pub const FAKE_IP_RANGE: &str = "198.18.0.1/16";
 pub const DNS_LISTEN: &str = "127.0.0.1:53";
 /// Name of the WeChat-DIRECT select group (present only with a DirectPlan).
 pub const DIRECT_GROUP_NAME: &str = "Tono-China-Direct";
+pub const WEB_DIRECT_GROUP_NAME: &str = "Tono-China-Web-Direct";
 /// DoH resolvers pinned through the exit group; the `#Tono-Exit` fragment
 /// routes the lookups through the tunnel.
 pub const DOH_NAMESERVERS: [&str; 2] = [
@@ -41,37 +42,61 @@ pub enum ConfigError {
     Node(#[from] NodeRejection),
     #[error("direct plan rejected: {0}")]
     DirectPlan(String),
+    #[error("runtime listener plan rejected: {0}")]
+    RuntimePorts(String),
 }
 
-/// The WeChat-DIRECT overlay for one connect (Mac Build 28 parity). All
+/// Per-connection loopback listeners. Tono's TUN product does not need a mixed proxy listener,
+/// so the App passes `mixed_port = 0`; the default preserves the legacy/test contract. The
+/// controller must be non-zero because the App needs its exact authenticated endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimePorts {
+    pub mixed_port: u16,
+    pub controller_port: u16,
+}
+
+impl Default for RuntimePorts {
+    fn default() -> Self {
+        Self {
+            mixed_port: MIXED_PORT,
+            controller_port: 9090,
+        }
+    }
+}
+
+/// The exact China-DIRECT overlay for one connect. All
 /// fields are already policy-validated by the caller; `build_owned_runtime`
 /// re-checks the invariants that guard the tunnel (interface shape, no
 /// rule targeting the selected node's IP).
 ///
 /// - `hosts`: (domain, pinned IP) pairs rendered into the top-level
 ///   `hosts:` section (grouped per domain, sorted).
-/// - `tcp_rules`: exact (IP, port) tuples for the TCP direct rules
-///   (ports ⊆ {80, 443}).
+/// - `tcp_wechat_rules`: exact (host, IP, port) tuples for WeChat TCP rules.
+/// - `tcp_web_rules`: exact (host, IP, TCP/443) tuples for reviewed web rules.
 /// - `udp_wechat_rules`: exact (IP, port) tuples for the WeChat media UDP
 ///   rules (ports ⊆ {443, 8000}).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectPlan {
     pub physical_interface: String,
     pub hosts: Vec<(String, String)>,
-    pub tcp_rules: Vec<(std::net::Ipv4Addr, u16)>,
+    pub tcp_wechat_rules: Vec<(String, std::net::Ipv4Addr, u16)>,
+    pub tcp_web_rules: Vec<(String, std::net::Ipv4Addr, u16)>,
     pub udp_wechat_rules: Vec<(std::net::Ipv4Addr, u16)>,
 }
 
 impl DirectPlan {
-    /// `^[A-Za-z0-9 _-]{1,64}$`, and never the loopback or the tunnel name
-    /// (a DIRECT group bound to either would be meaningless or circular).
+    /// Accept a Windows interface alias exactly as returned by `MIB_IF_ROW2::Alias`. Aliases are
+    /// user-visible Unicode and commonly contain localized text, dots, parentheses, or trademark
+    /// characters. The runtime is serialized through `serde_yaml`, so validation needs to reject
+    /// control characters and ambiguous surrounding whitespace rather than imposing an ASCII
+    /// grammar. The Windows API reserves 257 UTF-16 code units including the terminator.
     pub fn validate_physical_interface(interface: &str) -> Result<(), ConfigError> {
-        let reject = || ConfigError::DirectPlan(format!("invalid physical interface: {interface:?}"));
+        let reject =
+            || ConfigError::DirectPlan(format!("invalid physical interface: {interface:?}"));
         if interface.is_empty()
-            || interface.len() > 64
-            || !interface
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == ' ' || ch == '_' || ch == '-')
+            || interface.trim() != interface
+            || interface.encode_utf16().count() > 256
+            || interface.chars().any(char::is_control)
         {
             return Err(reject());
         }
@@ -98,6 +123,28 @@ pub fn build_owned_runtime(
     secret: &str,
     direct: Option<&DirectPlan>,
 ) -> Result<OwnedRuntime, ConfigError> {
+    build_owned_runtime_with_ports(nodes, selected, secret, direct, RuntimePorts::default())
+}
+
+/// Build the owned runtime with listeners chosen for this connection generation. This removes
+/// the fixed 7890/9090 collision without allowing cloud/user configuration to choose a bind.
+pub fn build_owned_runtime_with_ports(
+    nodes: &[ValidatedNode],
+    selected: &str,
+    secret: &str,
+    direct: Option<&DirectPlan>,
+    ports: RuntimePorts,
+) -> Result<OwnedRuntime, ConfigError> {
+    if ports.controller_port == 0 {
+        return Err(ConfigError::RuntimePorts(
+            "controller port must be non-zero".to_string(),
+        ));
+    }
+    if ports.mixed_port != 0 && ports.mixed_port == ports.controller_port {
+        return Err(ConfigError::RuntimePorts(
+            "mixed and controller listeners must use different ports".to_string(),
+        ));
+    }
     validate_node_set(nodes)?;
     let selected = selected.trim();
     let selected_node = nodes
@@ -111,10 +158,14 @@ pub fn build_owned_runtime(
         // A DIRECT rule that targets the selected node's own IP would pull
         // the tunnel's control socket out of the tunnel.
         let hits_node = plan
-            .tcp_rules
+            .tcp_wechat_rules
             .iter()
-            .chain(plan.udp_wechat_rules.iter())
-            .any(|(ip, _)| *ip == selected_node.server);
+            .chain(plan.tcp_web_rules.iter())
+            .any(|(_, ip, _)| *ip == selected_node.server)
+            || plan
+                .udp_wechat_rules
+                .iter()
+                .any(|(ip, _)| *ip == selected_node.server);
         if hits_node {
             return Err(ConfigError::DirectPlan(format!(
                 "direct rule targets the selected node: {}",
@@ -123,8 +174,15 @@ pub fn build_owned_runtime(
         }
     }
 
-    let yaml = serde_yaml_ng::to_string(&runtime_value(nodes, selected, secret, &route_exclusion, direct))
-        .map_err(|err| ConfigError::Node(NodeRejection::Malformed(err.to_string())))?;
+    let yaml = serde_yaml_ng::to_string(&runtime_value(
+        nodes,
+        selected,
+        secret,
+        &route_exclusion,
+        direct,
+        ports,
+    ))
+    .map_err(|err| ConfigError::Node(NodeRejection::Malformed(err.to_string())))?;
     Ok(OwnedRuntime { yaml })
 }
 
@@ -180,6 +238,7 @@ fn runtime_value(
     secret: &str,
     route_exclusion: &str,
     direct: Option<&DirectPlan>,
+    ports: RuntimePorts,
 ) -> Value {
     let mut root = Mapping::new();
     // Extra listeners stay disabled (macOS owned-runtime parity); the only
@@ -187,7 +246,11 @@ fn runtime_value(
     put(&mut root, "port", Value::Number(0.into()));
     put(&mut root, "socks-port", Value::Number(0.into()));
     put(&mut root, "redir-port", Value::Number(0.into()));
-    put(&mut root, "mixed-port", Value::Number(MIXED_PORT.into()));
+    put(
+        &mut root,
+        "mixed-port",
+        Value::Number(ports.mixed_port.into()),
+    );
     put(&mut root, "allow-lan", Value::Bool(false));
     put(&mut root, "ipv6", Value::Bool(false));
     put(&mut root, "mode", string("rule"));
@@ -198,7 +261,11 @@ fn runtime_value(
     // Never let a stale cache.db choice resurrect an old selection.
     put(&mut profile, "store-selected", Value::Bool(false));
     put(&mut root, "profile", Value::Mapping(profile));
-    put(&mut root, "external-controller", string(EXTERNAL_CONTROLLER));
+    put(
+        &mut root,
+        "external-controller",
+        string(&format!("127.0.0.1:{}", ports.controller_port)),
+    );
     put(&mut root, "secret", string(secret));
 
     // WeChat-DIRECT: pin resolved domain addresses into `hosts:` so the
@@ -206,9 +273,13 @@ fn runtime_value(
     if let Some(plan) = direct
         && !plan.hosts.is_empty()
     {
-        let mut grouped: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+        let mut grouped: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
         for (domain, address) in &plan.hosts {
-            grouped.entry(domain.as_str()).or_default().push(address.as_str());
+            grouped
+                .entry(domain.as_str())
+                .or_default()
+                .push(address.as_str());
         }
         let mut hosts = Mapping::new();
         for (domain, addresses) in grouped {
@@ -227,7 +298,11 @@ fn runtime_value(
     put(&mut dns, "fake-ip-range", string(FAKE_IP_RANGE));
     put(&mut dns, "respect-rules", Value::Bool(true));
     put(&mut dns, "nameserver", strings(&DOH_NAMESERVERS));
-    put(&mut dns, "proxy-server-nameserver", strings(&DOH_NAMESERVERS));
+    put(
+        &mut dns,
+        "proxy-server-nameserver",
+        strings(&DOH_NAMESERVERS),
+    );
     put(&mut root, "dns", Value::Mapping(dns));
 
     let mut tun = Mapping::new();
@@ -242,7 +317,11 @@ fn runtime_value(
     put(&mut tun, "disable-icmp-forwarding", Value::Bool(true));
     put(&mut tun, "dns-hijack", strings(&["any:53", "tcp://any:53"]));
     // Keeps Mihomo's own Reality socket out of the tunnel.
-    put(&mut tun, "route-exclude-address", strings(&[route_exclusion]));
+    put(
+        &mut tun,
+        "route-exclude-address",
+        strings(&[route_exclusion]),
+    );
     put(&mut root, "tun", Value::Mapping(tun));
 
     let proxies: Vec<Value> = nodes
@@ -256,16 +335,32 @@ fn runtime_value(
     // physical interface (mihomo group-level interface binding). It sits
     // before Tono-Exit; rules reference it by name.
     if let Some(plan) = direct {
-        let mut direct_group = Mapping::new();
-        put(&mut direct_group, "name", string(DIRECT_GROUP_NAME));
-        put(&mut direct_group, "type", string("select"));
-        put(&mut direct_group, "proxies", strings(&["DIRECT"]));
-        put(
-            &mut direct_group,
-            "interface-name",
-            string(&plan.physical_interface),
-        );
-        groups.push(Value::Mapping(direct_group));
+        let has_wechat = !plan.tcp_wechat_rules.is_empty() || !plan.udp_wechat_rules.is_empty();
+        let has_web = !plan.tcp_web_rules.is_empty();
+        if has_wechat {
+            let mut direct_group = Mapping::new();
+            put(&mut direct_group, "name", string(DIRECT_GROUP_NAME));
+            put(&mut direct_group, "type", string("select"));
+            put(&mut direct_group, "proxies", strings(&["DIRECT"]));
+            put(
+                &mut direct_group,
+                "interface-name",
+                string(&plan.physical_interface),
+            );
+            groups.push(Value::Mapping(direct_group));
+        }
+        if has_web {
+            let mut web_group = Mapping::new();
+            put(&mut web_group, "name", string(WEB_DIRECT_GROUP_NAME));
+            put(&mut web_group, "type", string("select"));
+            put(&mut web_group, "proxies", strings(&["DIRECT"]));
+            put(
+                &mut web_group,
+                "interface-name",
+                string(&plan.physical_interface),
+            );
+            groups.push(Value::Mapping(web_group));
+        }
     }
 
     let mut ordered: Vec<&str> = Vec::with_capacity(nodes.len());
@@ -287,12 +382,22 @@ fn runtime_value(
     groups.push(Value::Mapping(group));
     put(&mut root, "proxy-groups", Value::Sequence(groups));
 
-    // Loopback rules, then the WeChat-DIRECT pins, then the MATCH fallback.
-    let mut rules: Vec<String> = RULES[..RULES.len() - 1].iter().map(|rule| rule.to_string()).collect();
+    // Loopback, protected Claude processes, exact DIRECT pins, then MATCH.
+    let mut rules: Vec<String> = RULES[..RULES.len() - 1]
+        .iter()
+        .map(|rule| rule.to_string())
+        .collect();
     if let Some(plan) = direct {
-        for (address, port) in &plan.tcp_rules {
+        if !plan.tcp_wechat_rules.is_empty()
+            || !plan.tcp_web_rules.is_empty()
+            || !plan.udp_wechat_rules.is_empty()
+        {
+            rules.push("PROCESS-NAME,Claude.exe,Tono-Exit".to_string());
+            rules.push("PROCESS-NAME,claude.exe,Tono-Exit".to_string());
+        }
+        for (host, address, port) in &plan.tcp_wechat_rules {
             rules.push(format!(
-                "AND,((NETWORK,TCP),(DST-PORT,{port}),(IP-CIDR,{address}/32,no-resolve)),{DIRECT_GROUP_NAME}"
+                "AND,((NETWORK,TCP),(DST-PORT,{port}),(DOMAIN,{host}),(IP-CIDR,{address}/32,no-resolve),(PROCESS-NAME,WeChat.exe)),{DIRECT_GROUP_NAME}"
             ));
         }
         for (address, port) in &plan.udp_wechat_rules {
@@ -300,9 +405,18 @@ fn runtime_value(
                 "AND,((NETWORK,UDP),(DST-PORT,{port}),(IP-CIDR,{address}/32),(PROCESS-NAME,WeChat.exe)),{DIRECT_GROUP_NAME}"
             ));
         }
+        for (host, address, port) in &plan.tcp_web_rules {
+            rules.push(format!(
+                "AND,((NETWORK,TCP),(DST-PORT,{port}),(DOMAIN,{host}),(IP-CIDR,{address}/32,no-resolve)),{WEB_DIRECT_GROUP_NAME}"
+            ));
+        }
     }
     rules.push(RULES[RULES.len() - 1].to_string());
-    put(&mut root, "rules", Value::Sequence(rules.iter().map(|rule| string(rule)).collect()));
+    put(
+        &mut root,
+        "rules",
+        Value::Sequence(rules.iter().map(|rule| string(rule)).collect()),
+    );
     Value::Mapping(root)
 }
 
@@ -385,17 +499,72 @@ reality-opts:
     }
 
     #[test]
+    fn per_connection_ports_disable_mixed_listener_and_move_controller() {
+        let runtime = build_owned_runtime_with_ports(
+            &three_nodes(),
+            "JP Reality 02",
+            "test-secret",
+            None,
+            RuntimePorts {
+                mixed_port: 0,
+                controller_port: 41_237,
+            },
+        )
+        .unwrap();
+        let value = parsed(&runtime);
+        assert_eq!(get(&value, &["mixed-port"]).as_i64(), Some(0));
+        assert_eq!(
+            get(&value, &["external-controller"]).as_str(),
+            Some("127.0.0.1:41237")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_listener_plan() {
+        for ports in [
+            RuntimePorts {
+                mixed_port: 0,
+                controller_port: 0,
+            },
+            RuntimePorts {
+                mixed_port: 9_090,
+                controller_port: 9_090,
+            },
+        ] {
+            assert!(matches!(
+                build_owned_runtime_with_ports(
+                    &three_nodes(),
+                    "JP Reality 02",
+                    "test-secret",
+                    None,
+                    ports,
+                ),
+                Err(ConfigError::RuntimePorts(_))
+            ));
+        }
+    }
+
+    #[test]
     fn forces_dns_contract() {
         let value = parsed(&build());
         assert_eq!(get(&value, &["dns", "enable"]).as_bool(), Some(true));
-        assert_eq!(get(&value, &["dns", "listen"]).as_str(), Some("127.0.0.1:53"));
-        assert_eq!(get(&value, &["dns", "enhanced-mode"]).as_str(), Some("fake-ip"));
+        assert_eq!(
+            get(&value, &["dns", "listen"]).as_str(),
+            Some("127.0.0.1:53")
+        );
+        assert_eq!(
+            get(&value, &["dns", "enhanced-mode"]).as_str(),
+            Some("fake-ip")
+        );
         assert_eq!(
             get(&value, &["dns", "fake-ip-range"]).as_str(),
             Some("198.18.0.1/16")
         );
         assert_eq!(get(&value, &["dns", "respect-rules"]).as_bool(), Some(true));
-        let expected: Vec<Value> = DOH_NAMESERVERS.iter().map(|server| string(server)).collect();
+        let expected: Vec<Value> = DOH_NAMESERVERS
+            .iter()
+            .map(|server| string(server))
+            .collect();
         assert_eq!(
             get(&value, &["dns", "nameserver"]).as_sequence().unwrap(),
             &expected
@@ -477,8 +646,14 @@ reality-opts:
         assert_eq!(proxies.len(), 3);
         let first = &proxies[0];
         assert_eq!(first[string("type")].as_str(), Some("vless"));
-        assert_eq!(first[string("servername")].as_str(), Some("www.microsoft.com"));
-        assert!(first.get(string("sni")).is_none(), "sni alias must not be emitted");
+        assert_eq!(
+            first[string("servername")].as_str(),
+            Some("www.microsoft.com")
+        );
+        assert!(
+            first.get(string("sni")).is_none(),
+            "sni alias must not be emitted"
+        );
         assert_eq!(first[string("tls")].as_bool(), Some(true));
         assert_eq!(first[string("network")].as_str(), Some("tcp"));
         assert_eq!(first[string("flow")].as_str(), Some("xtls-rprx-vision"));
@@ -524,7 +699,9 @@ reality-opts:
 
     #[test]
     fn secret_lives_only_in_the_memory_copy() {
-        let runtime = build_owned_runtime(&three_nodes(), "US Reality 01", "super-secret-value", None).unwrap();
+        let runtime =
+            build_owned_runtime(&three_nodes(), "US Reality 01", "super-secret-value", None)
+                .unwrap();
         assert!(runtime.yaml().contains("super-secret-value"));
         let redacted = runtime.redacted_yaml();
         assert!(!redacted.contains("super-secret-value"));
@@ -591,18 +768,36 @@ reality-opts:
                 ("wxs.qq.com".to_string(), "9.0.0.11".to_string()),
                 ("qpic.cn".to_string(), "9.0.0.12".to_string()),
             ],
-            tcp_rules: vec![
-                (std::net::Ipv4Addr::new(9, 0, 0, 10), 443),
-                (std::net::Ipv4Addr::new(9, 0, 0, 10), 80),
-                (std::net::Ipv4Addr::new(9, 0, 0, 12), 443),
+            tcp_wechat_rules: vec![
+                (
+                    "wxs.qq.com".to_string(),
+                    std::net::Ipv4Addr::new(9, 0, 0, 10),
+                    443,
+                ),
+                (
+                    "wxs.qq.com".to_string(),
+                    std::net::Ipv4Addr::new(9, 0, 0, 10),
+                    80,
+                ),
+                (
+                    "qpic.cn".to_string(),
+                    std::net::Ipv4Addr::new(9, 0, 0, 12),
+                    443,
+                ),
             ],
+            tcp_web_rules: vec![(
+                "www.bilibili.com".to_string(),
+                std::net::Ipv4Addr::new(9, 0, 0, 30),
+                443,
+            )],
             udp_wechat_rules: vec![(std::net::Ipv4Addr::new(9, 0, 0, 20), 443)],
         }
     }
 
     #[test]
     fn no_direct_build_is_byte_identical_to_before() {
-        let without = build_owned_runtime(&three_nodes(), "JP Reality 02", "test-secret", None).unwrap();
+        let without =
+            build_owned_runtime(&three_nodes(), "JP Reality 02", "test-secret", None).unwrap();
         let value = parsed(&without);
         // No direct artifacts at all.
         assert!(value.as_mapping().unwrap().get(string("hosts")).is_none());
@@ -619,22 +814,46 @@ reality-opts:
 
     #[test]
     fn direct_build_renders_hosts_group_and_rules_in_order() {
-        let runtime = build_owned_runtime(&three_nodes(), "JP Reality 02", "test-secret", Some(&direct_plan())).unwrap();
+        let runtime = build_owned_runtime(
+            &three_nodes(),
+            "JP Reality 02",
+            "test-secret",
+            Some(&direct_plan()),
+        )
+        .unwrap();
         let value = parsed(&runtime);
 
         // hosts: grouped per domain, pinned addresses only.
         let hosts = get(&value, &["hosts"]);
-        let wxs = hosts.as_mapping().unwrap().get(string("wxs.qq.com")).unwrap().as_sequence().unwrap();
+        let wxs = hosts
+            .as_mapping()
+            .unwrap()
+            .get(string("wxs.qq.com"))
+            .unwrap()
+            .as_sequence()
+            .unwrap();
         assert_eq!(wxs.len(), 2);
-        let qpic = hosts.as_mapping().unwrap().get(string("qpic.cn")).unwrap().as_sequence().unwrap();
+        let qpic = hosts
+            .as_mapping()
+            .unwrap()
+            .get(string("qpic.cn"))
+            .unwrap()
+            .as_sequence()
+            .unwrap();
         assert_eq!(qpic.len(), 1);
 
         // The DIRECT select group comes first and binds the interface.
         let groups = get(&value, &["proxy-groups"]).as_sequence().unwrap();
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0][string("name")].as_str(), Some("Tono-China-Direct"));
+        assert_eq!(groups.len(), 3);
+        assert_eq!(
+            groups[0][string("name")].as_str(),
+            Some("Tono-China-Direct")
+        );
         assert_eq!(groups[0][string("type")].as_str(), Some("select"));
-        assert_eq!(groups[0][string("interface-name")].as_str(), Some("Ethernet 2"));
+        assert_eq!(
+            groups[0][string("interface-name")].as_str(),
+            Some("Ethernet 2")
+        );
         let direct_choices: Vec<&str> = groups[0][string("proxies")]
             .as_sequence()
             .unwrap()
@@ -643,7 +862,11 @@ reality-opts:
             .collect();
         assert_eq!(direct_choices, ["DIRECT"]);
         // Tono-Exit is untouched and still carries the selected node first.
-        assert_eq!(groups[1][string("name")].as_str(), Some("Tono-Exit"));
+        assert_eq!(
+            groups[1][string("name")].as_str(),
+            Some("Tono-China-Web-Direct")
+        );
+        assert_eq!(groups[2][string("name")].as_str(), Some("Tono-Exit"));
 
         // Rules: loopback, then TCP pins, then UDP WeChat pins, then MATCH.
         let rules: Vec<&str> = get(&value, &["rules"])
@@ -657,10 +880,13 @@ reality-opts:
             [
                 "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
                 "IP-CIDR6,::1/128,DIRECT,no-resolve",
-                "AND,((NETWORK,TCP),(DST-PORT,443),(IP-CIDR,9.0.0.10/32,no-resolve)),Tono-China-Direct",
-                "AND,((NETWORK,TCP),(DST-PORT,80),(IP-CIDR,9.0.0.10/32,no-resolve)),Tono-China-Direct",
-                "AND,((NETWORK,TCP),(DST-PORT,443),(IP-CIDR,9.0.0.12/32,no-resolve)),Tono-China-Direct",
+                "PROCESS-NAME,Claude.exe,Tono-Exit",
+                "PROCESS-NAME,claude.exe,Tono-Exit",
+                "AND,((NETWORK,TCP),(DST-PORT,443),(DOMAIN,wxs.qq.com),(IP-CIDR,9.0.0.10/32,no-resolve),(PROCESS-NAME,WeChat.exe)),Tono-China-Direct",
+                "AND,((NETWORK,TCP),(DST-PORT,80),(DOMAIN,wxs.qq.com),(IP-CIDR,9.0.0.10/32,no-resolve),(PROCESS-NAME,WeChat.exe)),Tono-China-Direct",
+                "AND,((NETWORK,TCP),(DST-PORT,443),(DOMAIN,qpic.cn),(IP-CIDR,9.0.0.12/32,no-resolve),(PROCESS-NAME,WeChat.exe)),Tono-China-Direct",
                 "AND,((NETWORK,UDP),(DST-PORT,443),(IP-CIDR,9.0.0.20/32),(PROCESS-NAME,WeChat.exe)),Tono-China-Direct",
+                "AND,((NETWORK,TCP),(DST-PORT,443),(DOMAIN,www.bilibili.com),(IP-CIDR,9.0.0.30/32,no-resolve)),Tono-China-Web-Direct",
                 "MATCH,Tono-Exit",
             ]
         );
@@ -672,7 +898,11 @@ reality-opts:
     fn direct_rules_never_target_the_selected_node() {
         let mut plan = direct_plan();
         // JP Reality 02 is 1.1.1.1 in the fixture set; adding it must fail.
-        plan.tcp_rules.push((std::net::Ipv4Addr::new(1, 1, 1, 1), 443));
+        plan.tcp_wechat_rules.push((
+            "wxs.qq.com".to_string(),
+            std::net::Ipv4Addr::new(1, 1, 1, 1),
+            443,
+        ));
         assert!(matches!(
             build_owned_runtime(&three_nodes(), "JP Reality 02", "s", Some(&plan)),
             Err(ConfigError::DirectPlan(_))
@@ -686,12 +916,32 @@ reality-opts:
 
     #[test]
     fn physical_interface_validation() {
-        for good in ["Ethernet 2", "Wi-Fi", "en0", "以太0x", "LAN_1", "a"] {
-            if good.is_ascii() {
-                DirectPlan::validate_physical_interface(good).unwrap_or_else(|err| panic!("{good}: {err}"));
-            }
+        for good in [
+            "Ethernet 2",
+            "Wi-Fi",
+            "en0",
+            "以太网",
+            "イーサネット",
+            "vEthernet (Default Switch)",
+            "Ethernet.Intel®",
+            "LAN_1",
+            "a",
+        ] {
+            DirectPlan::validate_physical_interface(good)
+                .unwrap_or_else(|err| panic!("{good}: {err}"));
         }
-        for bad in ["", &"x".repeat(65), "Tono", "tono", "lo0", "Loopback", "eth/0", "eth.0"] {
+        for bad in [
+            "",
+            &"x".repeat(257),
+            "Tono",
+            "tono",
+            "lo0",
+            "Loopback",
+            " Ethernet",
+            "Ethernet ",
+            "Ethernet\nInjected",
+            "Ethernet\0Hidden",
+        ] {
             assert!(
                 DirectPlan::validate_physical_interface(bad).is_err(),
                 "{bad}"
@@ -704,14 +954,16 @@ reality-opts:
         let plan = DirectPlan {
             physical_interface: "Ethernet".to_string(),
             hosts: Vec::new(),
-            tcp_rules: Vec::new(),
+            tcp_wechat_rules: Vec::new(),
+            tcp_web_rules: Vec::new(),
             udp_wechat_rules: Vec::new(),
         };
-        let runtime = build_owned_runtime(&three_nodes(), "JP Reality 02", "s", Some(&plan)).unwrap();
+        let runtime =
+            build_owned_runtime(&three_nodes(), "JP Reality 02", "s", Some(&plan)).unwrap();
         let value = parsed(&runtime);
         assert!(value.as_mapping().unwrap().get(string("hosts")).is_none());
         let groups = get(&value, &["proxy-groups"]).as_sequence().unwrap();
-        assert_eq!(groups.len(), 2, "the DIRECT group is still declared");
+        assert_eq!(groups.len(), 1, "an empty plan declares no DIRECT group");
         let rules: Vec<&str> = get(&value, &["rules"])
             .as_sequence()
             .unwrap()

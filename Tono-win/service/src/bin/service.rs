@@ -5,9 +5,10 @@
 
 use anyhow::Result;
 use clash_verge_service_ipc::{
-    acquire_service_owner, add_restored_kill_switch_tunnel, reconcile_service_startup,
-    restore_desired_state, restore_kill_switch, restore_windows_kill_switch,
-    run_ipc_supervisor_until_shutdown, spawn_kill_switch_watchdog,
+    acquire_service_owner, add_restored_kill_switch_tunnel, initialize_protected_dns_status,
+    reconcile_service_startup, restore_desired_state, restore_kill_switch,
+    restore_windows_kill_switch, retire_unverified_windows_kill_switch,
+    run_ipc_supervisor_until_shutdown, spawn_kill_switch_watchdog, spawn_protected_dns_watchdog,
     spawn_windows_kill_switch_watchdog,
 };
 use tracing::{Level, info, warn};
@@ -73,8 +74,7 @@ fn main() -> Result<()> {
         }
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let Some(_owner_guard) = clash_verge_service_ipc::acquire_service_owner().await?
-            else {
+            let Some(_owner_guard) = clash_verge_service_ipc::acquire_service_owner().await? else {
                 anyhow::bail!("service daemon is still running; refusing to open the kill switch");
             };
             clash_verge_service_ipc::emergency_disarm_windows_kill_switch().await
@@ -156,7 +156,12 @@ fn run_service() -> platform_lib::Result<()> {
         process_id: None,
     })?;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Keep recovery/status IPC schedulable while another handler coordinates SCM, filesystem,
+    // DNS, WFP/BFE, or process teardown. WFP/DNS calls already use blocking workers, but a
+    // current-thread runtime still made any accidental synchronous wait a total Service freeze.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("tono-service")
         .enable_all()
         .build()
         .unwrap();
@@ -177,31 +182,13 @@ fn run_service() -> platform_lib::Result<()> {
                 "Windows kill-switch restore failed; keeping IPC available for recovery: {error:#}"
             );
         }
+        initialize_protected_dns_status().await;
+        spawn_protected_dns_watchdog();
         spawn_windows_kill_switch_watchdog();
         clash_verge_service_ipc::start_network_monitor();
 
         match reconcile_service_startup().await {
-            Ok(()) => {
-                match restore_desired_state().await {
-                    Ok(true) => {
-                        if let Err(error) = add_restored_kill_switch_tunnel().await {
-                            tracing::warn!("Restored core remains fail-closed because its tunnel could not be authorized: {error:#}");
-                        }
-                        if let Err(error) =
-                            clash_verge_service_ipc::relock_restored_tunnel().await
-                        {
-                            tracing::warn!(
-                                "Restored core remains fail-closed because its tunnel could not be re-locked: {error:#}"
-                            );
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(
-                        "Desired state restoration failed; keeping IPC available for GUI recovery: {}",
-                        error
-                    ),
-                }
-            }
+            Ok(()) => restore_reconciled_desired_state().await,
             Err(error) => tracing::warn!(
                 "Service startup reconciliation failed; core starts remain blocked while IPC is available: {}",
                 error
@@ -251,6 +238,38 @@ fn init_logger() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
+/// Reconciliation has proved that no process from the previous service instance survived. Only
+/// now may an unverified first-attempt barrier be retired. If that retirement is ambiguous, keep
+/// the machine fail-closed and do not restore a desired Core behind an ownership mismatch.
+async fn restore_reconciled_desired_state() {
+    if let Err(error) = retire_unverified_windows_kill_switch().await {
+        warn!(
+            "Unverified Windows protection could not be safely retired after Core reconciliation; \
+             keeping IPC available for recovery and skipping desired Core restore: {error:#}"
+        );
+        return;
+    }
+
+    match restore_desired_state().await {
+        Ok(true) => {
+            if let Err(error) = add_restored_kill_switch_tunnel().await {
+                warn!(
+                    "Restored core remains fail-closed because its tunnel could not be authorized: {error:#}"
+                );
+            }
+            if let Err(error) = clash_verge_service_ipc::relock_restored_tunnel().await {
+                warn!(
+                    "Restored core remains fail-closed because its tunnel could not be re-locked: {error:#}"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => warn!(
+            "Desired state restoration failed; keeping IPC available for GUI recovery: {error:#}"
+        ),
+    }
+}
+
 async fn run_standalone() -> Result<()> {
     let pid = std::process::id();
     info!("Tono Service - Standalone Mode");
@@ -265,6 +284,8 @@ async fn run_standalone() -> Result<()> {
     spawn_kill_switch_watchdog();
     // WFP intent gets the same fail-closed-before-IPC treatment; a no-op off Windows.
     restore_windows_kill_switch().await?;
+    initialize_protected_dns_status().await;
+    spawn_protected_dns_watchdog();
     spawn_windows_kill_switch_watchdog();
     #[cfg(windows)]
     clash_verge_service_ipc::start_network_monitor();
@@ -272,25 +293,7 @@ async fn run_standalone() -> Result<()> {
     // 启动恢复只做 best-effort；即使失败也要启动 IPC，让 GUI 重连后重推配置自愈。
     // 否则失效的 desired-state 路径会导致进程退出并被 launchd 反复拉起。
     match reconcile_service_startup().await {
-        Ok(()) => match restore_desired_state().await {
-            Ok(true) => {
-                if let Err(error) = add_restored_kill_switch_tunnel().await {
-                    warn!(
-                        "Restored core remains fail-closed because its tunnel could not be authorized: {error:#}"
-                    );
-                }
-                if let Err(error) = clash_verge_service_ipc::relock_restored_tunnel().await {
-                    warn!(
-                        "Restored core remains fail-closed because its tunnel could not be re-locked: {error:#}"
-                    );
-                }
-            }
-            Ok(false) => {}
-            Err(error) => warn!(
-                "Failed to restore desired core state on startup; core will not be auto-started. \
-                     Keeping the IPC server up so the GUI can reconnect and recover: {error:#}"
-            ),
-        },
+        Ok(()) => restore_reconciled_desired_state().await,
         Err(error) => warn!(
             "Service startup reconciliation failed; core starts remain blocked while IPC is available: {error:#}"
         ),

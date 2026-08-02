@@ -5,7 +5,11 @@ import { useTranslation } from 'react-i18next'
 import { tonoServersQueryKey, useTonoStatus } from '@/hooks/use-tono'
 import { useQuery } from '@/services/query-client'
 import { useThemeMode } from '@/services/states'
-import { tonoSelectServer, tonoServers } from '@/services/tono'
+import {
+  tonoSelectServer,
+  tonoServers,
+  tonoTestCurrentServer,
+} from '@/services/tono'
 import {
   TONO_COLORS,
   TONO_EASE,
@@ -26,11 +30,12 @@ const ServersPage = () => {
   const { t } = useTranslation()
   const dark = useThemeMode() !== 'light'
   const text = tonoText(dark)
-  const { mutateTonoStatus } = useTonoStatus()
+  const { status, mutateTonoStatus } = useTonoStatus()
   const [selectError, setSelectError] = useState<string | null>(null)
   const [testing, setTesting] = useState(false)
-  // Bump to re-read latency history from the delay manager.
-  const [latencyTick, setLatencyTick] = useState(0)
+  const [measuredLatency, setMeasuredLatency] = useState<
+    Record<string, number>
+  >({})
 
   const { data: servers, refetch: mutateServers } = useQuery({
     queryKey: tonoServersQueryKey,
@@ -49,13 +54,17 @@ const ServersPage = () => {
   })
 
   const handleTestCurrent = useLockFn(async () => {
+    if (!selected) return
     setTesting(true)
+    setSelectError(null)
     try {
-      // The delay manager measures through the running core; re-read its
-      // history after a beat. A dedicated backend test command will replace
-      // this when one exists.
-      await new Promise((resolve) => setTimeout(resolve, 400))
-      setLatencyTick((v) => v + 1)
+      const latency = await tonoTestCurrentServer()
+      setMeasuredLatency((current) => ({
+        ...current,
+        [selected.name]: latency,
+      }))
+    } catch (error) {
+      setSelectError(error instanceof Error ? error.message : String(error))
     } finally {
       setTesting(false)
     }
@@ -70,7 +79,7 @@ const ServersPage = () => {
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          marginBottom: 18,
+          marginBottom: 24,
         }}
       >
         <h1 className="tono-page-title" style={{ color: text.primary }}>
@@ -80,17 +89,17 @@ const ServersPage = () => {
           type="button"
           className="tono-button"
           onClick={handleTestCurrent}
-          disabled={testing || !selected}
+          disabled={testing || !selected || status?.uiState !== 'connected'}
           style={{
-            padding: '8px 16px',
-            fontSize: 12,
+            padding: '8px 14px',
+            fontSize: 13,
             fontWeight: 600,
             color: text.primary,
             background: dark
-              ? 'rgba(255,255,255,0.08)'
-              : 'rgba(255,255,255,0.5)',
-            border: `1px solid ${dark ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.7)'}`,
-            backdropFilter: 'blur(20px)',
+              ? 'rgba(255,255,255,0.07)'
+              : 'rgba(255,255,255,0.68)',
+            border: `1px solid ${dark ? 'rgba(255,255,255,0.1)' : 'rgba(56,72,108,0.1)'}`,
+            backdropFilter: 'blur(10px)',
           }}
         >
           <span style={{ fontSize: 12 }}>⚡</span>
@@ -100,19 +109,21 @@ const ServersPage = () => {
 
       <div
         style={{
-          fontSize: 11,
+          fontSize: 12,
           fontWeight: 600,
-          letterSpacing: 0.6,
-          textTransform: 'uppercase',
+          letterSpacing: 0.15,
           color: text.tertiary,
-          marginBottom: 8,
+          marginBottom: 10,
         }}
       >
         {t('tono.nodes.cloudServers')}
       </div>
 
       {selectError && (
-        <p role="alert" style={{ margin: '0 0 8px', fontSize: 12, color: TONO_COLORS.error }}>
+        <p
+          role="alert"
+          style={{ margin: '0 0 8px', fontSize: 12, color: TONO_COLORS.error }}
+        >
           {selectError}
         </p>
       )}
@@ -122,27 +133,23 @@ const ServersPage = () => {
           {t('tono.nodes.empty')}
         </p>
       ) : (
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: '1fr 1fr',
-            gap: 10,
-          }}
-        >
+        <div className="tono-server-grid">
           {(servers ?? []).map((server) => {
-            const latency = readNodeLatency(server.name)
-            void latencyTick
+            const latency =
+              measuredLatency[server.name] ?? readNodeLatency(server.name)
             return (
               <button
                 key={server.name}
                 type="button"
+                className="tono-server-card"
                 onClick={() => void handleSelect(server.name, server.selected)}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
-                  gap: 8,
-                  padding: 10,
-                  borderRadius: 12,
+                  gap: 11,
+                  minHeight: 66,
+                  padding: '12px 14px',
+                  borderRadius: 16,
                   fontFamily: 'inherit',
                   textAlign: 'left',
                   cursor: server.selected ? 'default' : 'pointer',
@@ -150,22 +157,48 @@ const ServersPage = () => {
                   background: server.selected
                     ? hex(TONO_COLORS.accent, 0.15)
                     : dark
-                      ? 'rgba(255,255,255,0.06)'
-                      : 'rgba(255,255,255,0.7)',
+                      ? 'rgba(16,21,33,0.68)'
+                      : 'rgba(255,255,255,0.72)',
                   border: server.selected
                     ? `1px solid ${hex(TONO_COLORS.accent, 0.5)}`
-                    : `0.5px solid ${dark ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.9)'}`,
-                  transition: `background 0.15s ${TONO_EASE}, border-color 0.15s ${TONO_EASE}`,
+                    : `1px solid ${dark ? 'rgba(255,255,255,0.1)' : 'rgba(56,72,108,0.09)'}`,
+                  boxShadow: server.selected
+                    ? `0 14px 30px -24px ${hex(TONO_COLORS.accent, 0.75)}`
+                    : 'none',
+                  transition: `background 0.15s ${TONO_EASE}, border-color 0.15s ${TONO_EASE}, transform 0.15s ${TONO_EASE}`,
                 }}
               >
-                <span aria-hidden style={{ fontSize: 14, flexShrink: 0 }}>
+                <span
+                  aria-hidden
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    width: 34,
+                    height: 34,
+                    borderRadius: 10,
+                    fontSize: 17,
+                    flexShrink: 0,
+                    background: dark
+                      ? 'rgba(255,255,255,0.07)'
+                      : 'rgba(235,240,250,0.78)',
+                  }}
+                >
                   {nodeFlag(server.name)}
                 </span>
-                <span style={{ display: 'flex', flexDirection: 'column', gap: 1, flex: 1, minWidth: 0 }}>
+                <span
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 1,
+                    flex: 1,
+                    minWidth: 0,
+                  }}
+                >
                   <span
                     style={{
-                      fontSize: 12,
-                      fontWeight: 500,
+                      fontSize: 13,
+                      fontWeight: 600,
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
@@ -173,19 +206,24 @@ const ServersPage = () => {
                   >
                     {nodeDisplayName(server.name)}
                   </span>
-                  <span style={{ fontSize: 10, color: text.tertiary }}>
+                  <span style={{ fontSize: 11, color: text.tertiary }}>
                     {nodeProtocol(server.name)}
                   </span>
                 </span>
                 <span
                   style={{
-                    fontSize: 10,
+                    fontSize: 11,
+                    fontWeight: 600,
                     fontFamily: TONO_MONO_STACK,
                     flexShrink: 0,
+                    padding: '4px 7px',
+                    borderRadius: 7,
                     color:
+                      latency !== null ? latencyColor(latency) : text.tertiary,
+                    background:
                       latency !== null
-                        ? latencyColor(latency)
-                        : text.tertiary,
+                        ? hex(latencyColor(latency), 0.11)
+                        : 'transparent',
                   }}
                 >
                   {latency !== null ? `${latency}ms` : '—'}

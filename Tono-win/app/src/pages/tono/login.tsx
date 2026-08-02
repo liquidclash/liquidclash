@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router'
 import { useTonoStatus } from '@/hooks/use-tono'
 import { useThemeMode } from '@/services/states'
 import {
+  tonoDisconnect,
   tonoRetryRestore,
   tonoSignInStart,
   tonoSignInVerify,
@@ -54,9 +55,13 @@ const LoginPage = () => {
   const [sending, setSending] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [retrying, setRetrying] = useState(false)
+  const [restoringInternet, setRestoringInternet] = useState(false)
   const [verifySuspended, setVerifySuspended] = useState(false)
   const [suspendedDismissed, setSuspendedDismissed] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [restoreInternetError, setRestoreInternetError] = useState<
+    string | null
+  >(null)
   const [countdown, setCountdown] = useState(0)
 
   useEffect(() => {
@@ -72,6 +77,8 @@ const LoginPage = () => {
     (verifySuspended || status?.accountState === 'suspended')
 
   const restoreFailed = status?.accountState === 'error'
+  const internetBlocked =
+    status?.protectionBlocked === true || status?.killSwitch?.wanted === true
 
   const resetToStart = () => {
     setCodeSent(false)
@@ -136,6 +143,23 @@ const LoginPage = () => {
     }
   })
 
+  const handleRestoreInternet = useLockFn(async () => {
+    setRestoringInternet(true)
+    setRestoreInternetError(null)
+    try {
+      // This explicit owner-gated release is intentionally available before
+      // authentication. A persisted fail-closed Service state can otherwise
+      // block the login API while the auth guard hides the dashboard escape.
+      await tonoDisconnect()
+      await mutateTonoStatus()
+      setError(null)
+    } catch (error) {
+      setRestoreInternetError(errorMessage(error))
+    } finally {
+      setRestoringInternet(false)
+    }
+  })
+
   const inputStyle: React.CSSProperties = {
     background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.7)',
     border: `1px solid ${dark ? 'rgba(255,255,255,0.18)' : 'rgba(20,22,30,0.12)'}`,
@@ -149,6 +173,55 @@ const LoginPage = () => {
     color: '#fff',
     background: TONO_COLORS.accent,
   }
+
+  const internetRecovery = internetBlocked ? (
+    <div
+      role="alert"
+      style={{
+        width: '100%',
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10,
+        borderRadius: 12,
+        padding: '12px 14px',
+        textAlign: 'left',
+        color: text.primary,
+        background: `${TONO_COLORS.protectedOffline}1F`,
+        border: `1px solid ${TONO_COLORS.protectedOffline}4D`,
+      }}
+    >
+      <span style={{ fontSize: 13, fontWeight: 650 }}>
+        {t('tono.login.networkBlocked.title')}
+      </span>
+      <span style={{ fontSize: 12, lineHeight: 1.45, color: text.secondary }}>
+        {t('tono.login.networkBlocked.description')}
+      </span>
+      <button
+        type="button"
+        className="tono-button"
+        style={{
+          width: '100%',
+          padding: '9px 12px',
+          fontSize: 13,
+          fontWeight: 600,
+          color: '#fff',
+          background: TONO_COLORS.protectedOffline,
+        }}
+        onClick={handleRestoreInternet}
+        disabled={restoringInternet}
+      >
+        {restoringInternet
+          ? t('tono.login.networkBlocked.restoring')
+          : t('tono.login.networkBlocked.restore')}
+      </button>
+      {restoreInternetError && (
+        <span style={{ fontSize: 12, color: TONO_COLORS.error }}>
+          {restoreInternetError}
+        </span>
+      )}
+    </div>
+  ) : null
 
   if (suspended) {
     return (
@@ -168,6 +241,7 @@ const LoginPage = () => {
             padding: 32,
           }}
         >
+          {internetRecovery}
           <ShieldIcon color={TONO_COLORS.error} />
           <h1 className="tono-page-title" style={{ color: text.primary }}>
             {t('tono.login.suspended.title')}
@@ -208,6 +282,7 @@ const LoginPage = () => {
           padding: 32,
         }}
       >
+        {internetRecovery}
         {restoreFailed && (
           <div
             style={{
@@ -276,7 +351,13 @@ const LoginPage = () => {
           placeholder={t('tono.login.emailPlaceholder')}
           value={email}
           onChange={(event) => setEmail(event.target.value)}
-          disabled={sending || verifying || codeSent}
+          disabled={
+            sending ||
+            verifying ||
+            restoringInternet ||
+            internetBlocked ||
+            codeSent
+          }
         />
 
         {!codeSent ? (
@@ -285,7 +366,7 @@ const LoginPage = () => {
             className="tono-button"
             style={primaryButtonStyle}
             onClick={handleSendCode}
-            disabled={sending}
+            disabled={sending || restoringInternet || internetBlocked}
           >
             {sending ? t('tono.login.sending') : t('tono.login.sendCode')}
           </button>
@@ -304,14 +385,18 @@ const LoginPage = () => {
               maxLength={6}
               inputMode="numeric"
               onChange={(event) => setCode(event.target.value)}
-              disabled={sending || verifying}
+              disabled={
+                sending || verifying || restoringInternet || internetBlocked
+              }
             />
             <button
               type="button"
               className="tono-button"
               style={primaryButtonStyle}
               onClick={handleVerify}
-              disabled={sending || verifying}
+              disabled={
+                sending || verifying || restoringInternet || internetBlocked
+              }
             >
               {verifying ? t('tono.login.verifying') : t('tono.login.verify')}
             </button>
@@ -337,7 +422,12 @@ const LoginPage = () => {
                   marginLeft: 8,
                 }}
                 onClick={countdown > 0 ? undefined : handleSendCode}
-                disabled={sending || countdown > 0}
+                disabled={
+                  sending ||
+                  restoringInternet ||
+                  internetBlocked ||
+                  countdown > 0
+                }
               >
                 {countdown > 0
                   ? t('tono.login.resendIn', { seconds: countdown })
@@ -353,7 +443,9 @@ const LoginPage = () => {
                 alignSelf: 'center',
               }}
               onClick={resetToStart}
-              disabled={sending || verifying}
+              disabled={
+                sending || verifying || restoringInternet || internetBlocked
+              }
             >
               {t('tono.login.changeEmail')}
             </button>

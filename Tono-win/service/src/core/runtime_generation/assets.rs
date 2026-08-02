@@ -517,7 +517,7 @@ pub(super) fn validate_core_path(
         if !allowed {
             return Err(ServiceError::new(
                 ServiceErrorCode::InvalidInstallLocation,
-                "Windows core path is outside an allowed install location",
+                "Windows core path is outside an allowed install location; reinstall Tono under Program Files",
             ));
         }
     }
@@ -552,7 +552,14 @@ pub(super) fn classify_windows_core_path(
     user_writable_roots: &[String],
 ) -> WindowsCorePathClass {
     fn normalize(value: &str) -> String {
-        value.replace('/', "\\").to_lowercase()
+        let normalized = value.replace('/', "\\").to_lowercase();
+        // `std::fs::canonicalize` returns an extended-length path on Windows, while known-folder
+        // and environment-variable roots normally use drive-letter syntax. Compare both in the
+        // latter form or every installed core (`\\?\C:\Program Files\...`) misses the allowlist.
+        normalized
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&normalized)
+            .to_owned()
     }
     fn is_within(path: &str, root: &str) -> bool {
         let root = normalize(root);
@@ -1058,6 +1065,35 @@ mod windows_core_location_tests {
         assert_eq!(
             classify(r"C:\Program Files\tono-inc\mihomo.exe"),
             WindowsCorePathClass::Allowed
+        );
+    }
+
+    #[test]
+    fn accepts_canonical_windows_extended_length_paths() {
+        for path in [
+            r"\\?\C:\ProgramData\Tono\bin\mihomo.exe",
+            r"\\?\C:\Program Files\Tono\verge-mihomo.exe",
+        ] {
+            assert_eq!(
+                classify_windows_core_path(
+                    path,
+                    &[r"C:\ProgramData\Tono".to_owned()],
+                    &[r"C:\Program Files".to_owned()],
+                    &[r"C:\Users\a\AppData\Local\Temp".to_owned()],
+                ),
+                WindowsCorePathClass::Allowed,
+                "rejected {path}"
+            );
+        }
+
+        assert_eq!(
+            classify_windows_core_path(
+                r"\\?\C:\Users\a\AppData\Local\Temp\mihomo.exe",
+                &[r"C:\ProgramData\Tono".to_owned()],
+                &[r"C:\Program Files".to_owned()],
+                &[r"C:\Users\a\AppData\Local\Temp".to_owned()],
+            ),
+            WindowsCorePathClass::UserWritable
         );
     }
 

@@ -23,7 +23,6 @@ import {
   Menu,
   MenuItem,
   Paper,
-  SvgIcon,
   ThemeProvider,
 } from '@mui/material'
 import dayjs from 'dayjs'
@@ -33,9 +32,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Outlet, useLocation, useNavigate } from 'react-router'
 
-import iconDark from '@/assets/image/icon_dark.svg?react'
-import iconLight from '@/assets/image/icon_light.svg?react'
-import LogoSvg from '@/assets/image/logo.svg?react'
 import { BaseErrorBoundary } from '@/components/base'
 import { LayoutItem } from '@/components/layout/layout-item'
 import { LayoutTraffic } from '@/components/layout/layout-traffic'
@@ -50,6 +46,7 @@ import { useI18n } from '@/hooks/use-i18n'
 import { useVerge } from '@/hooks/use-verge'
 import { useWindowDecorations } from '@/hooks/use-window'
 import { useThemeMode } from '@/services/states'
+import { TonoLogo } from '@/tono-ui/TonoLogo'
 import getSystem from '@/utils/get-system'
 
 import {
@@ -332,21 +329,23 @@ const Layout = () => {
                 style={{
                   height: '27px',
                   display: 'flex',
-                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: '7px',
                 }}
               >
-                <SvgIcon
-                  component={isDark ? iconDark : iconLight}
-                  style={{
-                    height: '36px',
-                    width: '36px',
-                    marginTop: '-3px',
-                    marginRight: '5px',
-                    marginLeft: '-3px',
+                <TonoLogo connected={false} size={32} compact />
+                <Box
+                  component="span"
+                  sx={{
+                    color: isDark ? 'common.white' : 'common.black',
+                    fontSize: 20,
+                    fontWeight: 800,
+                    letterSpacing: '-0.55px',
+                    lineHeight: 1,
                   }}
-                  inheritViewBox
-                />
-                <LogoSvg fill={isDark ? 'white' : 'black'} />
+                >
+                  Tono
+                </Box>
               </div>
               <UpdateButton className="the-newbtn" />
             </div>

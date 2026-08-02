@@ -1,6 +1,6 @@
 use crate::core::auth::AuthenticatedOwner;
 use crate::core::desired::{load_active_owner, load_owner_desired_state};
-use crate::core::manager::CORE_MANAGER;
+use crate::core::manager::status_snapshot_nonblocking;
 use crate::core::state::{core_lifecycle_state, service_lifecycle_state};
 use crate::core::structure::{ServiceLifecycleState, ServiceStatusSnapshot};
 use anyhow::Result;
@@ -18,7 +18,7 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
         .map(|active| active.generation);
     let is_active = active_generation.is_some();
     let core = if is_active {
-        Some(CORE_MANAGER.lock().await.status().await)
+        Some(status_snapshot_nonblocking().await)
     } else {
         None
     };
@@ -39,7 +39,10 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
     let network_events = crate::core::netmon::status();
     #[cfg(not(windows))]
     let network_events = crate::core::structure::NetworkEventsStatus::default();
+    let (snapshot_generation, active_operation) = crate::core::operation::snapshot();
     Ok(ServiceStatusSnapshot {
+        snapshot_generation,
+        active_operation,
         is_active,
         active_generation,
         service_state,

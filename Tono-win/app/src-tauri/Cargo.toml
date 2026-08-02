@@ -1,6 +1,6 @@
 [package]
 name = "clash-verge"
-version = "2.5.3"
+version = "2.5.4"
 description = "clash verge"
 authors = ["zzzgydi", "Tunglies", "wonfen", "MystiPanda"]
 license = "GPL-3.0-only"
@@ -45,8 +45,6 @@ clash-verge-limiter = { workspace = true }
 tauri-plugin-clash-verge-sysinfo = { workspace = true }
 tauri-plugin-clipboard-manager = { workspace = true }
 tauri = { workspace = true, features = [
-  "protocol-asset",
-  "devtools",
   "tray-icon",
   "image-ico",
   "image-png",
@@ -81,7 +79,6 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-fs = "2.5.1"
 tauri-plugin-process = "2.3.1"
-tauri-plugin-deep-link = "2.4.9"
 tauri-plugin-window-state = "2.4.1"
 zip = "8.6.0"
 reqwest_dav = "0.3.3"
@@ -100,7 +97,7 @@ tauri-plugin-devtools = { version = "2.1.0" }
 tauri-plugin-mihomo = { git = "https://github.com/clash-verge-rev/tauri-plugin-mihomo", branch = "refactor-use-reqwest-ipc" }
 clash_verge_logger = { git = "https://github.com/clash-verge-rev/clash-verge-logger" }
 async-trait = "0.1.91"
-clash_verge_service_ipc = { path = "../../service", version = "2.6.1", features = [
+clash_verge_service_ipc = { path = "../../service", version = "2.6.2", features = [
   "client",
 ] }
 arc-swap = "1.9.2"
@@ -111,7 +108,7 @@ rust_iso3166 = "0.2.0"
 # Use the git repo until the next release after v2.0.0.
 dark-light = { git = "https://github.com/rust-dark-light/dark-light" }
 bytes = "1.12.1"
-tokio-util = { version = "0.7.19", features = ["time"] }
+tokio-util = { version = "0.7.19", features = ["rt", "time"] }
 tono-core = { path = "../../crates/tono-core" }
 keyring = { version = "3", default-features = false, features = [
   "windows-native",

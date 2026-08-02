@@ -24,7 +24,6 @@ use once_cell::sync::OnceCell;
 use tauri::{AppHandle, Manager as _};
 #[cfg(target_os = "macos")]
 use tauri_plugin_autostart::MacosLauncher;
-use tauri_plugin_deep_link::DeepLinkExt as _;
 
 pub static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 /// Application initialization helper functions
@@ -52,7 +51,6 @@ mod app_init {
             .plugin(tauri_plugin_fs::init())
             .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_shell::init())
-            .plugin(tauri_plugin_deep_link::init())
             .plugin(tauri_plugin_http::init())
             .plugin(
                 tauri_plugin_mihomo::Builder::new()
@@ -68,26 +66,6 @@ mod app_init {
             builder = builder.plugin(tauri_plugin_devtools::init());
         }
         builder
-    }
-
-    /// Setup deep link handling
-    pub fn setup_deep_links(app: &tauri::App) {
-        #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
-        {
-            logging!(info, Type::Setup, "注册深层链接...");
-            let _ = app.deep_link().register_all();
-        }
-
-        app.deep_link().on_open_url(|event| {
-            let urls = event.urls();
-            AsyncHandler::spawn(move || async move {
-                if let Some(url) = urls.first()
-                    && let Err(e) = resolve::resolve_scheme(url.as_ref()).await
-                {
-                    logging!(error, Type::Setup, "Failed to resolve scheme: {}", e);
-                }
-            });
-        });
     }
 
     /// Setup autostart plugin
@@ -217,6 +195,7 @@ mod app_init {
             tono::commands::tono_revoke_device,
             tono::commands::tono_servers,
             tono::commands::tono_select_server,
+            tono::commands::tono_test_current_server,
             tono::commands::tono_connect,
             tono::commands::tono_disconnect,
             tono::commands::tono_status,
@@ -283,8 +262,6 @@ pub fn run() {
                 if let Err(e) = app_init::setup_autostart(app) {
                     logging!(error, Type::Setup, "Failed to setup autostart: {}", e);
                 }
-
-                app_init::setup_deep_links(app);
 
                 if let Err(e) = app_init::setup_window_state(app) {
                     logging!(error, Type::Setup, "Failed to setup window state: {}", e);
@@ -479,7 +456,25 @@ pub fn run() {
                     handle::Handle::global().set_is_exiting();
                     // L1: Quit is one of the three releasing causes (§6) — restore
                     // DNS and disarm via the owner-gated route, best-effort.
-                    tono::commands::quit_release(app_handle.clone()).await;
+                    match tokio::time::timeout(
+                        tono::commands::QUIT_RELEASE_BUDGET,
+                        tono::commands::quit_release(app_handle.clone()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => logging!(
+                            error,
+                            Type::Service,
+                            "Tono: session-ending release failed; protection remains fail-closed: {error}"
+                        ),
+                        Err(_) => logging!(
+                            error,
+                            Type::Service,
+                            "Tono: session-ending release exceeded {:?}; Service reconciliation may still be running",
+                            tono::commands::QUIT_RELEASE_BUDGET
+                        ),
+                    }
                     let cleanup_result = feat::clean_session_ending_best_effort().await;
                     logging!(
                         info,
@@ -502,16 +497,19 @@ pub fn run() {
             } else if code.is_none() {
                 api.prevent_exit();
                 if !handle::Handle::global().is_exiting() {
+                    // Claim the single-flight synchronously before returning to Tao. Cleanup runs
+                    // on the async runtime so the native event loop keeps pumping paint, drag and
+                    // minimize messages while Service/Core shutdown completes.
+                    handle::Handle::global().set_is_exiting();
                     let app_handle = app_handle.clone();
-                    AsyncHandler::block_on(async move {
-                        // L1: explicit Quit releases the kill switch (§6)
-                        // before the legacy shutdown runs.
-                        tono::commands::quit_release(app_handle.clone()).await;
-                        feat::quit().await;
-                        // M3: still here means the quit was cancelled — the
-                        // barrier may already be released while the FSM
-                        // claims protection; re-sync before resuming.
-                        tono::commands::resync_after_cancelled_quit(app_handle).await;
+                    AsyncHandler::spawn(move || async move {
+                        // `feat::quit` is the sole explicit-release owner. A second release here
+                        // used to consume another 2.5 s budget and could race the Service cleanup.
+                        if matches!(feat::quit().await, clash_verge_signal::ShutdownOutcome::Canceled) {
+                            // The barrier may already be released while the FSM still claims
+                            // protection; re-sync only when quitting was actually cancelled.
+                            tono::commands::resync_after_cancelled_quit(app_handle).await;
+                        }
                     });
                 }
             }

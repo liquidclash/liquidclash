@@ -1,5 +1,5 @@
 {
-  "version": "2.5.3",
+  "version": "2.5.4",
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "bundle": {
     "active": true,
@@ -11,9 +11,17 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources"],
+    "resources": [
+      "resources/Country.mmdb",
+      "resources/geoip.dat",
+      "resources/geosite.dat",
+      "resources/enableLoopback.exe",
+      "resources/tono-service.exe",
+      "resources/tono-service-install.exe",
+      "resources/tono-service-uninstall.exe"
+    ],
     "publisher": "Raydocs",
-    "externalBin": ["sidecar/verge-mihomo", "sidecar/verge-mihomo-alpha"],
+    "externalBin": ["sidecar/verge-mihomo"],
     "copyright": "GNU General Public License v3.0",
     "category": "DeveloperTool",
     "shortDescription": "Tono",
@@ -29,24 +37,17 @@
   "productName": "Tono",
   "mainBinaryName": "Tono",
   "identifier": "com.raydocs.tono",
-  "plugins": {
-    "deep-link": {
-      "desktop": {
-        "schemes": ["clash", "clash-verge"]
-      }
-    }
-  },
   "app": {
     "security": {
       "capabilities": ["desktop-capability", "migrated"],
       "assetProtocol": {
-        "enable": true,
+        "enable": false,
         "scope": {
-          "allow": ["**"],
+          "allow": [],
           "requireLiteralLeadingDot": false
         }
       },
-      "csp": null
+      "csp": "default-src 'self' customprotocol: asset:; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     }
   }
 }

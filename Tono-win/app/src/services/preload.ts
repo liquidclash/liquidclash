@@ -102,5 +102,5 @@ export const preloadAppData = async () => {
     initializeLanguage(initialLanguage),
   ])
   const initialThemeMode = resolveThemeMode(config)
-  return { initialThemeMode }
+  return { initialThemeMode, initialLanguage }
 }

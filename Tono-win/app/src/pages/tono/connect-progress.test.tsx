@@ -94,7 +94,13 @@ const renderCard = (
     <ConnectProgressCard
       uiState="connecting"
       selectedServer="US West 1"
-      killSwitchMode="locked"
+      killSwitch={{
+        wanted: true,
+        live: true,
+        mode: 'locked',
+        endpoints: [],
+        last_error: null,
+      }}
       onRefreshStatus={onRefreshStatus}
       {...props}
     />,
@@ -262,7 +268,16 @@ describe('ConnectProgressCard', () => {
       }),
     )
 
-    renderCard({ uiState: 'protectedOffline' })
+    renderCard({
+      uiState: 'notConnected',
+      killSwitch: {
+        wanted: false,
+        live: false,
+        mode: 'blocked',
+        endpoints: [],
+        last_error: null,
+      },
+    })
 
     fireEvent.click(
       await screen.findByRole('button', { name: 'Copy details' }),
@@ -272,7 +287,9 @@ describe('ConnectProgressCard', () => {
     const copied = writeText.mock.calls[0][0] as string
     expect(copied).toContain('Tono v')
     expect(copied).toContain('Server: US West 1')
-    expect(copied).toContain('Kill switch: locked')
+    expect(copied).toContain(
+      'Kill switch: inactive (reported mode=blocked, wanted=false, live=false)',
+    )
     expect(copied).toContain('Failed stage: startingTunnel')
     expect(copied).toContain('Error: dns probe failed')
     expect(copied).toContain('Retry attempt: 2')

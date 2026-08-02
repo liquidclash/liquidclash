@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Outlet, useLocation, useNavigate } from 'react-router'
 
-import { BaseErrorBoundary } from '@/components/base'
+import { BaseErrorBoundary } from '@/components/base/base-error-boundary'
 import { NoticeManager } from '@/components/layout/notice-manager'
 import {
   WindowControls,

@@ -18,4 +18,4 @@ pub mod tray;
 pub mod validate;
 pub mod win_uwp;
 
-pub use self::{manager::CoreManager, timer::Timer};
+pub use self::manager::CoreManager;

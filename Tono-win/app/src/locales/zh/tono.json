@@ -32,6 +32,12 @@
       "title": "会话恢复失败",
       "description": "恢复此前的登录会话失败。请重试，或在下方重新登录。",
       "retry": "重试"
+    },
+    "networkBlocked": {
+      "title": "当前网络访问已被阻断",
+      "description": "Tono 恢复了上次连接遗留的防泄漏保护。请先恢复正常网络，再进行登录。",
+      "restore": "恢复正常网络",
+      "restoring": "正在恢复网络…"
     }
   },
   "pill": {
@@ -71,11 +77,16 @@
     "catalogRequiresChoice": "您选择的节点已下线 — 请重新选择",
     "killSwitchError": "Kill switch：{{message}}",
     "killSwitchErrorNote": "最近一次错误，可能已恢复。",
+    "errors": {
+      "serviceBusy": "Tono 服务正在安装或修复。请批准待处理的管理员提示，或重启 Tono。",
+      "releaseReconciling": "网络保护仍在释放中。请稍候再连接，避免拆掉新连接。",
+      "serviceTooOld": "当前 Tono 服务版本过旧。请用最新安装包重装，以替换 Service。"
+    },
     "info": {
-      "ip": "IP",
-      "asnType": "ASN 类型",
-      "city": "城市",
-      "dns": "DNS"
+      "protection": "流量保护",
+      "dns": "安全 DNS",
+      "upload": "上传",
+      "download": "下载"
     }
   },
   "node": {
@@ -150,7 +161,8 @@
       "tunSubtitle": "Tono 需要它来防止应用绕过代理",
       "allowLan": "允许局域网连接",
       "allowLanSubtitle": "由 Tono 托管",
-      "mixedPort": "混合端口"
+      "mixedPort": "混合端口",
+      "disabled": "已关闭（仅 TUN）"
     },
     "appearance": {
       "title": "外观",

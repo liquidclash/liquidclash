@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 #[cfg(windows)]
 use anyhow::Result;
@@ -24,6 +24,17 @@ use crate::{
 
 static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
+/// Keep synchronous Windows named-pipe and Service Control Manager verification away from the
+/// application's Tauri runtime. `kode-bridge` performs those checks inline before its first
+/// async pipe operation, so a slow SCM can otherwise occupy every worker on a small Windows VM.
+static IPC_RUNTIME: Lazy<std::result::Result<tokio::runtime::Runtime, String>> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("tono-service-ipc")
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+});
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 /// The Service bounds one handler at 60 seconds. A mutating client must wait slightly longer so
@@ -32,7 +43,29 @@ const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(65);
 /// Read-only status calls still round-trip through the service's state (and, on Windows,
 /// cached verify results), so they get more than the interactive default but far less than
 /// a lifecycle mutation.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// `kode-bridge` applies `max_retries` to both connection establishment and the complete HTTP
+/// request. The Run State already owns startup retry/backoff, so an individual read must stay
+/// small and bounded; otherwise two status calls can occupy the dedicated IPC runtime for
+/// minutes and queue a safety-critical release behind them.
+const READ_REQUEST_ATTEMPTS: usize = 2;
+/// A mutating request is never replayed after an ambiguous transport failure. The Service may
+/// already have committed it even when its response was lost.
+const MUTATING_REQUEST_ATTEMPTS: usize = 1;
+
+async fn run_on_ipc_runtime<T, F>(future: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    let runtime = IPC_RUNTIME
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("failed to initialize Service IPC runtime: {error}"))?;
+    runtime
+        .spawn(future)
+        .await
+        .map_err(|error| anyhow::anyhow!("Service IPC runtime task failed: {error}"))?
+}
 
 fn protected<'a>(
     request: kode_bridge::HttpRequestBuilder<'a>,
@@ -56,6 +89,14 @@ impl Verb {
     const fn is_read_only(self) -> bool {
         matches!(self, Self::Get)
     }
+
+    const fn max_attempts(self) -> usize {
+        if self.is_read_only() {
+            READ_REQUEST_ATTEMPTS
+        } else {
+            MUTATING_REQUEST_ATTEMPTS
+        }
+    }
 }
 
 /// One protected request: connect, wrap the payload in the envelope the route expects, declare
@@ -76,17 +117,41 @@ async fn protected_call<P, R>(
     timeout: Option<Duration>,
 ) -> Result<Response<R>>
 where
+    P: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + 'static,
+    R: for<'de> serde::Deserialize<'de> + Send + 'static,
+{
+    let credentials = credentials.clone();
+    let session = session.cloned();
+    run_on_ipc_runtime(async move {
+        protected_call_inner(
+            verb,
+            command,
+            &credentials,
+            session.as_ref(),
+            payload,
+            timeout,
+        )
+        .await
+    })
+    .await
+}
+
+async fn protected_call_inner<P, R>(
+    verb: Verb,
+    command: IpcCommand,
+    credentials: &OwnerCredentials,
+    session: Option<&OwnerSessionProof>,
+    payload: P,
+    timeout: Option<Duration>,
+) -> Result<Response<R>>
+where
     P: serde::Serialize + for<'de> serde::Deserialize<'de>,
     R: for<'de> serde::Deserialize<'de>,
 {
     // kode-bridge retries transport errors by default. That is useful for reads, but unsafe for
     // lifecycle writes: a response can be lost after the Service committed, and an automatic
     // retry would execute the mutation again. Product-level callers own any deliberate retry.
-    let client = if verb.is_read_only() {
-        connect().await?
-    } else {
-        connect_with_max_retries(Some(1)).await?
-    };
+    let client = connect_with_max_retries(Some(verb.max_attempts())).await?;
     let body = match session {
         None => AuthenticatedRequest {
             credentials: credentials.clone(),
@@ -195,7 +260,13 @@ pub fn is_ipc_path_exists() -> bool {
 }
 
 pub async fn get_version() -> Result<Response<ProtocolInfo>> {
-    let client = connect().await?;
+    run_on_ipc_runtime(get_version_inner()).await
+}
+
+async fn get_version_inner() -> Result<Response<ProtocolInfo>> {
+    // Startup retry/backoff belongs to `RunState::await_ready`; keep each probe bounded so it
+    // cannot monopolize the isolated IPC runtime.
+    let client = connect_with_max_retries(Some(READ_REQUEST_ATTEMPTS)).await?;
     let response = client
         .get(IpcCommand::GetVersion.as_ref())
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
@@ -206,7 +277,15 @@ pub async fn get_version() -> Result<Response<ProtocolInfo>> {
 }
 
 pub async fn get_status(credentials: &OwnerCredentials) -> Result<Response<ServiceStatusSnapshot>> {
-    protected_call(Verb::Get, IpcCommand::Status, credentials, None, (), None).await
+    protected_call(
+        Verb::Get,
+        IpcCommand::Status,
+        credentials,
+        None,
+        (),
+        Some(STATUS_TIMEOUT),
+    )
+    .await
 }
 
 pub async fn preflight_macos_kill_switch(credentials: &OwnerCredentials) -> Result<Response<()>> {
@@ -250,6 +329,22 @@ pub async fn lock_kill_switch(
         credentials,
         Some(session),
         body,
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+/// Persist completion of the full app verification barrier. Session-gated and idempotent.
+pub async fn mark_kill_switch_verified(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+) -> Result<Response<()>> {
+    protected_call(
+        Verb::Post,
+        IpcCommand::MarkKillSwitchVerified,
+        credentials,
+        Some(session),
+        (),
         Some(LIFECYCLE_TIMEOUT),
     )
     .await
@@ -478,12 +573,66 @@ pub async fn set_system_proxy(
 
 #[cfg(test)]
 mod retry_safety_tests {
-    use super::Verb;
+    use super::{MUTATING_REQUEST_ATTEMPTS, READ_REQUEST_ATTEMPTS, Verb, run_on_ipc_runtime};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn only_reads_are_safe_for_automatic_transport_retry() {
         assert!(Verb::Get.is_read_only());
         assert!(!Verb::Post.is_read_only());
         assert!(!Verb::Delete.is_read_only());
+        assert_eq!(Verb::Get.max_attempts(), READ_REQUEST_ATTEMPTS);
+        assert_eq!(Verb::Post.max_attempts(), MUTATING_REQUEST_ATTEMPTS);
+        assert_eq!(Verb::Delete.max_attempts(), MUTATING_REQUEST_ATTEMPTS);
+    }
+
+    #[test]
+    fn synchronous_ipc_work_does_not_starve_a_single_threaded_caller() {
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build caller runtime: {error}"));
+        caller.block_on(async {
+            let started = Instant::now();
+            let blocked = run_on_ipc_runtime(async {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok(())
+            });
+            let tick = async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                started.elapsed()
+            };
+            let (result, ticked_at) = tokio::join!(blocked, tick);
+            result.unwrap_or_else(|error| panic!("isolated IPC work failed: {error}"));
+            assert!(
+                ticked_at < Duration::from_millis(200),
+                "caller runtime was starved for {ticked_at:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn dropping_the_caller_does_not_cancel_started_ipc_work() {
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build caller runtime: {error}"));
+        caller.block_on(async {
+            let completed = Arc::new(AtomicBool::new(false));
+            let task_completed = Arc::clone(&completed);
+            let outer = tokio::spawn(run_on_ipc_runtime(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                task_completed.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            outer.abort();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(completed.load(Ordering::SeqCst));
+        });
     }
 }

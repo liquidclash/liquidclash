@@ -6,7 +6,11 @@ import { Link, useNavigate } from 'react-router'
 import { useTonoStatus } from '@/hooks/use-tono'
 import { useTrafficData } from '@/hooks/use-traffic-data'
 import { useThemeMode } from '@/services/states'
-import { tonoConnect, tonoDisconnect } from '@/services/tono'
+import {
+  formatTonoActionError,
+  tonoConnect,
+  tonoDisconnect,
+} from '@/services/tono'
 import { ConnectPill } from '@/tono-ui/ConnectPill'
 import { GlassCard } from '@/tono-ui/GlassCard'
 import {
@@ -22,7 +26,13 @@ import { latencyColor, readNodeLatency } from './node-latency'
 import { nodeFlag, nodeDisplayName } from './node-meta'
 
 const LockIcon = ({ locked }: { locked: boolean }) => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+  <svg
+    width="12"
+    height="12"
+    viewBox="0 0 24 24"
+    fill="currentColor"
+    aria-hidden
+  >
     {locked ? (
       <path d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5zm-3 8V7a3 3 0 1 1 6 0v3H9z" />
     ) : (
@@ -37,7 +47,13 @@ const hex = (color: string, alpha: number) =>
     .padStart(2, '0')
     .toUpperCase()}`
 
-const ActiveNodeCard = ({ serverName, connected }: { serverName: string; connected: boolean }) => {
+const ActiveNodeCard = ({
+  serverName,
+  connected,
+}: {
+  serverName: string
+  connected: boolean
+}) => {
   const { t } = useTranslation()
   const dark = useThemeMode() !== 'light'
   const text = tonoText(dark)
@@ -56,13 +72,12 @@ const ActiveNodeCard = ({ serverName, connected }: { serverName: string; connect
 
   return (
     <GlassCard
-      radius={12}
-      tint={dark ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.5)'}
+      radius={18}
       padding={0}
       style={{
-        width: 480,
+        width: 520,
         maxWidth: '100%',
-        border: `1px solid ${dark ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.75)'}`,
+        overflow: 'hidden',
         animation: `tono-card-in 0.5s ${TONO_SPRING}`,
       }}
     >
@@ -71,15 +86,15 @@ const ActiveNodeCard = ({ serverName, connected }: { serverName: string; connect
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          padding: '10px 14px 8px',
+          padding: '13px 16px 10px',
         }}
       >
         <span
           style={{
-            fontSize: 10,
+            fontSize: 11,
             fontWeight: 600,
-            letterSpacing: 0.6,
-            color: TONO_COLORS.gray,
+            letterSpacing: 0.15,
+            color: text.secondary,
           }}
         >
           {connected
@@ -90,24 +105,31 @@ const ActiveNodeCard = ({ serverName, connected }: { serverName: string; connect
           type="button"
           className="tono-link"
           onClick={() => navigate('/servers')}
-          style={{ fontSize: 12, fontWeight: 500, color: TONO_COLORS.accent }}
+          style={{
+            minHeight: 30,
+            padding: '5px 9px',
+            fontSize: 12,
+            fontWeight: 600,
+            color: dark ? '#A9B7FF' : '#3453D5',
+            background: hex(TONO_COLORS.accent, dark ? 0.12 : 0.08),
+          }}
         >
           {t('tono.node.switch')}
         </button>
       </div>
 
-      <div style={{ padding: '0 12px 12px' }}>
+      <div style={{ padding: '0 10px 10px' }}>
         <div
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 10,
-            borderRadius: 10,
-            padding: '12px 14px',
+            gap: 12,
+            borderRadius: 13,
+            padding: '13px 15px',
             background: dark
-              ? 'rgba(255,255,255,0.24)'
-              : 'rgba(255,255,255,0.65)',
-            border: `1px solid ${dark ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.85)'}`,
+              ? 'rgba(255,255,255,0.055)'
+              : 'rgba(235,240,250,0.68)',
+            border: `1px solid ${dark ? 'rgba(255,255,255,0.08)' : 'rgba(56,72,108,0.08)'}`,
           }}
         >
           <span
@@ -116,23 +138,31 @@ const ActiveNodeCard = ({ serverName, connected }: { serverName: string; connect
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              width: 28,
-              height: 28,
-              borderRadius: '50%',
-              fontSize: 16,
+              width: 36,
+              height: 36,
+              borderRadius: 11,
+              fontSize: 18,
               background: dark
-                ? 'rgba(255,255,255,0.28)'
-                : 'rgba(255,255,255,0.8)',
+                ? 'rgba(255,255,255,0.08)'
+                : 'rgba(255,255,255,0.82)',
               flexShrink: 0,
             }}
           >
             {nodeFlag(serverName)}
           </span>
-          <span style={{ display: 'flex', flexDirection: 'column', gap: 1, flex: 1, minWidth: 0 }}>
+          <span
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 1,
+              flex: 1,
+              minWidth: 0,
+            }}
+          >
             <span
               style={{
-                fontSize: 13,
-                fontWeight: 600,
+                fontSize: 14,
+                fontWeight: 650,
                 color: text.primary,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -141,17 +171,17 @@ const ActiveNodeCard = ({ serverName, connected }: { serverName: string; connect
             >
               {nodeDisplayName(serverName)}
             </span>
-            <span style={{ fontSize: 11, color: TONO_COLORS.gray }}>
+            <span style={{ fontSize: 11, color: text.tertiary }}>
               {t('tono.node.group')}
             </span>
           </span>
           <span
             style={{
-              fontSize: 12,
+              fontSize: 11,
               fontWeight: 600,
               fontFamily: TONO_MONO_STACK,
-              borderRadius: 6,
-              padding: '4px 8px',
+              borderRadius: 8,
+              padding: '5px 9px',
               color: latency !== null ? latencyColor(latency) : text.tertiary,
               background:
                 latency !== null
@@ -170,26 +200,36 @@ const ActiveNodeCard = ({ serverName, connected }: { serverName: string; connect
 const InfoItem = ({
   label,
   value,
+  valueColor,
 }: {
   label: string
   value: string
+  valueColor?: string
 }) => {
   const dark = useThemeMode() !== 'light'
   const text = tonoText(dark)
   return (
-    <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+    <span
+      style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 76 }}
+    >
       <span
         style={{
-          fontSize: 9,
+          fontSize: 10,
           fontWeight: 600,
-          letterSpacing: 0.6,
-          textTransform: 'uppercase',
+          letterSpacing: 0.2,
           color: text.tertiary,
         }}
       >
         {label}
       </span>
-      <span style={{ fontSize: 12, fontWeight: 500, color: text.secondary }}>
+      <span
+        style={{
+          fontSize: 12,
+          fontWeight: 600,
+          color: valueColor ?? text.primary,
+          fontFamily: TONO_MONO_STACK,
+        }}
+      >
         {value}
       </span>
     </span>
@@ -216,7 +256,7 @@ const DashboardPage = () => {
       await tonoConnect()
       await mutateTonoStatus()
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error))
+      setActionError(formatTonoActionError(error, t))
     }
   })
 
@@ -226,7 +266,7 @@ const DashboardPage = () => {
       await tonoDisconnect()
       await mutateTonoStatus()
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error))
+      setActionError(formatTonoActionError(error, t))
     }
   })
 
@@ -234,9 +274,11 @@ const DashboardPage = () => {
   const [down, downUnit] = parseTraffic(traffic?.down ?? 0)
 
   return (
-    <div className="tono-page">
+    <div className="tono-page tono-dashboard">
       {status?.catalogRequiresChoice && (
-        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}>
+        <div
+          style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}
+        >
           <Link
             to="/servers"
             style={{
@@ -254,10 +296,12 @@ const DashboardPage = () => {
         </div>
       )}
       {status?.killSwitch?.last_error && (
-        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}>
+        <div
+          style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}
+        >
           <span
             style={{
-              fontSize: 12,
+              fontSize: 13,
               fontWeight: 500,
               color: TONO_COLORS.error,
               borderRadius: 10,
@@ -275,10 +319,12 @@ const DashboardPage = () => {
         </div>
       )}
       {actionError && (
-        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}>
+        <div
+          style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}
+        >
           <span
             style={{
-              fontSize: 12,
+              fontSize: 13,
               fontWeight: 500,
               color: TONO_COLORS.error,
               borderRadius: 10,
@@ -291,38 +337,46 @@ const DashboardPage = () => {
         </div>
       )}
 
-      {/* Top status line */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: 6,
-          fontSize: 13,
-          fontWeight: 600,
-          color: text.primary,
-        }}
-      >
-        <LockIcon locked={connected} />
-        <span>
-          {connected
-            ? t('tono.pill.statusProtected')
-            : t('tono.pill.statusReality')}
-        </span>
-      </div>
-
       {/* Center stack */}
-      <div
-        style={{
-          flex: 1,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: 24,
-        }}
-      >
-        <div style={{ transition: `all 0.5s ${TONO_SPRING}` }}>
+      <div className="tono-dashboard__content">
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 7,
+            minHeight: 30,
+            padding: '5px 11px',
+            borderRadius: 999,
+            fontSize: 12,
+            fontWeight: 600,
+            color: connected ? TONO_COLORS.connected : text.secondary,
+            background: connected
+              ? hex(TONO_COLORS.connected, dark ? 0.12 : 0.09)
+              : dark
+                ? 'rgba(255,255,255,0.06)'
+                : 'rgba(255,255,255,0.58)',
+            border: `1px solid ${
+              connected
+                ? hex(TONO_COLORS.connected, 0.18)
+                : dark
+                  ? 'rgba(255,255,255,0.08)'
+                  : 'rgba(40,54,86,0.08)'
+            }`,
+          }}
+        >
+          <LockIcon locked={connected} />
+          <span>
+            {connected
+              ? t('tono.pill.statusProtected')
+              : t('tono.pill.statusReality')}
+          </span>
+        </div>
+        <div
+          style={{
+            transition: `all 0.5s ${TONO_SPRING}`,
+          }}
+        >
           <ConnectPill
             uiState={uiState}
             stageLabel={status?.stageLabel}
@@ -333,7 +387,7 @@ const DashboardPage = () => {
         <ConnectProgressCard
           uiState={uiState}
           selectedServer={status?.selectedServer ?? null}
-          killSwitchMode={status?.killSwitch?.mode ?? null}
+          killSwitch={status?.killSwitch ?? null}
           onRefreshStatus={mutateTonoStatus}
         />
         {status?.selectedServer && (
@@ -351,35 +405,33 @@ const DashboardPage = () => {
             style={{
               display: 'flex',
               alignItems: 'center',
-              gap: 24,
-              borderRadius: 12,
-              padding: '10px 20px',
+              justifyContent: 'space-between',
+              gap: 22,
+              width: 520,
+              maxWidth: '100%',
+              borderRadius: 16,
+              padding: '12px 16px',
               background: dark
-                ? 'rgba(255,255,255,0.08)'
-                : 'rgba(255,255,255,0.5)',
+                ? 'rgba(16,21,33,0.58)'
+                : 'rgba(255,255,255,0.62)',
+              border: `1px solid ${dark ? 'rgba(255,255,255,0.09)' : 'rgba(255,255,255,0.72)'}`,
+              backdropFilter: 'blur(18px)',
             }}
           >
-            <InfoItem label={t('tono.dashboard.info.ip')} value="—" />
-            <InfoItem label={t('tono.dashboard.info.asnType')} value="—" />
-            <InfoItem label={t('tono.dashboard.info.city')} value="—" />
+            <InfoItem
+              label={t('tono.dashboard.info.protection')}
+              value={t('tono.dashboard.killSwitchModes.locked')}
+              valueColor={TONO_COLORS.connected}
+            />
             <InfoItem label={t('tono.dashboard.info.dns')} value="127.0.0.1" />
-            <span
-              style={{
-                display: 'flex',
-                gap: 12,
-                marginLeft: 8,
-                fontFamily: TONO_MONO_STACK,
-                fontSize: 11,
-                color: text.secondary,
-              }}
-            >
-              <span>
-                <span style={{ fontSize: 9 }}>↑</span> {up} {upUnit}/s
-              </span>
-              <span>
-                <span style={{ fontSize: 9 }}>↓</span> {down} {downUnit}/s
-              </span>
-            </span>
+            <InfoItem
+              label={t('tono.dashboard.info.upload')}
+              value={`↑ ${up} ${upUnit}/s`}
+            />
+            <InfoItem
+              label={t('tono.dashboard.info.download')}
+              value={`↓ ${down} ${downUnit}/s`}
+            />
           </div>
         </div>
       )}

@@ -23,16 +23,16 @@ export const TONO_EASE = 'cubic-bezier(0.25, 0.1, 0.25, 1)'
 export const TONO_SPRING = 'cubic-bezier(0.34, 1.3, 0.64, 1)'
 
 export const TONO_FONT_STACK =
-  '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", Arial, sans-serif'
+  '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif'
 
 export const TONO_MONO_STACK =
-  'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace'
+  'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace'
 
 /** Text/foreground ramps. macOS resolves these from semantic colors. */
 export const tonoText = (dark: boolean) => ({
-  primary: dark ? 'rgba(255,255,255,0.92)' : 'rgba(20,22,30,0.92)',
-  secondary: dark ? 'rgba(255,255,255,0.6)' : 'rgba(20,22,30,0.6)',
-  tertiary: dark ? 'rgba(255,255,255,0.4)' : 'rgba(20,22,30,0.4)',
+  primary: dark ? 'rgba(255,255,255,0.96)' : 'rgba(20,22,30,0.94)',
+  secondary: dark ? 'rgba(255,255,255,0.72)' : 'rgba(20,22,30,0.68)',
+  tertiary: dark ? 'rgba(255,255,255,0.5)' : 'rgba(20,22,30,0.52)',
 })
 
 // ---------------------------------------------------------------------------
@@ -72,7 +72,11 @@ const subscribeGlass = (onChange: () => void) => {
 }
 
 export const useGlassTransparency = () =>
-  useSyncExternalStore(subscribeGlass, getGlassTransparency, () => GLASS_DEFAULT)
+  useSyncExternalStore(
+    subscribeGlass,
+    getGlassTransparency,
+    () => GLASS_DEFAULT,
+  )
 
 export const glassOpacity = (transparency: number) =>
   0.94 - (transparency / 100) * 0.22

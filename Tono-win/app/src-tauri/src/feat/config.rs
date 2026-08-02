@@ -356,6 +356,10 @@ pub async fn sanitize_verge_config_for_tono() {
             || data.webdav_username.is_some()
             || data.webdav_password.is_some()
             || data.tray_event.as_deref() != Some("dashboard")
+            // Windows (and Tono product) ships one audited stable core. A hand-edited
+            // verge.yaml that still names alpha would demand a second ~47 MB binary.
+            || data.clash_core.as_deref().is_some_and(|core| core != "verge-mihomo")
+            || data.clash_core.is_none()
     };
     if !needs_fix {
         return;
@@ -373,6 +377,7 @@ pub async fn sanitize_verge_config_for_tono() {
         d.webdav_username = None;
         d.webdav_password = None;
         d.tray_event = Some("dashboard".into());
+        d.clash_core = Some("verge-mihomo".into());
     });
     verge.apply();
     let data = verge.data_arc();

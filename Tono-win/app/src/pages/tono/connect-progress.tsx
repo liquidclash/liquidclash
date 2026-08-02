@@ -13,6 +13,7 @@ import {
   tonoDisconnect,
   tonoRetryNow,
   type TonoConnectStep,
+  type TonoKillSwitch,
   type TonoUiState,
 } from '@/services/tono'
 import { GlassCard } from '@/tono-ui/GlassCard'
@@ -63,10 +64,7 @@ const useConnectProgress = (active: boolean) => {
   useEffect(() => {
     refetchRef.current = refetch
   })
-  useEffect(
-    () => subscribeTonoStatus(() => void refetchRef.current()),
-    [],
-  )
+  useEffect(() => subscribeTonoStatus(() => void refetchRef.current()), [])
 
   return progress
 }
@@ -123,14 +121,14 @@ const StepIcon = ({ state }: { state: TonoConnectStep['state'] }) => {
 interface ConnectProgressCardProps {
   uiState: TonoUiState
   selectedServer: string | null
-  killSwitchMode: string | null
+  killSwitch: TonoKillSwitch | null
   onRefreshStatus: () => Promise<unknown>
 }
 
 export const ConnectProgressCard = ({
   uiState,
   selectedServer,
-  killSwitchMode,
+  killSwitch,
   onRefreshStatus,
 }: ConnectProgressCardProps) => {
   const { t } = useTranslation()
@@ -187,7 +185,13 @@ export const ConnectProgressCard = ({
       `Tono v${version} diagnostics`,
       `Server: ${selectedServer ?? '(none)'}`,
       `UI state: ${uiState}`,
-      `Kill switch: ${killSwitchMode ?? '(unknown)'}`,
+      `Kill switch: ${
+        killSwitch
+          ? !killSwitch.wanted && !killSwitch.live
+            ? `inactive (reported mode=${killSwitch.mode}, wanted=false, live=false)`
+            : `${killSwitch.mode} (wanted=${killSwitch.wanted}, live=${killSwitch.live})`
+          : '(unknown)'
+      }`,
       `Failed stage: ${progress?.failedStage ?? '(none)'}`,
       `Error: ${progress?.error ?? '(none)'}`,
       `Retry attempt: ${progress?.retryAttempt ?? 0}`,
@@ -229,13 +233,11 @@ export const ConnectProgressCard = ({
 
   return (
     <GlassCard
-      radius={12}
-      tint={dark ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.5)'}
-      padding={14}
+      radius={18}
+      padding={18}
       style={{
-        width: 480,
+        width: 520,
         maxWidth: '100%',
-        border: `1px solid ${dark ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.75)'}`,
       }}
     >
       {/* Header: total elapsed + retry badge */}
@@ -244,14 +246,14 @@ export const ConnectProgressCard = ({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          marginBottom: 10,
+          marginBottom: 14,
         }}
       >
         <span
           style={{
-            fontSize: 10,
+            fontSize: 11,
             fontWeight: 600,
-            letterSpacing: 0.6,
+            letterSpacing: 0.2,
             fontFamily: TONO_MONO_STACK,
             color: text.tertiary,
           }}
@@ -266,7 +268,7 @@ export const ConnectProgressCard = ({
         {progress.retryAttempt > 0 && (
           <span
             style={{
-              fontSize: 10,
+              fontSize: 11,
               fontWeight: 600,
               fontFamily: TONO_MONO_STACK,
               borderRadius: 6,
@@ -285,7 +287,7 @@ export const ConnectProgressCard = ({
         style={{
           display: 'grid',
           gridTemplateColumns: '1fr 1fr',
-          gap: '8px 14px',
+          gap: '10px 18px',
         }}
       >
         {progress.steps.map((step) => (
@@ -296,7 +298,7 @@ export const ConnectProgressCard = ({
             style={{
               display: 'flex',
               alignItems: 'center',
-              gap: 6,
+              gap: 7,
               minWidth: 0,
             }}
           >
@@ -304,7 +306,7 @@ export const ConnectProgressCard = ({
             <span
               style={{
                 flex: 1,
-                fontSize: 11,
+                fontSize: 12,
                 fontWeight: step.state === 'current' ? 600 : 400,
                 color:
                   step.state === 'pending'
@@ -323,7 +325,7 @@ export const ConnectProgressCard = ({
               step.elapsedMs != null && (
                 <span
                   style={{
-                    fontSize: 10,
+                    fontSize: 11,
                     fontFamily: TONO_MONO_STACK,
                     color: text.secondary,
                     flexShrink: 0,
@@ -338,14 +340,14 @@ export const ConnectProgressCard = ({
 
       {/* Failure block */}
       {progress.error != null && (
-        <div style={{ marginTop: 10 }}>
+        <div style={{ marginTop: 14 }}>
           {failedStepLabel && (
             <div
               style={{
-                fontSize: 11,
+                fontSize: 12,
                 fontWeight: 600,
                 color: TONO_COLORS.error,
-                marginBottom: 4,
+                marginBottom: 6,
               }}
             >
               {t('tono.progress.failedAt', { stage: failedStepLabel })}
@@ -355,13 +357,13 @@ export const ConnectProgressCard = ({
             data-testid="tono-progress-error"
             style={{
               margin: 0,
-              padding: '8px 10px',
-              borderRadius: 8,
-              fontSize: 10,
+              padding: '10px 12px',
+              borderRadius: 10,
+              fontSize: 11,
               fontFamily: TONO_MONO_STACK,
               lineHeight: 1.5,
               whiteSpace: 'pre-wrap',
-              wordBreak: 'break-all',
+              wordBreak: 'break-word',
               userSelect: 'text',
               color: TONO_COLORS.error,
               background: hex(TONO_COLORS.error, 0.1),
@@ -379,7 +381,7 @@ export const ConnectProgressCard = ({
             display: 'flex',
             alignItems: 'center',
             gap: 8,
-            marginTop: 10,
+            marginTop: 14,
           }}
         >
           <span
@@ -399,8 +401,8 @@ export const ConnectProgressCard = ({
             onClick={handleRetryNow}
             disabled={retrying}
             style={{
-              padding: '6px 12px',
-              fontSize: 11,
+              padding: '7px 13px',
+              fontSize: 12,
               color: '#fff',
               background: TONO_COLORS.accent,
             }}
@@ -410,7 +412,10 @@ export const ConnectProgressCard = ({
         </div>
       )}
       {retryError && (
-        <div role="alert" style={{ marginTop: 6, fontSize: 11, color: TONO_COLORS.error }}>
+        <div
+          role="alert"
+          style={{ marginTop: 6, fontSize: 11, color: TONO_COLORS.error }}
+        >
           {retryError}
         </div>
       )}
@@ -420,7 +425,7 @@ export const ConnectProgressCard = ({
           display: 'flex',
           alignItems: 'center',
           gap: 8,
-          marginTop: 12,
+          marginTop: 14,
         }}
       >
         {uiState === 'protectedOffline' && (
@@ -433,7 +438,7 @@ export const ConnectProgressCard = ({
             }}
             style={{
               flex: 1,
-              padding: '9px 12px',
+              padding: '9px 14px',
               fontSize: 12,
               color: '#fff',
               background: TONO_COLORS.protectedOffline,
@@ -448,13 +453,13 @@ export const ConnectProgressCard = ({
           onClick={handleCopyDetails}
           style={{
             flex: uiState === 'protectedOffline' ? undefined : 1,
-            padding: '9px 12px',
+            padding: '9px 14px',
             fontSize: 12,
             color: text.primary,
             background: dark
-              ? 'rgba(255,255,255,0.1)'
-              : 'rgba(255,255,255,0.65)',
-            border: `1px solid ${dark ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.85)'}`,
+              ? 'rgba(255,255,255,0.07)'
+              : 'rgba(235,240,250,0.72)',
+            border: `1px solid ${dark ? 'rgba(255,255,255,0.1)' : 'rgba(56,72,108,0.1)'}`,
           }}
         >
           {t('tono.progress.copyDetails')}

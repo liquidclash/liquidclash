@@ -114,9 +114,18 @@ pub async fn quit() -> clash_verge_signal::ShutdownOutcome {
     // 设置退出标志
     handle::Handle::global().set_is_exiting();
 
-    // Tono: every exit path funnels through the explicit release (§6,
-    // P0-8) — idempotent, bounded, safe to repeat.
-    crate::tono::commands::quit_release(handle::Handle::app_handle().clone()).await;
+    // Tono: this is the sole owner of the preventable explicit-Quit release (§6). Session-ending
+    // exits use their separate best-effort path in `RunEvent::Exit`.
+    if let Err(error) = crate::tono::commands::quit_release(handle::Handle::app_handle().clone()).await {
+        logging!(
+            error,
+            Type::Service,
+            "Tono: 无法证明退出前已恢复网络保护，取消退出: {error}"
+        );
+        handle::Handle::global().clear_is_exiting();
+        handle::Handle::notice_message("app_quit::core_stop_failed", "");
+        return clash_verge_signal::ShutdownOutcome::Canceled;
+    }
 
     Config::apply_all_and_save_file().await;
 

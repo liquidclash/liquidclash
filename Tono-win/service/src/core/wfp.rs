@@ -18,7 +18,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    ConvertInterfaceNameToLuidW, GetIfEntry2, IF_TYPE_PROP_VIRTUAL, IF_TYPE_TUNNEL, MIB_IF_ROW2,
+    ConvertInterfaceAliasToLuid, GetIfEntry2, IF_TYPE_PROP_VIRTUAL, IF_TYPE_TUNNEL, MIB_IF_ROW2,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
@@ -807,9 +807,9 @@ pub(crate) fn luid_for_interface(name: &str) -> Result<u64> {
     let wide = wide(name);
     let mut luid = NET_LUID_LH::default();
     // SAFETY: `wide` is a NUL-terminated UTF-16 buffer; `luid` is a valid out-pointer.
-    let status = unsafe { ConvertInterfaceNameToLuidW(wide.as_ptr(), &mut luid) };
+    let status = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) };
     if status != 0 {
-        bail!("interface {name:?} did not resolve to a LUID: Windows error {status}");
+        bail!("interface alias {name:?} did not resolve to a LUID: Windows error {status}");
     }
     // SAFETY: `Value` is the plain u64 view of the union, valid after a successful call.
     let luid = unsafe { luid.Value };

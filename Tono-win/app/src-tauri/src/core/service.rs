@@ -1179,12 +1179,10 @@ pub(super) async fn stop_core_by_service(release_kill_switch: bool) -> Result<()
 
 /// Core binary path for the Tono owned runtime: the same mihomo build the Service runs.
 pub(crate) async fn tono_core_binary_path() -> Result<PathBuf> {
-    let verge_config = Config::verge().await;
-    let clash_core = verge_config.latest_arc().get_valid_clash_core();
-    drop(verge_config);
-
     let bin_ext = if cfg!(windows) { ".exe" } else { "" };
-    service_core_path(&clash_core, bin_ext)
+    // The managed Tono product has one audited data-plane binary. A legacy Verge setting must not
+    // silently select the alpha sidecar, which would also force every installer to ship two cores.
+    service_core_path("verge-mihomo", bin_ext)
 }
 
 /// Whether the Tono Service is installed, running, and protocol-compatible.
@@ -1198,17 +1196,24 @@ pub(crate) async fn tono_service_ready() -> Result<()> {
     }
 }
 
-/// Whether the installed Service speaks protocol rev 5 (Windows kill switch + DNS routes)
-/// *and* rev 6 (owner-gated kill switch release). Both are required: connecting against a
-/// rev 5 service would create a Protected Offline the user cannot release (C1).
+/// Whether the installed Service has the complete Windows protection contract: WFP + DNS,
+/// owner-gated release, the durable verified-session marker, **and** the current system-safety
+/// floor (`MIN_REQUIRED_SERVICE_REVISION`). Feature-only checks (rev ≥ 5/6/8) are not enough —
+/// a Test 5 Service already had those bits but still freezes status behind the lifecycle lock
+/// and uses the old DNS restore semantics. Pairing a new App with that Service after a failed
+/// installer replacement must fail closed here, not during a half-armed connect.
 pub(crate) async fn tono_probe_kill_switch_release_support() -> Result<bool> {
     let response = clash_verge_service_ipc::get_version()
         .await
         .context("无法连接到 Tono Service")?;
     Ok(response.code == 0
         && response.data.as_ref().is_some_and(|info| {
-            clash_verge_service_ipc::ProtocolInfo::supports_windows_kill_switch(info)
+            info.supports_client(
+                clash_verge_service_ipc::ProtocolVersion::current(),
+                clash_verge_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
+            ) && clash_verge_service_ipc::ProtocolInfo::supports_windows_kill_switch(info)
                 && clash_verge_service_ipc::ProtocolInfo::supports_kill_switch_release(info)
+                && clash_verge_service_ipc::ProtocolInfo::supports_kill_switch_verification(info)
         }))
 }
 
@@ -1397,6 +1402,18 @@ pub(crate) async fn tono_lock_kill_switch() -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn tono_mark_kill_switch_verified() -> Result<()> {
+    let credentials = current_owner_credentials()?;
+    let session = active_service_session()?;
+    let response = clash_verge_service_ipc::mark_kill_switch_verified(&credentials, &session)
+        .await
+        .context("无法连接到Tono Service")?;
+    if response.code > 0 {
+        bail!(response.message);
+    }
+    Ok(())
+}
+
 /// `POST /kill-switch/restrict-bootstrap`: keep blocking, reopen only the API recovery channel.
 pub(crate) async fn tono_restrict_bootstrap() -> Result<()> {
     let credentials = current_owner_credentials()?;
@@ -1522,6 +1539,9 @@ pub(crate) async fn tono_release_kill_switch() -> Result<KillSwitchStatus> {
                     Type::Service,
                     "Tono: kill-switch release response was lost, but status proves disarm completed"
                 );
+                cancel_owner_monitors();
+                clear_active_service_session();
+                CoreManager::global().core_stopped();
                 return Ok(status);
             }
             return Err(error).context("无法连接到Tono Service");
@@ -1530,12 +1550,22 @@ pub(crate) async fn tono_release_kill_switch() -> Result<KillSwitchStatus> {
     if response.code > 0 {
         bail!(response.message);
     }
-    response.data.context("Tono Service 未返回 Kill Switch 状态")
+    let status = response.data.context("Tono Service 未返回 Kill Switch 状态")?;
+    if !status.wanted && !status.live {
+        // The owner-gated Service release is a complete last-resort disconnect and may have
+        // stopped a Core after our session-gated best-effort stop failed. Mirror that committed
+        // reality locally so Quit and the next Connect never reuse a stale session/running mode.
+        cancel_owner_monitors();
+        clear_active_service_session();
+        CoreManager::global().core_stopped();
+    }
+    Ok(status)
 }
 
 /// Whether a live owner session exists for session-gated routes (stop-core
 /// among them). False in Protected Offline after an app restart — which is
 /// exactly why the release path is owner-gated instead (C1).
+#[cfg(any(not(windows), test))]
 pub(crate) fn tono_session_live() -> bool {
     ACTIVE_SERVICE_SESSION.lock().is_some()
 }

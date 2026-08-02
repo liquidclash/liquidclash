@@ -5,23 +5,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "fs:allow-read-file",
-    "fs:allow-exists",
-    {
-      "identifier": "fs:scope",
-      "allow": ["$APPDATA/**", "$RESOURCE/../**", "**"]
-    },
-    "fs:allow-write-file",
-    {
-      "identifier": "fs:scope",
-      "allow": ["$APPDATA/**", "$RESOURCE/../**", "**"]
-    },
-    "fs:allow-app-read",
-    "fs:allow-app-read-recursive",
-    "fs:allow-appcache-read",
-    "fs:allow-appcache-read-recursive",
-    "fs:allow-appconfig-read",
-    "fs:allow-appconfig-read-recursive",
     "core:window:allow-create",
     "core:window:allow-center",
     "core:window:allow-request-user-attention",
@@ -61,23 +44,6 @@
     "core:window:allow-minimize",
     "core:window:allow-unminimize",
     "core:window:allow-set-maximizable",
-    "core:window:allow-set-minimizable",
-    "core:webview:allow-print",
-    "shell:allow-execute",
-    "shell:allow-open",
-    "shell:allow-kill",
-    "shell:allow-spawn",
-    "shell:allow-stdin-write",
-    "dialog:allow-open",
-    "global-shortcut:allow-is-registered",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-register-all",
-    "global-shortcut:allow-unregister",
-    "global-shortcut:allow-unregister-all",
-    "process:allow-exit",
-    "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text",
-    "shell:default",
-    "dialog:default"
+    "core:window:allow-set-minimizable"
   ]
 }

@@ -147,6 +147,36 @@ pub async fn clear_active_owner() -> Result<()> {
     }
 }
 
+/// Retire a stale unverified startup intent only when no other owner has taken over.
+///
+/// `true` means it is safe for the caller to remove the old owner's machine-wide protection:
+/// there was no active owner, or the matching owner's desired run state was durably stopped and
+/// its active record cleared. `false` means a different owner is active; opening WFP in that
+/// ambiguous state would be unsafe.
+pub(crate) async fn retire_owner_if_active(owner_key: &str) -> Result<bool> {
+    let Some(active_owner) = load_active_owner().await? else {
+        return Ok(true);
+    };
+    if active_owner.owner_key != owner_key {
+        return Ok(false);
+    }
+    persist_owner_core_stopped_by_key(owner_key).await?;
+    clear_active_owner().await?;
+    Ok(true)
+}
+
+/// Retire whichever owner a legacy machine-wide protection record was paired with. Records from
+/// before `owner_key` cannot prove an association, but startup runs before IPC accepts a new owner;
+/// leaving the old desired state runnable after removing WFP would let a later Service restart
+/// resurrect an unprotected Core.
+pub(crate) async fn retire_legacy_active_owner() -> Result<()> {
+    let Some(active_owner) = load_active_owner().await? else {
+        return Ok(());
+    };
+    persist_owner_core_stopped_by_key(&active_owner.owner_key).await?;
+    clear_active_owner().await
+}
+
 /// Restores persisted state and reports whether a core was successfully started.
 pub async fn restore_desired_state() -> Result<bool> {
     backup_legacy_desired_states().await;

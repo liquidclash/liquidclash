@@ -5,8 +5,8 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     AuthenticatedRequest, IpcCommand, MacosProxyConfig, OwnerSessionProof, RuntimeBundle,
-    ServiceErrorCode, StartClashRequest, StartClashResult, connect, run_ipc_server,
-    set_system_proxy, start_clash, stop_clash, stop_ipc_server,
+    ServiceErrorCode, ServiceOperationKind, StartClashRequest, StartClashResult, connect,
+    get_status, run_ipc_server, set_system_proxy, start_clash, stop_clash, stop_ipc_server,
 };
 use serde::Deserialize;
 use serial_test::serial;
@@ -72,7 +72,7 @@ async fn client_uses_versioned_session_aware_proxy_lifecycle() -> Result<()> {
             proposed_session_token: proposed_session_token.clone(),
             macos_proxy: Some(MacosProxyConfig::Disabled),
             kill_switch: None,
-        windows_kill_switch: None,
+            windows_kill_switch: None,
         },
     )
     .await?;
@@ -109,7 +109,7 @@ async fn client_uses_versioned_session_aware_proxy_lifecycle() -> Result<()> {
             proposed_session_token: "22".repeat(32),
             macos_proxy: None,
             kill_switch: None,
-        windows_kill_switch: None,
+            windows_kill_switch: None,
         },
     })?;
     let response = client
@@ -160,7 +160,7 @@ async fn owner_b_cannot_overtake_owner_a_proxy_operation() -> Result<()> {
             proposed_session_token: token_a.clone(),
             macos_proxy: None,
             kill_switch: None,
-        windows_kill_switch: None,
+            windows_kill_switch: None,
         },
     )
     .await?;
@@ -182,6 +182,19 @@ async fn owner_b_cannot_overtake_owner_a_proxy_operation() -> Result<()> {
     });
     proxy_barrier_wait("proxy-entered").await?;
 
+    // Read-only diagnostics must bypass the lifecycle writer queue. This reproduces the old UI
+    // freeze deterministically: the proxy mutation is held at the test barrier while /status must
+    // still answer and identify the active operation.
+    let status = tokio::time::timeout(std::time::Duration::from_millis(500), get_status(&owner_a))
+        .await
+        .context("status waited behind the lifecycle mutation")??
+        .data
+        .context("status omitted its snapshot")?;
+    assert_eq!(
+        status.active_operation.map(|operation| operation.kind),
+        Some(ServiceOperationKind::SetSystemProxy)
+    );
+
     let token_b = "bb".repeat(32);
     let start_owner = owner_b.clone();
     let start_bundle = bundle.clone();
@@ -193,7 +206,7 @@ async fn owner_b_cannot_overtake_owner_a_proxy_operation() -> Result<()> {
                 proposed_session_token: token_b,
                 macos_proxy: None,
                 kill_switch: None,
-            windows_kill_switch: None,
+                windows_kill_switch: None,
             },
         )
         .await

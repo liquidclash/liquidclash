@@ -33,17 +33,20 @@ export const GlassCard = ({
 
   return (
     <div
-      className={className}
+      className={['tono-glass-card', className].filter(Boolean).join(' ')}
       style={{
         borderRadius: radius,
         padding,
         background:
-          tint ?? (dark ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.4)'),
+          tint ?? (dark ? 'rgba(16,21,33,0.72)' : 'rgba(255,255,255,0.72)'),
         border: border
-          ? `1px solid ${dark ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.7)'}`
+          ? `1px solid ${dark ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.78)'}`
           : 'none',
-        backdropFilter: 'blur(20px)',
-        WebkitBackdropFilter: 'blur(20px)',
+        boxShadow: dark
+          ? '0 20px 48px -32px rgba(0,0,0,0.75), inset 0 1px 0 rgba(255,255,255,0.04)'
+          : '0 20px 48px -32px rgba(55,72,110,0.3), inset 0 1px 0 rgba(255,255,255,0.5)',
+        backdropFilter: 'blur(12px) saturate(1.08)',
+        WebkitBackdropFilter: 'blur(12px) saturate(1.08)',
         ...style,
       }}
     >

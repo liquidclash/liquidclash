@@ -146,9 +146,11 @@ pub enum AuditEvent {
         revision: i64,
         domains: usize,
         media: usize,
+        web_domains: usize,
     },
     PolicyActivated {
-        tcp: usize,
+        wechat_tcp: usize,
+        web_tcp: usize,
         udp: usize,
     },
     PolicySyncFail {

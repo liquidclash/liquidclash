@@ -4,8 +4,10 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use clash_verge_logging::{Type, logging};
 use clash_verge_service_ipc::KillSwitchStatus;
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter as _, Manager as _};
 use tono_core::{
@@ -25,9 +27,13 @@ use crate::{
     },
 };
 
-/// L2: the quit-path release is time-boxed — WM_ENDSESSION gives the
-/// process only a few seconds, and a longer release must not stall exit.
-const QUIT_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
+/// L2: only the unpreventable WM_ENDSESSION path uses this short outer budget. Interactive Quit
+/// joins the ordinary release operation and cancels the exit when disarm cannot be proven.
+pub(crate) const QUIT_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
+/// Absolute budget for startup authentication restore and its two cloud refreshes. Credential
+/// hydration has its own three-second budget before this function starts. Read-only API work can
+/// be cancelled safely; protection release keeps its separate reconciliation semantics.
+const RESTORE_TRANSACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Emitted on `tono://status` after every state change.
 ///
@@ -49,6 +55,11 @@ pub struct TonoStatus {
     pub catalog_revision: Option<i64>,
     pub catalog_requires_choice: bool,
 }
+
+/// Last published immutable UI snapshot. The status command reads this without joining the large
+/// product-state mutex, so a slow credential-store or transition commit cannot make the WebView
+/// lose all progress/diagnostics. Writers still publish only fully assembled states.
+static STATUS_SNAPSHOT: Lazy<ArcSwapOption<TonoStatus>> = Lazy::new(ArcSwapOption::empty);
 
 /// TS: `interface TonoSignInChallenge { challengeId: string; expiresIn: number; message: string }`
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +144,7 @@ pub(crate) fn status_of(inner: &TonoInner) -> TonoStatus {
 }
 
 pub(crate) fn emit_status(app: &AppHandle, status: &TonoStatus) {
+    STATUS_SNAPSHOT.store(Some(Arc::new(status.clone())));
     if let Err(err) = app.emit("tono://status", status) {
         logging!(warn, Type::Service, "Tono: 状态事件发送失败: {err}");
     }
@@ -358,10 +370,9 @@ pub async fn tono_sign_in_verify(
 pub async fn tono_sign_out(state: tauri::State<'_, Arc<TonoState>>, app: AppHandle) -> Result<(), String> {
     let (client, generation) = {
         let mut inner = state.lock().await;
-        inner.connect_generation += 1;
+        inner.invalidate_connection(true);
         inner.sign_in_generation = inner.sign_in_generation.wrapping_add(1);
-        inner.release_on_stale = true;
-        inner.tasks.abort_all();
+        inner.tasks.abort_catalog_sync();
         (inner.client.clone(), inner.sign_in_generation)
     };
 
@@ -385,7 +396,7 @@ pub async fn tono_sign_out(state: tauri::State<'_, Arc<TonoState>>, app: AppHand
             emit_status(&app, &status_of(&inner));
             drop(inner);
             // L4: the user is still signed in — restart the catalog sync
-            // that `abort_all` just stopped.
+            // that `abort_catalog_sync` just stopped.
             catalog_sync::spawn_periodic_for_auth_generation(&state, &app, generation).await;
             return Err(err);
         }
@@ -406,6 +417,7 @@ pub async fn tono_sign_out(state: tauri::State<'_, Arc<TonoState>>, app: AppHand
     inner.account_state = AccountState::SignedOut;
     inner.challenge_id = None;
     inner.controller_secret = None;
+    inner.controller_port = None;
     inner.kill_switch = None;
     inner.network_events_counter = None;
     emit_status(&app, &status_of(&inner));
@@ -507,10 +519,8 @@ pub async fn tono_select_server(
             action,
             connection::SelectAction::Switch | connection::SelectAction::Reconnect
         ) {
-            inner.connect_generation += 1;
             // The switch/reconnect re-arms rather than releases (H-1 intent).
-            inner.release_on_stale = false;
-            inner.tasks.abort_connection_tasks();
+            inner.invalidate_connection(false);
         }
         let generation = inner.connect_generation;
         if let Err(err) = crate::tono::state::save_selection(&inner.catalog_dir, &name) {
@@ -544,6 +554,13 @@ pub async fn tono_select_server(
         connection::SelectAction::Noop | connection::SelectAction::UpdateOnly => {}
     }
     Ok(())
+}
+
+/// Execute a fresh controller delay probe through the selected exit. This is intentionally
+/// available only while Connected; cached legacy delay history is not presented as a new test.
+#[tauri::command]
+pub async fn tono_test_current_server(state: tauri::State<'_, Arc<TonoState>>) -> Result<u64, String> {
+    connection::test_current_server(state.inner()).await
 }
 
 /// Run the §6 connect transaction.
@@ -581,9 +598,13 @@ pub struct TonoConnectProgress {
 #[tauri::command]
 pub async fn tono_connect_progress(state: tauri::State<'_, Arc<TonoState>>) -> Result<TonoConnectProgress, String> {
     let inner = state.lock().await;
+    let current_elapsed_ms = inner
+        .step_started_at
+        .map(|started| started.elapsed().as_millis() as u64);
+    let steps = crate::tono::steps::snapshot_with_current_elapsed(&inner.connect_steps, current_elapsed_ms);
     Ok(TonoConnectProgress {
-        total_elapsed_ms: crate::tono::steps::total_elapsed_ms(&inner.connect_steps),
-        steps: inner.connect_steps.clone(),
+        total_elapsed_ms: crate::tono::steps::total_elapsed_ms(&steps),
+        steps,
         failed_stage: inner.failed_stage.map(str::to_string),
         error: inner.connect_error.clone(),
         retry_attempt: inner.retry_attempt,
@@ -610,6 +631,9 @@ pub async fn tono_retry_now(state: tauri::State<'_, Arc<TonoState>>, app: AppHan
 /// Current product status (also pushed on `tono://status`).
 #[tauri::command]
 pub async fn tono_status(state: tauri::State<'_, Arc<TonoState>>) -> Result<TonoStatus, String> {
+    if let Some(status) = STATUS_SNAPSHOT.load_full() {
+        return Ok((*status).clone());
+    }
     let inner = state.lock().await;
     Ok(status_of(&inner))
 }
@@ -621,6 +645,7 @@ pub async fn tono_status(state: tauri::State<'_, Arc<TonoState>>) -> Result<Tono
 /// kill switch, surface Protected Offline and wait for the user — never
 /// auto-reconnect here.
 pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
+    let restore_deadline = tokio::time::Instant::now() + RESTORE_TRANSACTION_TIMEOUT;
     let generation = {
         let mut inner = state.lock().await;
         // Restore is an authentication transaction too. A retry supersedes an older restore,
@@ -635,9 +660,10 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
         inner.sign_in_generation
     };
 
-    let wanted_kill_switch = service::tono_service_status_snapshot()
+    let wanted_kill_switch = tokio::time::timeout_at(restore_deadline, service::tono_service_status_snapshot())
         .await
         .ok()
+        .and_then(Result::ok)
         .and_then(|snapshot| snapshot.kill_switch)
         .filter(|status| status.wanted);
 
@@ -660,6 +686,9 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
                 return;
             }
             if let Some(status) = wanted_kill_switch {
+                if status.verified {
+                    inner.fsm.mark_session_verified();
+                }
                 inner.kill_switch = Some(status);
                 inner.fsm.mark_kill_switch_armed();
             }
@@ -672,13 +701,39 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
             return;
         }
         TokenProbe::NoToken => {
+            if let Some(status) = wanted_kill_switch {
+                {
+                    let mut inner = state.lock().await;
+                    if inner.sign_in_generation != generation {
+                        return;
+                    }
+                    if status.verified {
+                        inner.fsm.mark_session_verified();
+                    }
+                    inner.kill_switch = Some(status);
+                    inner.fsm.mark_kill_switch_armed();
+                }
+                if let Err(error) = connection::release_explicit(&state, &app).await {
+                    let mut inner = state.lock().await;
+                    if inner.sign_in_generation != generation {
+                        return;
+                    }
+                    inner.account_state = AccountState::Error(format!(
+                        "stored protection could not be released while signed out: {error}"
+                    ));
+                    emit_status(&app, &status_of(&inner));
+                    return;
+                }
+                let mut inner = state.lock().await;
+                inner.fsm.sign_out_or_quit();
+                inner.kill_switch = None;
+                if inner.sign_in_generation != generation {
+                    return;
+                }
+            }
             let mut inner = state.lock().await;
             if inner.sign_in_generation != generation {
                 return;
-            }
-            if let Some(status) = wanted_kill_switch {
-                inner.kill_switch = Some(status);
-                inner.fsm.mark_kill_switch_armed();
             }
             inner.account_state = AccountState::SignedOut;
             emit_status(&app, &status_of(&inner));
@@ -696,7 +751,28 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
         emit_status(&app, &status_of(&inner));
     }
 
-    match client.me().await {
+    let account_result = match tokio::time::timeout_at(restore_deadline, client.me()).await {
+        Ok(result) => result,
+        Err(_) => {
+            let mut inner = state.lock().await;
+            if inner.sign_in_generation != generation {
+                return;
+            }
+            if let Some(status) = wanted_kill_switch {
+                if status.verified {
+                    inner.fsm.mark_session_verified();
+                }
+                inner.kill_switch = Some(status);
+                inner.fsm.mark_kill_switch_armed();
+            }
+            inner.account_state =
+                AccountState::Error(format!("session restore exceeded {RESTORE_TRANSACTION_TIMEOUT:?}"));
+            emit_status(&app, &status_of(&inner));
+            return;
+        }
+    };
+
+    match account_result {
         Ok(me) => {
             let info = account_info_of(&me.user);
             {
@@ -711,22 +787,45 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
                     AccountState::Ready
                 };
                 if let Some(status) = wanted_kill_switch {
+                    if status.verified {
+                        inner.fsm.mark_session_verified();
+                    }
                     inner.kill_switch = Some(status);
                     inner.fsm.mark_kill_switch_armed();
                 }
                 emit_status(&app, &status_of(&inner));
             }
             if !info.suspended {
-                if let Err(err) = catalog_sync::sync_with_retries_for_auth_generation(&state, &app, generation).await {
-                    logging!(warn, Type::Service, "Tono: 会话恢复后的目录同步失败: {err}");
+                match tokio::time::timeout_at(
+                    restore_deadline,
+                    catalog_sync::sync_with_retries_for_auth_generation(&state, &app, generation),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => logging!(warn, Type::Service, "Tono: 会话恢复后的目录同步失败: {err}"),
+                    Err(_) => logging!(
+                        warn,
+                        Type::Service,
+                        "Tono: 会话恢复目录同步达到 {RESTORE_TRANSACTION_TIMEOUT:?} 总预算；继续使用已验证缓存"
+                    ),
                 }
                 if state.lock().await.sign_in_generation != generation {
                     return;
                 }
-                if let Err(err) =
-                    crate::tono::policy_sync::sync_with_retries_for_auth_generation(&state, &app, generation).await
+                match tokio::time::timeout_at(
+                    restore_deadline,
+                    crate::tono::policy_sync::sync_with_retries_for_auth_generation(&state, &app, generation),
+                )
+                .await
                 {
-                    logging!(warn, Type::Service, "Tono: 会话恢复后的策略同步失败: {err}");
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => logging!(warn, Type::Service, "Tono: 会话恢复后的策略同步失败: {err}"),
+                    Err(_) => logging!(
+                        warn,
+                        Type::Service,
+                        "Tono: 会话恢复策略同步达到 {RESTORE_TRANSACTION_TIMEOUT:?} 总预算；继续使用已验证缓存"
+                    ),
                 }
                 if state.lock().await.sign_in_generation != generation {
                     return;
@@ -777,6 +876,9 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
                 return;
             }
             if let Some(status) = wanted_kill_switch {
+                if status.verified {
+                    inner.fsm.mark_session_verified();
+                }
                 inner.kill_switch = Some(status);
                 inner.fsm.mark_kill_switch_armed();
             }
@@ -855,40 +957,27 @@ pub async fn tono_audit_log_path(state: tauri::State<'_, Arc<TonoState>>) -> Res
     })
 }
 
-/// Explicit Quit release (§6, L1): bump the generation, abort every task,
-/// then the explicit-release sequence. Best-effort by design — a failure is
-/// logged loudly but must never block process exit. The whole sequence is
-/// time-boxed (L2): WM_ENDSESSION gives the process only a few seconds.
-pub async fn quit_release(app: AppHandle) {
+/// Explicit Quit/restart release (§6, L1): bump the generation, abort every task, then join the
+/// single-flight explicit-release sequence. A preventable interactive exit is cancelled when
+/// release cannot be proven; the unpreventable WM_ENDSESSION path applies its own short outer
+/// budget in the run-event handler.
+pub async fn quit_release(app: AppHandle) -> Result<(), String> {
     let Some(state) = app.try_state::<Arc<TonoState>>().map(|state| state.inner().clone()) else {
-        return;
+        return Ok(());
     };
     let protected = {
         let mut inner = state.lock().await;
-        inner.connect_generation += 1;
-        inner.release_on_stale = true;
-        inner.tasks.abort_all();
+        inner.invalidate_connection(true);
+        inner.tasks.abort_catalog_sync();
         inner.fsm.kill_switch_armed()
             || inner.fsm.status().is_connected
             || inner.fsm.status().is_connecting
             || inner.fsm.status().is_protection_blocked
     };
     if protected {
-        match tokio::time::timeout(QUIT_RELEASE_BUDGET, connection::release_explicit(&state, &app)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                logging!(
-                    error,
-                    Type::Service,
-                    "Tono: 退出时释放 Kill Switch 失败，系统仍受保护: {err}"
-                )
-            }
-            Err(_) => logging!(
-                error,
-                Type::Service,
-                "Tono: 退出时释放 Kill Switch 超过 2.5s 预算，放行走退出流程，系统仍受保护"
-            ),
-        }
+        connection::release_explicit(&state, &app).await
+    } else {
+        Ok(())
     }
 }
 
@@ -920,6 +1009,9 @@ pub async fn resync_after_cancelled_quit(app: AppHandle) {
     match kill_switch {
         Some(status) if status.wanted => {
             // Still armed (the release failed or never ran): reflect it.
+            if status.verified {
+                inner.fsm.mark_session_verified();
+            }
             if !inner.fsm.kill_switch_armed() {
                 inner.fsm.mark_kill_switch_armed();
             }

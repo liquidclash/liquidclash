@@ -17,12 +17,11 @@
 //! unproven — fail-closed for the normal disarm, while the emergency path stays the documented
 //! escape hatch (it logs and proceeds).
 //!
-//! **Degraded mode:** CIM brokenness must not deadlock a user in Protected Offline. When the
-//! registry writes keep succeeding but live-apply fails for
-//! [`DEGRADED_LIVE_FAILURE_THRESHOLD`] consecutive enable/restore rounds, a restore whose
-//! registry matches is accepted as *degraded*: the disarm proceeds, and the degraded state is
-//! surfaced through `last_error`/status so the product layer can warn that the running
-//! resolver may need an interface bounce.
+//! A registry-only match is never accepted as a normal restore. If CIM cannot prove that the
+//! running resolver left loopback, normal disarm remains fail-closed and the explicit elevated
+//! emergency-disarm path is the only escape hatch. Automatically opening WFP while the live
+//! resolver may still point at a dead loopback server strands the machine in an ambiguous and
+//! often unrecoverable network state.
 //!
 //! The pure snapshot/merge/restore-decision logic in this file is platform-independent and
 //! unit-tested on any host; the registry/CIM engine is compiled only on Windows.
@@ -200,15 +199,6 @@ fn restore_is_proven(snapshot: &DnsSnapshot, current: &[AdapterDnsSnapshot]) -> 
     })
 }
 
-/// After this many consecutive enable/restore rounds whose registry writes succeed but CIM
-/// live-apply keeps failing, a registry-matching restore is accepted as degraded (see the
-/// module docs) instead of deadlocking the user in Protected Offline.
-pub(crate) const DEGRADED_LIVE_FAILURE_THRESHOLD: u32 = 3;
-
-fn degraded_restore_ok(consecutive_live_failures: u32, registry_matches: bool) -> bool {
-    registry_matches && consecutive_live_failures >= DEGRADED_LIVE_FAILURE_THRESHOLD
-}
-
 static CONSECUTIVE_LIVE_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 /// One enable/restore round's live-apply outcome; returns the current streak of failing rounds.
@@ -345,6 +335,11 @@ const SUPPORTED: bool = cfg!(any(windows, test));
 
 static LIVE_APPLY_FAILURES: Lazy<std::sync::Mutex<std::collections::BTreeSet<String>>> =
     Lazy::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+/// Last committed/live-verified DNS observation. IPC reads clone this synchronously instead of
+/// waiting behind a CIM mutation. The background reconciler refreshes it and repairs drift.
+static DNS_STATUS_CACHE: Lazy<Mutex<DnsProtectionStatus>> =
+    Lazy::new(|| Mutex::new(DnsProtectionStatus::default()));
+const DNS_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn ensure_supported() -> Result<()> {
     if SUPPORTED {
@@ -469,7 +464,6 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
     let snapshot = serde_json::from_slice::<DnsSnapshot>(&bytes)
         .context("protected-dns snapshot is corrupt; cannot prove restore")?;
     let mut snapshot = with_live_failures(&snapshot, &LIVE_APPLY_FAILURES.lock().unwrap());
-    let mut degraded: Option<String> = None;
     let outcome: Result<()> = async {
         // The engine applies all adapters in one PowerShell batch and retries the failures
         // once in a second batch, reporting final per-adapter results.
@@ -481,13 +475,10 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
         if ENGINE_LIVE {
             let current = engine_collect().await?;
             if !restore_is_proven(&snapshot, &current) {
-                if degraded_restore_ok(streak, registry_restore_matches(&snapshot, &current)) {
-                    degraded = Some(format!(
-                        "DNS restore degraded: registry restored but CIM live-apply failed {streak} rounds in a row; the running resolver may need an interface bounce"
-                    ));
-                } else {
-                    bail!("DNS restore could not be proven (registry read-back or live-apply)");
-                }
+                let registry = registry_restore_matches(&snapshot, &current);
+                bail!(
+                    "DNS restore could not be proven (registry_match={registry}, consecutive_live_apply_failures={streak}); protection remains armed"
+                );
             }
         } else if snapshot.adapters.iter().any(|adapter| adapter.live_apply_failed) {
             bail!("DNS restore could not be proven (recorded live-apply failure)");
@@ -496,11 +487,6 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
     }
     .await;
     record_outcome(outcome)?;
-    if let Some(note) = degraded {
-        // `record_outcome` clears last_error on success; the degraded note must survive so
-        // the product layer can surface it.
-        *DNS_LAST_ERROR.lock().unwrap() = Some(note);
-    }
     match tokio::fs::remove_file(snapshot_path()).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -529,15 +515,56 @@ pub(crate) async fn ensure_restored() -> Result<()> {
 }
 
 pub(crate) async fn status() -> DnsProtectionStatus {
+    DNS_STATUS_CACHE.lock().unwrap().clone()
+}
+
+fn publish_status(status: &DnsProtectionStatus) {
+    *DNS_STATUS_CACHE.lock().unwrap() = status.clone();
+}
+
+fn publish_status_error(error: &anyhow::Error) {
+    let mut status = DNS_STATUS_CACHE.lock().unwrap();
+    status.last_error = Some(format!("{error:#}"));
+}
+
+/// Populate the fast snapshot before IPC is opened. A corrupt recovery file is represented as a
+/// status error rather than preventing the Service from starting; WFP remains independently
+/// fail-closed and the GUI can still offer diagnostics/emergency recovery.
+pub async fn initialize_status_cache() {
     let _operation = DNS_OPERATION.lock().await;
-    status_unlocked()
-        .await
-        .unwrap_or_else(|error| DnsProtectionStatus {
-            enabled: false,
-            snapshot_present: false,
-            adapters: 0,
-            last_error: Some(format!("{error:#}")),
-        })
+    match status_unlocked().await {
+        Ok(status) => publish_status(&status),
+        Err(error) => publish_status_error(&error),
+    }
+}
+
+/// Keep the cached snapshot fresh and repair a new/drifted adapter while protection is active.
+/// The expensive live read runs here, never in a request handler. `enable` preserves the original
+/// snapshot and only reapplies loopback after this probe finds drift.
+pub fn spawn_status_watchdog() {
+    if !SUPPORTED {
+        return;
+    }
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(DNS_WATCHDOG_INTERVAL).await;
+            let observed = {
+                let _operation = DNS_OPERATION.lock().await;
+                status_unlocked().await
+            };
+            match observed {
+                Ok(status) => {
+                    let repair = status.snapshot_present && !status.enabled;
+                    publish_status(&status);
+                    if repair && let Err(error) = enable().await {
+                        publish_status_error(&error);
+                        tracing::warn!("protected DNS reconciliation failed: {error:#}");
+                    }
+                }
+                Err(error) => publish_status_error(&error),
+            }
+        }
+    });
 }
 
 async fn status_unlocked() -> Result<DnsProtectionStatus> {
@@ -559,21 +586,23 @@ async fn status_unlocked() -> Result<DnsProtectionStatus> {
         Some(snapshot) => engine_all_loopback(&snapshot.adapters).await?,
         None => false,
     };
-    Ok(DnsProtectionStatus {
+    let status = DnsProtectionStatus {
         enabled,
         snapshot_present: snapshot.is_some(),
         adapters: snapshot
             .as_ref()
             .map_or(0, |snapshot| snapshot.adapters.len() as u32),
         last_error: DNS_LAST_ERROR.lock().unwrap().clone(),
-    })
+    };
+    publish_status(&status);
+    Ok(status)
 }
 
 /// Only an operational IP adapter has a live resolver that can leak DNS. Registry interface keys
 /// outlive disabled and removed adapters, while the software loopback has no configurable CIM DNS
 /// instance; including either class makes one irrelevant `SetDNSServerSearchOrder` failure abort
 /// protection for every real adapter.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(all(windows, not(feature = "test")), test))]
 fn is_active_dns_adapter(oper_status: i32, if_type: u32) -> bool {
     const IF_OPER_STATUS_UP: i32 = 1;
     const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
@@ -1357,20 +1386,6 @@ mod tests {
             "a recorded live-apply failure must replay even when the registry is loopback"
         );
         assert!(needs_loopback_replay(false, false, true));
-    }
-
-    #[test]
-    fn degraded_restore_needs_registry_match_and_a_full_streak() {
-        assert!(!degraded_restore_ok(0, true));
-        assert!(!degraded_restore_ok(
-            DEGRADED_LIVE_FAILURE_THRESHOLD - 1,
-            true
-        ));
-        assert!(degraded_restore_ok(DEGRADED_LIVE_FAILURE_THRESHOLD, true));
-        assert!(
-            !degraded_restore_ok(DEGRADED_LIVE_FAILURE_THRESHOLD + 4, false),
-            "a registry mismatch is never degraded-ok, however long the streak"
-        );
     }
 
     #[test]

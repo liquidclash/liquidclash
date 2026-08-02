@@ -289,7 +289,14 @@ pub struct IVergeTheme {
 }
 
 impl IVerge {
-    /// 有效的clash核心名称
+    /// Valid clash core names.
+    ///
+    /// Windows Tono installs ship a single audited stable binary. Accepting
+    /// `verge-mihomo-alpha` here would reintroduce a second ~47 MB data-plane
+    /// (and a silent product path that Test 5 accidentally packaged).
+    #[cfg(windows)]
+    pub const VALID_CLASH_CORES: &'static [&'static str] = &["verge-mihomo"];
+    #[cfg(not(windows))]
     pub const VALID_CLASH_CORES: &'static [&'static str] = &["verge-mihomo", "verge-mihomo-alpha"];
 
     /// 验证并修正配置文件中的clash_core值

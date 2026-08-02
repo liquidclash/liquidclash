@@ -6,6 +6,11 @@ import path from 'path'
 import { context, getOctokit } from '@actions/github'
 import AdmZip from 'adm-zip'
 
+import {
+  WINDOWS_RESOURCE_ALLOWLIST,
+  partitionReleaseResources,
+} from './windows-packaging.mjs'
+
 const target = process.argv.slice(2)[0]
 const alpha = process.argv.slice(2)[1]
 
@@ -42,11 +47,37 @@ async function resolvePortable() {
   }
 
   const zip = new AdmZip()
+  const resourcesDir = path.join(releaseDir, 'resources')
 
   zip.addLocalFile(path.join(releaseDir, 'Tono.exe'))
-  zip.addLocalFile(path.join(releaseDir, 'verge-mihomo.exe'))
-  zip.addLocalFile(path.join(releaseDir, 'verge-mihomo-alpha.exe'))
-  zip.addLocalFolder(path.join(releaseDir, 'resources'), 'resources')
+  const stableMihomo = path.join(releaseDir, 'verge-mihomo.exe')
+  if (!fs.existsSync(stableMihomo)) {
+    throw new Error(`missing stable Mihomo at ${stableMihomo}`)
+  }
+  if (fs.existsSync(path.join(releaseDir, 'verge-mihomo-alpha.exe'))) {
+    throw new Error(
+      'refuse to build portable zip while verge-mihomo-alpha.exe is present in the release dir',
+    )
+  }
+  zip.addLocalFile(stableMihomo)
+
+  if (!fs.existsSync(resourcesDir)) {
+    throw new Error(`missing resources dir: ${resourcesDir}`)
+  }
+  const onDisk = await fsp.readdir(resourcesDir)
+  const { allowed, rejected } = partitionReleaseResources(onDisk)
+  if (rejected.length) {
+    console.warn(
+      `[portable-fixed-webview2] ignoring non-allowlisted resources (not packaged): ${rejected.join(', ')}`,
+    )
+  }
+  for (const name of WINDOWS_RESOURCE_ALLOWLIST) {
+    if (!allowed.includes(name)) {
+      throw new Error(`portable resources missing required file: ${name}`)
+    }
+    zip.addLocalFile(path.join(resourcesDir, name), 'resources')
+  }
+
   zip.addLocalFolder(
     path.join(
       releaseDir,

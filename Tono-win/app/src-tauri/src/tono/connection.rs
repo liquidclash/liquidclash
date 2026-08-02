@@ -12,7 +12,7 @@
 //! side effects — no `fail_connect`, no emit, no core action — when it
 //! moved (H1).
 
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{future::Future, net::IpAddr, sync::Arc, time::Duration};
 
 use clash_verge_logging::{Type, logging};
 use clash_verge_service_ipc::{
@@ -20,15 +20,18 @@ use clash_verge_service_ipc::{
     RuntimeBundle,
 };
 use tauri::AppHandle;
+use tokio_util::sync::CancellationToken;
 use tono_core::{
     EXIT_GROUP_NAME,
-    config::{self, build_owned_runtime, generate_controller_secret},
+    config::{self, RuntimePorts, build_owned_runtime_with_ports, generate_controller_secret},
     connection::{ConnectStage, ConnectionStatus},
     node::ValidatedNode,
 };
 
+#[cfg(not(windows))]
+use crate::core::{CoreManager, manager::RunningMode};
 use crate::{
-    core::{CoreManager, manager::RunningMode, service},
+    core::service,
     process::AsyncHandler,
     tono::{
         audit::AuditEvent,
@@ -37,8 +40,6 @@ use crate::{
     },
 };
 
-/// Owned runtime controller (§5).
-const CONTROLLER_BASE: &str = "http://127.0.0.1:9090";
 /// §6.8 exit probe target.
 const EXIT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// §6.8: the probe also proves fake-ip DNS via this lookup.
@@ -46,6 +47,10 @@ const FAKE_IP_LOOKUP: &str = "www.gstatic.com:443";
 /// §6.4: controller readiness poll budget.
 const VERSION_POLL_ATTEMPTS: u32 = 40;
 const VERSION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// A localhost controller poll must never inherit the general 6 s HTTP timeout. Forty such
+/// timeouts would turn the documented ~10 s readiness window into a multi-minute apparent hang.
+const CONTROLLER_POLL_TIMEOUT: Duration = Duration::from_millis(750);
+const CONTROLLER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// §6.5: TUN adapter / lock retry budget. The first WinTUN driver install
 /// plus interface-alias propagation is slow (~10 s on real hardware, P0-12).
 const LOCK_ATTEMPTS: u32 = 50;
@@ -53,6 +58,23 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 /// §6.7/§6.8 retry counts.
 const VERIFY_ATTEMPTS: u32 = 3;
 const VERIFY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// `lookup_host` delegates to the OS resolver and has no Tokio timeout of its own. Bound every
+/// lookup so a broken adapter/resolver cannot strand Connecting forever.
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// One absolute budget covers service readiness, both possible Core starts (cold WinTUN + WFP),
+/// controller/DNS verification, cloud-policy re-arm, and locking. Per-stage retries never reset
+/// this clock. 45 s was too tight on real Windows: a first StartClash alone can approach the
+/// Service's 60 s handler budget, and a cloud-policy second StartClash plus DNS would then race
+/// the absolute deadline and look like a hang/failure even when the backend was still making
+/// progress. 120 s keeps UI bounded while matching cold first-connect reality.
+const CONNECT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
+/// UI budget for an explicit release. The ordered DNS → Core → WFP sequence runs in a detached
+/// reconciliation task, so reaching this budget stops waiting but never cancels a safety step.
+const EXPLICIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The WFP model has a hard endpoint budget. The runtime DIRECT plan and its permits must be
+/// generated from the same complete set; silently truncating only the permits creates selective
+/// blackholes that look like random application hangs.
+const MAX_DIRECT_ENDPOINTS: usize = 256;
 /// network_events poll cadence while Connected.
 const NETWORK_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 /// P0-13: bursts of network events inside this window merge into a single
@@ -120,12 +142,55 @@ enum Attempt {
 enum StageFailure {
     /// Generation moved; see [`Attempt::Stale`].
     Stale,
+    /// The shared transaction deadline elapsed. The generation is retired before failure
+    /// handling so any detached privileged IPC completion performs the stale-commit repair.
+    TimedOut(String),
     Error(String),
 }
 
 impl StageFailure {
     fn error(err: impl std::fmt::Display) -> Self {
         StageFailure::Error(err.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct ConnectTransaction {
+    deadline: tokio::time::Instant,
+    cancellation: CancellationToken,
+}
+
+impl ConnectTransaction {
+    fn new(cancellation: CancellationToken) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + CONNECT_TRANSACTION_TIMEOUT,
+            cancellation,
+        }
+    }
+
+    fn check(&self, stage: &'static str) -> Result<(), StageFailure> {
+        if self.cancellation.is_cancelled() {
+            return Err(StageFailure::Stale);
+        }
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(StageFailure::TimedOut(format!(
+                "connection transaction exceeded {CONNECT_TRANSACTION_TIMEOUT:?} during {stage}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn wait<T>(&self, stage: &'static str, future: impl Future<Output = T>) -> Result<T, StageFailure> {
+        self.check(stage)?;
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err(StageFailure::Stale),
+            result = tokio::time::timeout_at(self.deadline, future) => result.map_err(|_| {
+                StageFailure::TimedOut(format!(
+                    "connection transaction exceeded {CONNECT_TRANSACTION_TIMEOUT:?} during {stage}"
+                ))
+            }),
+        }
     }
 }
 
@@ -166,10 +231,11 @@ fn attempt<'a>(state: &'a Arc<TonoState>, app: &'a AppHandle) -> BoxedAttempt<'a
 }
 
 async fn attempt_inner(state: &Arc<TonoState>, app: &AppHandle) -> Attempt {
-    let (node, nodes, generation) = match guard_snapshot(state).await {
+    let (node, nodes, generation, cancellation) = match guard_snapshot(state).await {
         Ok(snapshot) => snapshot,
         Err(err) => return Attempt::GuardRejected(err),
     };
+    let transaction = ConnectTransaction::new(cancellation);
     // L5: the clock starts at the top of the attempt, so even a
     // service-readiness failure leaves no orphan ConnectFail.
     let started = std::time::Instant::now();
@@ -199,25 +265,62 @@ async fn attempt_inner(state: &Arc<TonoState>, app: &AppHandle) -> Attempt {
     state.audit().log(AuditEvent::ConnectBegin {
         node: node.name.clone(),
     });
-    if let Err(err) = ensure_service_ready().await {
-        // The kill switch may already be armed from a previous session, so
-        // this is a transaction failure, not a guard rejection. fail_connect
-        // runs the decision table and (pre-arm) releases the FSM cleanly.
-        return Attempt::Failed(err);
+    match transaction.wait("service readiness", ensure_service_ready()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            // The kill switch may already be armed from a previous session, so this is a
+            // transaction failure, not a guard rejection. `fail_connect` runs the decision
+            // table and (pre-arm) releases the FSM cleanly.
+            return Attempt::Failed(err);
+        }
+        Err(failure) => return attempt_from_stage_failure(state, generation, failure).await,
     }
 
-    match run_stages(state, app, &node, &nodes, generation, started).await {
+    match run_stages(state, app, &node, &nodes, generation, started, &transaction).await {
         Ok(()) => Attempt::Connected,
         Err(StageFailure::Stale) => Attempt::Stale,
+        Err(StageFailure::TimedOut(err)) => {
+            retire_timed_out_generation(state, generation).await;
+            Attempt::Failed(err)
+        }
         Err(StageFailure::Error(err)) => Attempt::Failed(err),
     }
+}
+
+async fn attempt_from_stage_failure(state: &Arc<TonoState>, generation: u64, failure: StageFailure) -> Attempt {
+    match failure {
+        StageFailure::Stale => Attempt::Stale,
+        StageFailure::TimedOut(error) => {
+            retire_timed_out_generation(state, generation).await;
+            Attempt::Failed(error)
+        }
+        StageFailure::Error(error) => Attempt::Failed(error),
+    }
+}
+
+async fn retire_timed_out_generation(state: &Arc<TonoState>, generation: u64) {
+    let mut inner = state.lock().await;
+    if inner.connect_generation != generation {
+        return;
+    }
+    // A first attempt may release a late unverified arm. A previously verified protected
+    // reconnect keeps the barrier, matching the normal failure decision table.
+    let release_late_commit = !inner.fsm.session_verified();
+    inner.invalidate_connection(release_late_commit);
 }
 
 /// §6.1 guards: forced values live in the owned runtime; here we check the
 /// account is ready (H2a — the reconnect path's only account gate), the
 /// catalog is usable, the selection exists and passed admission, and no
 /// transaction is in flight. Pure read — no state changes.
-async fn guard_snapshot(state: &Arc<TonoState>) -> Result<(ValidatedNode, Vec<ValidatedNode>, u64), String> {
+async fn guard_snapshot(
+    state: &Arc<TonoState>,
+) -> Result<(ValidatedNode, Vec<ValidatedNode>, u64, CancellationToken), String> {
+    if state.release_in_progress().await {
+        return Err(format!(
+            "{RELEASE_RECONCILING_PREFIX}: network protection release is still reconciling; wait before reconnecting"
+        ));
+    }
     let inner = state.lock().await;
     match &inner.account_state {
         AccountState::Ready => {}
@@ -244,13 +347,23 @@ async fn guard_snapshot(state: &Arc<TonoState>) -> Result<(ValidatedNode, Vec<Va
         .find(|node| node.name == selected)
         .cloned()
         .ok_or_else(|| "the selected server is not in the catalog".to_string())?;
-    Ok((node, inner.nodes.clone(), inner.connect_generation))
+    Ok((
+        node,
+        inner.nodes.clone(),
+        inner.connect_generation,
+        inner.connect_cancellation.clone(),
+    ))
 }
 
 /// Stable error-code prefix the frontend's i18n keys off: the Service has
 /// a privileged operation in flight (install/repair pending, possibly a
 /// UAC prompt nobody approved).
 pub const SERVICE_BUSY_PREFIX: &str = "TONO_SERVICE_BUSY";
+/// Disconnect/Sign-out/Quit release is still finishing. Connect must wait — racing would let
+/// a late release tear down a fresh StartClash (the P0 fixed in the final review).
+pub const RELEASE_RECONCILING_PREFIX: &str = "TONO_RELEASE_RECONCILING";
+/// Installed Service is below protocol revision 9 (Test 5 or older).
+pub const SERVICE_TOO_OLD_PREFIX: &str = "TONO_SERVICE_TOO_OLD";
 
 /// Layer the Run State's raw English onto a stable, actionable message.
 /// Everything else keeps the original detail for diagnostics.
@@ -266,6 +379,32 @@ pub fn map_service_ready_error(err: &anyhow::Error) -> String {
     format!("Tono Service is not ready: {text}")
 }
 
+/// Whether a lock failure is the expected "WinTUN still coming up" class that must be
+/// retried, versus a permanent failure that would only burn the connect budget if looped.
+///
+/// Permanent errors (owner mismatch, not armed, WFP engine failure, auth) must not be
+/// retried: each attempt is a full Service lifecycle IPC (up to 65 s), and blind retries
+/// after a transport timeout can also race a still-running lock on the Service side.
+pub fn is_retryable_lock_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    // Primary: ConvertInterfaceAliasToLuid failed because the adapter is not registered yet.
+    if lower.contains("did not resolve to a luid") {
+        return true;
+    }
+    // validate_tunnel_luid refuses a non-tunnel LUID while WinTUN is still renaming/initializing.
+    if lower.contains("is not a tunnel device") {
+        return true;
+    }
+    // Transient service lifecycle contention while StartClash is still materializing.
+    if lower.contains("service unavailable")
+        || lower.contains("operation already")
+        || lower.contains("busy")
+    {
+        return true;
+    }
+    false
+}
+
 /// Tono has no sidecar: the Service must be Ready and speak the kill switch
 /// protocol (rev 5 arm/lock + rev 6 release, C1).
 async fn ensure_service_ready() -> Result<(), String> {
@@ -274,7 +413,9 @@ async fn ensure_service_ready() -> Result<(), String> {
         .map_err(|err| map_service_ready_error(&err))?;
     match service::tono_probe_kill_switch_release_support().await {
         Ok(true) => Ok(()),
-        Ok(false) => Err("Tono Service is too old for the kill switch; reinstall the service".to_string()),
+        Ok(false) => Err(format!(
+            "{SERVICE_TOO_OLD_PREFIX}: Tono Service is too old for this App (protocol revision below the system-safety floor); reinstall/repair the Tono Service from this installer"
+        )),
         Err(err) => Err(format!("cannot query the Tono Service protocol: {err}")),
     }
 }
@@ -289,6 +430,7 @@ async fn run_stages(
     nodes: &[ValidatedNode],
     generation: u64,
     started: std::time::Instant,
+    transaction: &ConnectTransaction,
 ) -> Result<(), StageFailure> {
     // §6.2: proxy endpoints (public IPv4/port/TCP) from the selected node;
     // the bootstrap API hosts are the only control-plane recovery channel.
@@ -297,16 +439,55 @@ async fn run_stages(
     // bootstrap permit must not depend on the system resolver once
     // blocking starts, and the app's own API client is pinned to the same
     // addresses (see `tono::bootstrap` / `tono::transport`).
-    let bootstrap_api_hosts = bootstrap_hosts().await;
+    let bootstrap_api_hosts = transaction.wait("bootstrap DNS", bootstrap_hosts()).await?;
 
+    transaction.check("preparing service")?;
     set_stage(state, app, ConnectStage::PreparingService, generation, false, started).await?;
+
+    // Capture both the policy and its physical egress before WinTUN changes the default route.
+    // Re-reading either after the first Core start can select the Tono adapter itself and makes
+    // the runtime plan disagree with the WFP preflight that was actually performed.
+    let traffic_policy = { state.lock().await.traffic_policy.clone() };
+    let physical_interface = if traffic_policy.as_ref().is_some_and(|policy| {
+        !policy.domains.is_empty() || !policy.media_endpoints.is_empty() || !policy.web_domains.is_empty()
+    }) {
+        let interface = transaction
+            .wait("physical interface discovery", detect_physical_interface())
+            .await?
+            .map_err(StageFailure::error)?;
+        tono_core::config::DirectPlan::validate_physical_interface(&interface).map_err(StageFailure::error)?;
+        Some(interface)
+    } else {
+        None
+    };
+
+    // Tono is TUN-only, so it does not expose Mihomo's legacy mixed listener. A fresh controller
+    // port eliminates collisions with another proxy or a stale 9090 listener. DNS stays fixed at
+    // loopback:53 because Windows adapter protection points resolvers there, therefore prove both
+    // TCP and UDP are available before installing WFP rather than timing out after the arm.
+    let controller_port = transaction
+        .wait("controller port allocation", allocate_controller_port())
+        .await?
+        .map_err(StageFailure::error)?;
+    transaction
+        .wait("DNS listener preflight", preflight_dns_listener())
+        .await?
+        .map_err(StageFailure::error)?;
+    let runtime_ports = RuntimePorts {
+        mixed_port: 0,
+        controller_port,
+    };
 
     // §5: the owned runtime carries a fresh random controller secret; only
     // the redacted copy may touch disk.
     let secret = generate_controller_secret();
-    let runtime = build_owned_runtime(nodes, &node.name, &secret, None).map_err(StageFailure::error)?;
+    let runtime =
+        build_owned_runtime_with_ports(nodes, &node.name, &secret, None, runtime_ports).map_err(StageFailure::error)?;
     write_redacted_copy(state, &runtime.redacted_yaml()).await;
-    let core_path = service::tono_core_binary_path().await.map_err(StageFailure::error)?;
+    let core_path = transaction
+        .wait("core path validation", service::tono_core_binary_path())
+        .await?
+        .map_err(StageFailure::error)?;
     let bundle = RuntimeBundle {
         yaml: runtime.yaml().to_string(),
         assets: Vec::new(),
@@ -327,7 +508,12 @@ async fn run_stages(
     // a failure inside is fail-closed on the Service side.
     set_stage(state, app, ConnectStage::StartingKillSwitch, generation, false, started).await?;
     ensure_fresh(state, generation).await?;
-    start_core_cancellation_safe(state, bundle, kill_switch, generation).await?;
+    transaction
+        .wait(
+            "starting kill switch and core",
+            start_core_cancellation_safe(state, bundle, kill_switch, generation),
+        )
+        .await??;
 
     // The WFP policy exists from here on: the machine is fail-closed.
     {
@@ -340,51 +526,88 @@ async fn run_stages(
         }
         inner.fsm.mark_kill_switch_armed();
         inner.controller_secret = Some(secret.clone());
+        inner.controller_port = Some(controller_port);
         commands::emit_status(app, &commands::status_of(&inner));
     }
 
     // §6.4: startingTunnel — poll the controller (≤ 40 × 250 ms).
     set_stage(state, app, ConnectStage::StartingTunnel, generation, true, started).await?;
-    wait_controller(&secret).await.map_err(StageFailure::error)?;
+    transaction
+        .wait("controller readiness", wait_controller(&secret, controller_port))
+        .await?
+        .map_err(StageFailure::error)?;
 
     // §6.5+§6.6: lockingTraffic — the lock call doubles as the TUN adapter
     // existence check and is idempotent on the Service side (≤ 20 × 100 ms).
     set_stage(state, app, ConnectStage::LockingTraffic, generation, true, started).await?;
-    lock_kill_switch_with_retries().await.map_err(StageFailure::error)?;
+    transaction
+        .wait("locking traffic", lock_kill_switch_with_retries())
+        .await?
+        .map_err(StageFailure::error)?;
 
     // Build 28: applyingCloudPolicy — resolve the cloud WeChat-DIRECT
     // policy through the now-running controller and, when a plan exists,
     // re-arm with its endpoint permits before the DIRECT-capable runtime
     // starts (permit strictly before selector, via a second StartClash).
     set_stage(state, app, ConnectStage::ApplyingCloudPolicy, generation, true, started).await?;
-    let secret = apply_cloud_policy(
-        state,
-        app,
-        &node,
-        nodes,
-        generation,
-        &secret,
-        &proxy_endpoints,
-        &bootstrap_api_hosts,
-    )
-    .await?;
+    let secret = transaction
+        .wait(
+            "cloud traffic policy",
+            apply_cloud_policy(
+                state,
+                app,
+                &node,
+                nodes,
+                generation,
+                &secret,
+                controller_port,
+                &proxy_endpoints,
+                &bootstrap_api_hosts,
+                traffic_policy,
+                physical_interface,
+            ),
+        )
+        .await??;
 
     // §6.7: securingDNS — snapshot + point resolvers at loopback, then prove
     // an ordinary lookup returns a fake-ip address.
     set_stage(state, app, ConnectStage::SecuringDns, generation, true, started).await?;
-    enable_dns_cancellation_safe(state, generation).await?;
+    transaction
+        .wait(
+            "enabling protected DNS",
+            enable_dns_cancellation_safe(state, generation),
+        )
+        .await??;
     if state.lock().await.connect_generation != generation {
         return Err(stale_after_dns(state).await);
     }
-    verify_fake_ip().await.map_err(StageFailure::error)?;
+    transaction
+        .wait("fake-IP verification", verify_fake_ip())
+        .await?
+        .map_err(StageFailure::error)?;
 
     // §6.8: checkingExit — probe generate_204 through the Tono-Exit group.
     set_stage(state, app, ConnectStage::CheckingExit, generation, true, started).await?;
-    probe_exit(&secret).await.map_err(StageFailure::error)?;
+    transaction
+        .wait("exit verification", probe_exit(&secret, controller_port))
+        .await?
+        .map_err(StageFailure::error)?;
 
     // §6.9: verifyingTraffic — the barrier must be wanted, live, and locked.
     set_stage(state, app, ConnectStage::VerifyingTraffic, generation, true, started).await?;
-    let kill_status = verify_locked().await.map_err(StageFailure::error)?;
+    let mut kill_status = transaction
+        .wait("kill-switch verification", verify_locked())
+        .await?
+        .map_err(StageFailure::error)?;
+
+    // The durable logical-session latch is committed only after every existing check and a
+    // final generation guard. A failure remains an ordinary connect failure.
+    ensure_fresh(state, generation).await?;
+    transaction
+        .wait("committing verified session", service::tono_mark_kill_switch_verified())
+        .await?
+        .map_err(StageFailure::error)?;
+    kill_status.verified = true;
 
     // §6.10: only now Connected; monitors start.
     {
@@ -394,6 +617,7 @@ async fn run_stages(
             return Err(stale_after_arm(state).await);
         }
         inner.kill_switch = Some(kill_status);
+        inner.fsm.mark_session_verified();
         inner.fsm.connect_succeeded().map_err(StageFailure::error)?;
         // F3: every step completed; retry bookkeeping resets.
         let elapsed = inner
@@ -430,8 +654,14 @@ async fn start_core_cancellation_safe(
     kill_switch: KillSwitchConfig,
     generation: u64,
 ) -> Result<(), StageFailure> {
+    let mutation_guard = state.begin_connect_mutation().await;
+    if state.lock().await.connect_generation != generation {
+        drop(mutation_guard);
+        return Err(StageFailure::Stale);
+    }
     let task_state = Arc::clone(state);
     let task = tokio::spawn(async move {
+        let _mutation_guard = mutation_guard;
         service::tono_start_core_with_kill_switch(bundle, kill_switch)
             .await
             .map_err(StageFailure::error)?;
@@ -447,8 +677,14 @@ async fn start_core_cancellation_safe(
 /// Cancellation-safe counterpart for DNS enable. A disconnect may restore and release while an
 /// old enable is still in flight; the detached child restores again after that late commit.
 async fn enable_dns_cancellation_safe(state: &Arc<TonoState>, generation: u64) -> Result<(), StageFailure> {
+    let mutation_guard = state.begin_connect_mutation().await;
+    if state.lock().await.connect_generation != generation {
+        drop(mutation_guard);
+        return Err(StageFailure::Stale);
+    }
     let task_state = Arc::clone(state);
     let task = tokio::spawn(async move {
+        let _mutation_guard = mutation_guard;
         service::tono_enable_protected_dns()
             .await
             .map_err(StageFailure::error)?;
@@ -532,7 +768,7 @@ pub struct FailurePlan {
     pub restrict_bootstrap: bool,
 }
 
-pub fn plan_failure(armed: bool, was_disconnecting: bool) -> FailurePlan {
+pub fn plan_failure(armed: bool, session_verified: bool, was_disconnecting: bool) -> FailurePlan {
     if was_disconnecting {
         // A disconnect is in flight and owns the release sequence end to
         // end; the failing transaction must not double it.
@@ -541,8 +777,7 @@ pub fn plan_failure(armed: bool, was_disconnecting: bool) -> FailurePlan {
             stop_core: None,
             restrict_bootstrap: false,
         }
-    } else if armed {
-        // §6: anything after arm keeps blocking and reconnects.
+    } else if armed && session_verified {
         FailurePlan {
             mark_armed: true,
             stop_core: Some(false),
@@ -562,6 +797,7 @@ pub fn plan_failure(armed: bool, was_disconnecting: bool) -> FailurePlan {
 /// stop before the owner-gated release. Only a live session can stop; the
 /// release itself never depends on one (C1: Protected Offline's session is
 /// long gone).
+#[cfg(any(not(windows), test))]
 pub fn stop_core_before_release(core_active: bool, session_active: bool) -> bool {
     core_active && session_active
 }
@@ -572,7 +808,7 @@ pub fn stop_core_before_release(core_active: bool, session_active: bool) -> bool
 async fn fail_connect(state: &Arc<TonoState>, app: &AppHandle, err: String) -> String {
     logging!(error, Type::Service, "Tono: 连接事务失败: {err}");
     let observed = service::tono_kill_switch_status().await.ok();
-    let (plan, stage, action) = {
+    let (plan, stage, action, armed) = {
         let mut inner = state.lock().await;
         if let Some(status) = &observed {
             inner.kill_switch = Some(status.clone());
@@ -583,23 +819,34 @@ async fn fail_connect(state: &Arc<TonoState>, app: &AppHandle, err: String) -> S
             .map(|status| status.wanted)
             .unwrap_or(inner.fsm.kill_switch_armed());
         let was_disconnecting = inner.fsm.status().is_disconnecting;
-        let plan = plan_failure(armed, was_disconnecting);
+        let session_verified = observed
+            .as_ref()
+            .map(|status| status.verified)
+            .unwrap_or(inner.fsm.session_verified());
+        if session_verified {
+            inner.fsm.mark_session_verified();
+        }
+        let plan = plan_failure(armed, session_verified, was_disconnecting);
         let action: &'static str = if was_disconnecting {
             "racedDisconnect"
-        } else if armed {
+        } else if armed && session_verified {
             "keepBlockingAndReconnect"
         } else {
             "fullRelease"
         };
         if plan.mark_armed {
             inner.fsm.mark_kill_switch_armed();
+        } else if armed && !session_verified && !was_disconnecting {
+            // Keep reality visible until the required full release actually succeeds.
+            inner.fsm.mark_kill_switch_armed();
         }
-        if !was_disconnecting {
+        if !was_disconnecting && (session_verified || !armed) {
             // Drives the FSM to Protected Offline (armed) or releases it
             // (pre-arm), mirroring the plan.
             inner.fsm.connect_failed();
         }
         inner.controller_secret = None;
+        inner.controller_port = None;
         // F3: the in-flight step is failed (never completed); the error is
         // sanitized before it is stored for the UI.
         let step_elapsed = inner
@@ -613,7 +860,7 @@ async fn fail_connect(state: &Arc<TonoState>, app: &AppHandle, err: String) -> S
         if plan.mark_armed {
             inner.retry_attempt += 1;
         }
-        (plan, stage, action)
+        (plan, stage, action, armed)
     };
     state.audit().log(AuditEvent::ConnectFail {
         stage: stage.map(commands::stage_key),
@@ -626,7 +873,18 @@ async fn fail_connect(state: &Arc<TonoState>, app: &AppHandle, err: String) -> S
             .log(AuditEvent::ProtectedOffline { reason: "connectFail" });
     }
 
-    if let Some(release) = plan.stop_core {
+    if plan.stop_core == Some(true) && armed {
+        match release_explicit(state, app).await {
+            Ok(()) => {
+                state.lock().await.fsm.connect_failed();
+            }
+            Err(release_error) => {
+                let mut inner = state.lock().await;
+                inner.fsm.initial_release_failed();
+                inner.connect_error = Some(crate::tono::audit::redact(&format!("{err}; {release_error}")));
+            }
+        }
+    } else if let Some(release) = plan.stop_core {
         let _ = service::tono_stop_core(release).await;
     }
     if plan.restrict_bootstrap {
@@ -640,41 +898,98 @@ async fn fail_connect(state: &Arc<TonoState>, app: &AppHandle, err: String) -> S
 
 /// Explicit user release (Disconnect / Sign Out / Quit, §6; C1).
 ///
-/// Order: DNS restore — proven, or the whole release aborts and the system
-/// stays armed (M3) → best-effort session-gated core stop while a session
-/// is live → owner-gated kill switch release, which works from Protected
-/// Offline where the arming session is long gone. A failed release keeps
-/// the system armed and surfaces an error.
+/// Windows executes DNS restore → matching Core stop/retire → WFP removal inside one owner-gated
+/// Service handler, including from Protected Offline where the arming session is gone. Every
+/// caller joins one App-side operation; its UI deadline never cancels the worker. A failed release
+/// keeps the system armed and surfaces an error.
 pub async fn release_explicit(state: &Arc<TonoState>, app: &AppHandle) -> Result<(), String> {
-    let _ = app;
-    // 1. DNS is always restored before the kill switch is disarmed (§6);
-    //    a missing snapshot is a proven no-op on the Service side.
-    if let Err(err) = service::tono_restore_protected_dns().await {
-        let message = format!("DNS restore failed; protection stays on: {err}");
-        state.audit().log(AuditEvent::ReleaseFail { error: message.clone() });
-        return Err(message);
+    let (operation, is_new) = state.begin_release().await;
+    if is_new {
+        let task_state = Arc::clone(state);
+        let task_app = app.clone();
+        let worker_state = Arc::clone(state);
+        let worker_app = app.clone();
+        let worker =
+            tauri::async_runtime::spawn(async move { run_explicit_release_sequence(&worker_state, &worker_app).await });
+        let supervised_operation = Arc::clone(&operation);
+        AsyncHandler::spawn(move || async move {
+            let result = worker
+                .await
+                .map_err(|error| format!("release reconciliation task failed: {error}"))
+                .and_then(|result| result);
+            if let Err(message) = &result {
+                task_state
+                    .audit()
+                    .log(AuditEvent::ReleaseFail { error: message.clone() });
+                logging!(error, Type::Service, "Tono: 安全释放对账失败: {message}");
+            }
+            supervised_operation.complete(result);
+            task_state.finish_release(supervised_operation.id()).await;
+            // A timed-out caller may no longer be present to repaint. Publish the final state (or
+            // the still-protected failure state) after the coordinator has settled.
+            let inner = task_state.lock().await;
+            commands::emit_status(&task_app, &commands::status_of(&inner));
+        });
     }
 
-    // 2. Best-effort core stop; its failure never blocks the release.
-    let core_active = matches!(*CoreManager::global().get_running_mode(), RunningMode::Service);
-    if stop_core_before_release(core_active, service::tono_session_live()) {
-        let _ = service::tono_stop_core(false).await;
+    match tokio::time::timeout(EXPLICIT_RELEASE_TIMEOUT, operation.wait()).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "release exceeded {EXPLICIT_RELEASE_TIMEOUT:?}; ordered background reconciliation continues and protection is assumed on until proven otherwise"
+        )),
     }
+}
 
-    // 3. The actual disarm (owner-gated, idempotent, DNS-before-disarm is
-    //    re-enforced Service-side).
-    let status = match service::tono_release_kill_switch().await {
-        Ok(status) => status,
-        Err(err) => {
-            let message = format!("kill switch release failed; protection stays on: {err}");
-            state.audit().log(AuditEvent::ReleaseFail { error: message.clone() });
-            return Err(message);
+/// The release worker is never owned by one UI call. On Windows the owner-gated Service route is
+/// already the transaction boundary: under one lifecycle lock it proves DNS restoration, stops
+/// and retires the matching Core, then removes WFP. Calling those as three App-owned IPCs would
+/// recreate a cancellation window between the steps. Other platforms retain their existing
+/// helper sequence until their Service route provides the same complete stop semantics.
+async fn run_explicit_release_sequence(state: &Arc<TonoState>, app: &AppHandle) -> Result<(), String> {
+    // Wait for detached StartClash/DNS commits that began before the release generation bump.
+    // Keeping this guard through the Service call also prevents a stale mutation from starting
+    // between the wait and the atomic DNS/Core/WFP transaction.
+    let _release_guard = state.begin_privileged_release().await;
+
+    #[cfg(windows)]
+    let status = service::tono_release_kill_switch()
+        .await
+        .map_err(|error| format!("kill switch release failed; protection stays on: {error}"))?;
+
+    #[cfg(not(windows))]
+    let status = {
+        service::tono_restore_protected_dns()
+            .await
+            .map_err(|error| format!("DNS restore failed; protection stays on: {error}"))?;
+        let core_active = matches!(*CoreManager::global().get_running_mode(), RunningMode::Service);
+        if stop_core_before_release(core_active, service::tono_session_live()) {
+            let _ = service::tono_stop_core(false).await;
         }
+        service::tono_release_kill_switch()
+            .await
+            .map_err(|error| format!("kill switch release failed; protection stays on: {error}"))?
     };
+
+    if status.wanted || status.live {
+        return Err(format!(
+            "kill switch release returned an armed state (wanted={}, live={})",
+            status.wanted, status.live
+        ));
+    }
 
     let mut inner = state.lock().await;
     inner.kill_switch = Some(status);
     inner.controller_secret = None;
+    inner.controller_port = None;
+    inner.network_events_counter = None;
+    inner.last_core_pid = None;
+    inner.last_restart_count = None;
+    // Also closes a caller that reached its UI budget and temporarily surfaced Protected
+    // Offline; this transition is allowed only after the Service proved WFP is gone. A new
+    // connect cannot race this commit because `guard_snapshot` rejects while the coordinator is
+    // populated.
+    inner.fsm.sign_out_or_quit();
+    commands::emit_status(app, &commands::status_of(&inner));
     Ok(())
 }
 
@@ -841,9 +1156,7 @@ pub async fn disconnect(state: Arc<TonoState>, app: AppHandle) -> Result<(), Str
         if inner.fsm.status().is_disconnecting {
             return Ok(());
         }
-        inner.connect_generation += 1;
-        inner.release_on_stale = true;
-        inner.tasks.abort_connection_tasks();
+        inner.invalidate_connection(true);
         let status = inner.fsm.status();
         if !status.is_connected && !status.is_connecting && !status.is_protection_blocked {
             return Ok(());
@@ -861,6 +1174,7 @@ pub async fn disconnect(state: Arc<TonoState>, app: AppHandle) -> Result<(), Str
     let mut inner = state.lock().await;
     inner.fsm.finish_disconnect();
     inner.controller_secret = None;
+    inner.controller_port = None;
     inner.kill_switch = None;
     inner.network_events_counter = None;
     inner.last_core_pid = None;
@@ -894,11 +1208,9 @@ pub async fn selected_node_vanished(state: Arc<TonoState>, app: AppHandle) {
         // a teardown actually follows — an idle catalog shrink must not
         // stomp a releaser's intent.
         if active {
-            inner.connect_generation += 1;
             // The teardown keeps blocking, so a stale attempt must not
             // release the barrier (H-1 intent).
-            inner.release_on_stale = false;
-            inner.tasks.abort_connection_tasks();
+            inner.invalidate_connection(false);
         }
         active
     };
@@ -911,6 +1223,7 @@ pub async fn selected_node_vanished(state: Arc<TonoState>, app: AppHandle) {
 
     let mut inner = state.lock().await;
     inner.controller_secret = None;
+    inner.controller_port = None;
     let vanished_node = inner.selected_node.clone();
     if inner.fsm.status().is_connected {
         inner.fsm.tunnel_died();
@@ -945,6 +1258,7 @@ pub async fn switch_selected_node(state: Arc<TonoState>, app: AppHandle, generat
             return;
         }
         inner.controller_secret = None;
+        inner.controller_port = None;
         if inner.fsm.status().is_connected {
             inner.fsm.tunnel_died();
         } else {
@@ -1031,10 +1345,13 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
         // F2 leg 2: periodic single-shot exit probe through the tunnel.
         if last_probe.elapsed() >= EXIT_PROBE_INTERVAL {
             last_probe = std::time::Instant::now();
-            let secret = { state.lock().await.controller_secret.clone() };
-            let failed = match secret {
-                Some(secret) => match probe_exit_once(&secret).await {
-                    Ok(()) => false,
+            let controller = {
+                let inner = state.lock().await;
+                inner.controller_secret.clone().zip(inner.controller_port)
+            };
+            let failed = match controller {
+                Some((secret, port)) => match probe_exit_once(&secret, port).await {
+                    Ok(_) => false,
                     Err(err) => {
                         state.audit().log(AuditEvent::HealthProbeFail {
                             probe: "exit",
@@ -1043,7 +1360,7 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
                         true
                     }
                 },
-                // Connected without a controller secret is itself abnormal.
+                // Connected without an authenticated controller endpoint is itself abnormal.
                 None => true,
             };
             if failed {
@@ -1163,10 +1480,11 @@ pub fn proxy_endpoint_of(node: &ValidatedNode) -> ProxyEndpoint {
 /// F1: merge the pinned bootstrap IPs with the live resolution of the API
 /// host (best-effort — a failed lookup just yields the pins alone).
 async fn bootstrap_hosts() -> Vec<String> {
-    let dynamic: Vec<String> = match tokio::net::lookup_host((bootstrap::API_HOST, 443)).await {
-        Ok(addrs) => addrs.map(|addr| addr.ip().to_string()).collect(),
-        Err(_) => Vec::new(),
-    };
+    let dynamic: Vec<String> =
+        match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((bootstrap::API_HOST, 443))).await {
+            Ok(Ok(addrs)) => addrs.map(|addr| addr.ip().to_string()).collect(),
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        };
     bootstrap::merge_bootstrap_hosts(&dynamic)
 }
 
@@ -1235,35 +1553,105 @@ async fn set_stage(
 fn controller_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_millis(500))
         .timeout(Duration::from_secs(6))
         .build()
         .map_err(|err| err.to_string())
 }
 
-/// §6.4: poll the mihomo controller `/version` (≤ 40 × 250 ms).
-async fn wait_controller(secret: &str) -> Result<(), String> {
+fn controller_url(port: u16, path: &str) -> String {
+    format!("http://127.0.0.1:{port}{path}")
+}
+
+/// Pick an unused loopback port for this connection generation. The bind is intentionally released
+/// before Mihomo starts; a second process can theoretically win that narrow race, but Mihomo then
+/// fails immediately and the absolute connection deadline handles it. Keeping a listener open would
+/// prevent the child from binding on Windows.
+async fn allocate_controller_port() -> Result<u16, String> {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|error| format!("cannot allocate loopback controller port: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("cannot inspect loopback controller port: {error}"))?
+        .port();
+    drop(listener);
+    if port == 0 {
+        return Err("operating system returned an invalid controller port".to_string());
+    }
+    Ok(port)
+}
+
+/// Protected DNS requires Mihomo to own both TCP and UDP loopback:53. Fail before WFP is installed
+/// when another resolver already owns either socket, avoiding a 45-second protected-offline mystery.
+#[cfg(windows)]
+async fn preflight_dns_listener() -> Result<(), String> {
+    let tcp = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 53))
+        .await
+        .map_err(|error| format!("DNS TCP 127.0.0.1:53 is unavailable: {error}"))?;
+    let udp = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 53))
+        .await
+        .map_err(|error| format!("DNS UDP 127.0.0.1:53 is unavailable: {error}"))?;
+    drop((tcp, udp));
+    Ok(())
+}
+
+#[cfg(not(windows))]
+async fn preflight_dns_listener() -> Result<(), String> {
+    Ok(())
+}
+
+/// §6.4: poll the mihomo controller `/version` for at most 15 seconds. Each localhost request is
+/// independently bounded as well, so a half-open socket cannot multiply the whole-stage budget.
+async fn wait_controller(secret: &str, controller_port: u16) -> Result<(), String> {
     let client = controller_client()?;
-    let url = format!("{CONTROLLER_BASE}/version");
+    let url = controller_url(controller_port, "/version");
     let mut last = String::from("no response");
-    for _ in 0..VERSION_POLL_ATTEMPTS {
-        match client.get(&url).bearer_auth(secret).send().await {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            Ok(response) => last = format!("controller answered {}", response.status()),
-            Err(err) => last = err.to_string(),
+    let deadline = tokio::time::Instant::now() + CONTROLLER_READY_TIMEOUT;
+    for attempt in 0..VERSION_POLL_ATTEMPTS {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        tokio::time::sleep(VERSION_POLL_INTERVAL).await;
+        match tokio::time::timeout(
+            remaining.min(CONTROLLER_POLL_TIMEOUT),
+            client.get(&url).bearer_auth(secret).send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) if response.status().is_success() => return Ok(()),
+            Ok(Ok(response)) => last = format!("controller answered {}", response.status()),
+            Ok(Err(err)) => last = err.to_string(),
+            Err(_) => last = format!("controller poll exceeded {CONTROLLER_POLL_TIMEOUT:?}"),
+        }
+        if attempt + 1 == VERSION_POLL_ATTEMPTS {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(VERSION_POLL_INTERVAL)).await;
     }
     Err(format!("mihomo controller not ready: {last}"))
 }
 
-/// §6.5+§6.6: lock, retrying while the TUN adapter comes up (≤ 20 × 100 ms).
+/// §6.5+§6.6: lock, retrying only while the TUN adapter comes up (≤ 50 × 200 ms between
+/// retryable failures). Permanent lock errors fail immediately so a bad owner/WFP state does
+/// not burn the 120 s connect budget on 50 full lifecycle IPCs.
 async fn lock_kill_switch_with_retries() -> Result<(), String> {
     let mut last = String::from("no response");
-    for _ in 0..LOCK_ATTEMPTS {
+    for attempt in 0..LOCK_ATTEMPTS {
         match service::tono_lock_kill_switch().await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last = err.to_string();
+                if !is_retryable_lock_error(&last) {
+                    return Err(format!("kill switch lock failed: {last}"));
+                }
+                if attempt + 1 == LOCK_ATTEMPTS {
+                    break;
+                }
                 tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
             }
         }
@@ -1274,28 +1662,31 @@ async fn lock_kill_switch_with_retries() -> Result<(), String> {
 /// §6.7: an ordinary system lookup must return a fake-ip address (3 tries).
 async fn verify_fake_ip() -> Result<(), String> {
     let mut last = String::from("no answer");
-    for _ in 0..VERIFY_ATTEMPTS {
-        match tokio::net::lookup_host(FAKE_IP_LOOKUP).await {
-            Ok(addrs) => {
+    for attempt in 0..VERIFY_ATTEMPTS {
+        match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host(FAKE_IP_LOOKUP)).await {
+            Ok(Ok(addrs)) => {
                 let addrs: Vec<_> = addrs.collect();
                 if addrs.iter().any(|addr| is_fake_ip(addr.ip())) {
                     return Ok(());
                 }
                 last = format!("no fake-ip in {addrs:?}");
             }
-            Err(err) => last = err.to_string(),
+            Ok(Err(err)) => last = err.to_string(),
+            Err(_) => last = format!("system DNS lookup exceeded {DNS_LOOKUP_TIMEOUT:?}"),
         }
-        tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+        if attempt + 1 < VERIFY_ATTEMPTS {
+            tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
+        }
     }
     Err(format!("fake-ip verification failed: {last}"))
 }
 
 /// §6.8: delay-probe the exit group through the selected node (3 tries).
-async fn probe_exit(secret: &str) -> Result<(), String> {
+async fn probe_exit(secret: &str, controller_port: u16) -> Result<(), String> {
     let mut last = String::from("no response");
     for _ in 0..VERIFY_ATTEMPTS {
-        match probe_exit_once(secret).await {
-            Ok(()) => return Ok(()),
+        match probe_exit_once(secret, controller_port).await {
+            Ok(_) => return Ok(()),
             Err(err) => {
                 last = err;
                 tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
@@ -1307,10 +1698,13 @@ async fn probe_exit(secret: &str) -> Result<(), String> {
 
 /// One exit probe: `GET /proxies/Tono-Exit/delay` against the generate_204
 /// target with a 5 s core-side timeout; a positive delay proves egress.
-async fn probe_exit_once(secret: &str) -> Result<(), String> {
+async fn probe_exit_once(secret: &str, controller_port: u16) -> Result<u64, String> {
     let client = controller_client()?;
-    let mut url = reqwest::Url::parse(&format!("{CONTROLLER_BASE}/proxies/{EXIT_GROUP_NAME}/delay"))
-        .map_err(|err| err.to_string())?;
+    let mut url = reqwest::Url::parse(&controller_url(
+        controller_port,
+        &format!("/proxies/{EXIT_GROUP_NAME}/delay"),
+    ))
+    .map_err(|err| err.to_string())?;
     url.query_pairs_mut()
         .append_pair("url", EXIT_PROBE_URL)
         .append_pair("timeout", "5000");
@@ -1320,7 +1714,7 @@ async fn probe_exit_once(secret: &str) -> Result<(), String> {
             Ok(value) => {
                 let delay = value.get("delay").and_then(serde_json::Value::as_u64).unwrap_or(0);
                 if delay > 0 {
-                    Ok(())
+                    Ok(delay)
                 } else {
                     Err("exit delay was 0".to_string())
                 }
@@ -1330,6 +1724,26 @@ async fn probe_exit_once(secret: &str) -> Result<(), String> {
         Ok(response) => Err(format!("delay probe answered {}", response.status())),
         Err(err) => Err(err.to_string()),
     }
+}
+
+/// Run one real, bounded egress measurement for the currently connected server. The authenticated
+/// in-memory controller endpoint is never exposed to the WebView; only the measured milliseconds
+/// cross the Tauri command boundary.
+pub async fn test_current_server(state: &Arc<TonoState>) -> Result<u64, String> {
+    let (secret, controller_port) = {
+        let inner = state.lock().await;
+        if !inner.fsm.status().is_connected {
+            return Err("connect before testing the current server".to_string());
+        }
+        inner
+            .controller_secret
+            .clone()
+            .zip(inner.controller_port)
+            .ok_or_else(|| "connected controller endpoint is unavailable".to_string())?
+    };
+    probe_exit_once(&secret, controller_port)
+        .await
+        .map_err(|error| format!("current server test failed: {error}"))
 }
 
 /// §6.9: the kill switch must be wanted, verified live, and fully locked.
@@ -1365,29 +1779,36 @@ async fn apply_cloud_policy(
     nodes: &[ValidatedNode],
     generation: u64,
     original_secret: &str,
+    controller_port: u16,
     proxy_endpoints: &[ProxyEndpoint],
     bootstrap_api_hosts: &[String],
+    policy: Option<tono_core::policy::TonoTrafficPolicy>,
+    physical_interface: Option<String>,
 ) -> Result<String, StageFailure> {
-    let policy = { state.lock().await.traffic_policy.clone() };
     let Some(policy) = policy else {
         return Ok(original_secret.to_string());
     };
-    if policy.domains.is_empty() && policy.media_endpoints.is_empty() {
+    if policy.domains.is_empty() && policy.media_endpoints.is_empty() && policy.web_domains.is_empty() {
         return Ok(original_secret.to_string());
     }
 
-    // The DIRECT group binds the physical egress interface; resolving it
-    // fail-closed (a DIRECT path with no valid interface must not exist).
-    let interface = detect_physical_interface().await.map_err(StageFailure::error)?;
-    tono_core::config::DirectPlan::validate_physical_interface(&interface).map_err(StageFailure::error)?;
+    let interface = physical_interface
+        .ok_or_else(|| StageFailure::error("cloud DIRECT policy has no pre-TUN physical interface snapshot"))?;
 
     // Resolve every policy domain through the controller (parallel; a
     // failed query fails the stage = a connect failure behind the barrier).
-    let pins = resolve_direct_domains(original_secret, &policy.domains, node)
-        .await
+    let (wechat_pins, web_pins) = tokio::try_join!(
+        resolve_direct_domains(original_secret, controller_port, &policy.domains, node),
+        resolve_direct_domains(original_secret, controller_port, &policy.web_domains, node),
+    )
+    .map_err(StageFailure::error)?;
+    let (plan, direct_endpoints) = build_direct_plan(interface, &wechat_pins, &web_pins, &policy.media_endpoints, node)
         .map_err(StageFailure::error)?;
-    let (plan, direct_endpoints) = build_direct_plan(interface, &pins, &policy.media_endpoints, node);
-    if plan.hosts.is_empty() && plan.tcp_rules.is_empty() && plan.udp_wechat_rules.is_empty() {
+    if plan.hosts.is_empty()
+        && plan.tcp_wechat_rules.is_empty()
+        && plan.tcp_web_rules.is_empty()
+        && plan.udp_wechat_rules.is_empty()
+    {
         return Ok(original_secret.to_string());
     }
 
@@ -1399,7 +1820,17 @@ async fn apply_cloud_policy(
     // plus the exact DIRECT endpoint tuples and the direct-enabled runtime
     // (fresh controller secret per start, §5).
     let secret = generate_controller_secret();
-    let runtime = build_owned_runtime(nodes, &node.name, &secret, Some(&plan)).map_err(StageFailure::error)?;
+    let runtime = build_owned_runtime_with_ports(
+        nodes,
+        &node.name,
+        &secret,
+        Some(&plan),
+        RuntimePorts {
+            mixed_port: 0,
+            controller_port,
+        },
+    )
+    .map_err(StageFailure::error)?;
     write_redacted_copy(state, &runtime.redacted_yaml()).await;
     ensure_fresh(state, generation).await?;
     let core_path = service::tono_core_binary_path().await.map_err(StageFailure::error)?;
@@ -1424,10 +1855,13 @@ async fn apply_cloud_policy(
             return Err(stale_after_arm(state).await);
         }
         inner.controller_secret = Some(secret.clone());
+        inner.controller_port = Some(controller_port);
     }
     // The restarted core re-creates the TUN adapter: wait for the new
     // controller, then re-lock (idempotent, re-asserts the adapter).
-    wait_controller(&secret).await.map_err(StageFailure::error)?;
+    wait_controller(&secret, controller_port)
+        .await
+        .map_err(StageFailure::error)?;
     if state.lock().await.connect_generation != generation {
         return Err(stale_after_arm(state).await);
     }
@@ -1437,7 +1871,8 @@ async fn apply_cloud_policy(
     }
 
     state.audit().log(AuditEvent::PolicyActivated {
-        tcp: plan.tcp_rules.len(),
+        wechat_tcp: plan.tcp_wechat_rules.len(),
+        web_tcp: plan.tcp_web_rules.len(),
         udp: plan.udp_wechat_rules.len(),
     });
     let _ = app;
@@ -1448,6 +1883,7 @@ async fn apply_cloud_policy(
 /// the mihomo controller's `/dns/query` (fail-closed on any query error).
 async fn resolve_direct_domains(
     secret: &str,
+    controller_port: u16,
     domains: &[tono_core::policy::PolicyDomain],
     node: &ValidatedNode,
 ) -> Result<Vec<(String, Vec<std::net::Ipv4Addr>, Vec<u16>)>, String> {
@@ -1459,7 +1895,7 @@ async fn resolve_direct_domains(
             let server = node.server;
             let secret = secret.to_string();
             async move {
-                let addresses = dns_query_a(&secret, &host).await?;
+                let addresses = dns_query_a(&secret, controller_port, &host).await?;
                 let usable: Vec<std::net::Ipv4Addr> = addresses
                     .into_iter()
                     .filter(|ip| tono_core::node::is_public_ipv4(*ip))
@@ -1480,9 +1916,9 @@ async fn resolve_direct_domains(
 
 /// `GET /dns/query?name=<host>&type=A` through the controller; the response
 /// shape is tolerated by collecting every IPv4 literal in the JSON tree.
-async fn dns_query_a(secret: &str, host: &str) -> Result<Vec<std::net::Ipv4Addr>, String> {
+async fn dns_query_a(secret: &str, controller_port: u16, host: &str) -> Result<Vec<std::net::Ipv4Addr>, String> {
     let client = controller_client()?;
-    let mut url = reqwest::Url::parse(&format!("{CONTROLLER_BASE}/dns/query")).map_err(|err| err.to_string())?;
+    let mut url = reqwest::Url::parse(&controller_url(controller_port, "/dns/query")).map_err(|err| err.to_string())?;
     url.query_pairs_mut().append_pair("name", host).append_pair("type", "A");
     let response = client
         .get(url)
@@ -1524,22 +1960,30 @@ pub fn collect_ipv4_literals(value: &serde_json::Value) -> Vec<std::net::Ipv4Add
 /// (defense in depth on top of sync-time validation).
 pub fn build_direct_plan(
     interface: String,
-    pins: &[(String, Vec<std::net::Ipv4Addr>, Vec<u16>)],
+    wechat_pins: &[(String, Vec<std::net::Ipv4Addr>, Vec<u16>)],
+    web_pins: &[(String, Vec<std::net::Ipv4Addr>, Vec<u16>)],
     media: &[tono_core::policy::PolicyMedia],
     node: &ValidatedNode,
-) -> (tono_core::config::DirectPlan, Vec<ProxyEndpoint>) {
+) -> Result<(tono_core::config::DirectPlan, Vec<ProxyEndpoint>), String> {
     let mut hosts: Vec<(String, String)> = Vec::new();
-    let mut tcp: Vec<(std::net::Ipv4Addr, u16)> = Vec::new();
-    for (host, addresses, ports) in pins {
-        for ip in addresses {
-            // The selected node's own IP must never become a DIRECT target
-            // (resolution already filters it; the plan builder re-checks).
-            if *ip == node.server || tono_core::policy::is_permanently_protected(*ip) {
-                continue;
-            }
-            hosts.push((host.clone(), ip.to_string()));
-            for port in ports {
-                tcp.push((*ip, *port));
+    let mut wechat_tcp = Vec::new();
+    let mut web_tcp = Vec::new();
+    for (is_web, pins) in [(false, wechat_pins), (true, web_pins)] {
+        for (host, addresses, ports) in pins {
+            for ip in addresses {
+                // The selected node's own IP must never become a DIRECT target
+                // (resolution already filters it; the plan builder re-checks).
+                if *ip == node.server || tono_core::policy::is_permanently_protected(*ip) {
+                    continue;
+                }
+                hosts.push((host.clone(), ip.to_string()));
+                for port in ports {
+                    if is_web {
+                        web_tcp.push((host.clone(), *ip, *port));
+                    } else {
+                        wechat_tcp.push((host.clone(), *ip, *port));
+                    }
+                }
             }
         }
     }
@@ -1555,34 +1999,42 @@ pub fn build_direct_plan(
             udp.push((ip, *port));
         }
     }
-    tcp.sort_unstable();
-    tcp.dedup();
+    wechat_tcp.sort_unstable();
+    wechat_tcp.dedup();
+    web_tcp.sort_unstable();
+    web_tcp.dedup();
     udp.sort_unstable();
     udp.dedup();
 
-    let mut endpoints: Vec<ProxyEndpoint> = tcp
+    let mut endpoint_keys: std::collections::BTreeSet<(std::net::Ipv4Addr, u16, bool)> = wechat_tcp
         .iter()
-        .map(|(ip, port)| ProxyEndpoint {
+        .chain(web_tcp.iter())
+        .map(|(_, ip, port)| (*ip, *port, false))
+        .collect();
+    endpoint_keys.extend(udp.iter().map(|(ip, port)| (*ip, *port, true)));
+    if endpoint_keys.len() > MAX_DIRECT_ENDPOINTS {
+        return Err(format!(
+            "cloud DIRECT policy resolved to {} unique endpoints; maximum is {MAX_DIRECT_ENDPOINTS}",
+            endpoint_keys.len()
+        ));
+    }
+    let endpoints = endpoint_keys
+        .into_iter()
+        .map(|(ip, port, is_udp)| ProxyEndpoint {
             ip: ip.to_string(),
-            port: *port,
-            protocol: ProxyProtocol::Tcp,
+            port,
+            protocol: if is_udp { ProxyProtocol::Udp } else { ProxyProtocol::Tcp },
         })
         .collect();
-    endpoints.extend(udp.iter().map(|(ip, port)| ProxyEndpoint {
-        ip: ip.to_string(),
-        port: *port,
-        protocol: ProxyProtocol::Udp,
-    }));
-    // Service-side cap for direct permits.
-    endpoints.truncate(256);
 
     let plan = tono_core::config::DirectPlan {
         physical_interface: interface,
         hosts,
-        tcp_rules: tcp,
+        tcp_wechat_rules: wechat_tcp,
+        tcp_web_rules: web_tcp,
         udp_wechat_rules: udp,
     };
-    (plan, endpoints)
+    Ok((plan, endpoints))
 }
 
 /// The physical interface carrying the default route. Windows uses
@@ -1591,7 +2043,11 @@ pub fn build_direct_plan(
 async fn detect_physical_interface() -> Result<String, String> {
     #[cfg(windows)]
     {
-        detect_physical_interface_windows()
+        // GetBestRoute2/GetIfEntry2 are synchronous OS calls. Keep them off the Tauri async
+        // workers so a slow IP helper stack cannot starve UI / status / release tasks.
+        tokio::task::spawn_blocking(detect_physical_interface_windows)
+            .await
+            .map_err(|error| format!("physical interface discovery worker failed: {error}"))?
     }
     #[cfg(not(windows))]
     {
@@ -1622,14 +2078,15 @@ async fn detect_physical_interface_route_command() -> Result<String, String> {
     Err("no default route interface found".to_string())
 }
 
-/// Windows path: `GetBestRoute2` for a public destination, then
-/// `ConvertInterfaceLuidToNameW` for the interface's friendly name
-/// (`"Ethernet 2"` etc.). Runtime-unverified on this dev host; the shapes
-/// mirror the documented windows-sys signatures.
+/// Windows path: `GetBestRoute2` for a public destination, then `GetIfEntry2` for the interface
+/// alias (`"Ethernet 2"`, `"以太网"`, etc.). This runs before WinTUN starts, so the best route
+/// cannot resolve back to Tono. The Service deliberately resolves aliases to LUIDs as well; using
+/// `ConvertInterfaceLuidToNameW` here would produce the adapter's internal name and recreate the
+/// alias/name mismatch behind Windows error 123.
 #[cfg(windows)]
 fn detect_physical_interface_windows() -> Result<String, String> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ConvertInterfaceLuidToNameW, GetBestRoute2, MIB_IPFORWARD_ROW2,
+        GetBestRoute2, GetIfEntry2, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, IN_ADDR, SOCKADDR_INET};
 
@@ -1657,13 +2114,25 @@ fn detect_physical_interface_windows() -> Result<String, String> {
         return Err(format!("GetBestRoute2 failed: {status}"));
     }
 
-    let mut name = [0u16; 256];
-    let status = unsafe { ConvertInterfaceLuidToNameW(&best_route.InterfaceLuid, name.as_mut_ptr(), name.len()) };
+    let mut interface = MIB_IF_ROW2 {
+        InterfaceLuid: best_route.InterfaceLuid,
+        ..Default::default()
+    };
+    // SAFETY: `interface` is initialized and its LUID came from a successful `GetBestRoute2`.
+    let status = unsafe { GetIfEntry2(&mut interface) };
     if status != 0 {
-        return Err(format!("ConvertInterfaceLuidToNameW failed: {status}"));
+        return Err(format!("GetIfEntry2 failed: {status}"));
     }
-    let end = name.iter().position(|ch| *ch == 0).unwrap_or(name.len());
-    String::from_utf16(&name[..end]).map_err(|err| err.to_string())
+    let end = interface
+        .Alias
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(interface.Alias.len());
+    let alias = String::from_utf16(&interface.Alias[..end]).map_err(|err| err.to_string())?;
+    if alias.is_empty() {
+        return Err("GetIfEntry2 returned an empty interface alias".to_string());
+    }
+    Ok(alias)
 }
 
 /// Persist the redacted runtime copy (§5: the secret never touches disk).
@@ -1693,10 +2162,12 @@ async fn write_redacted_copy(state: &Arc<TonoState>, redacted: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailurePlan, SERVICE_BUSY_PREFIX, SelectAction, build_direct_plan, collect_ipv4_literals,
-        health_threshold_reached, is_fake_ip, kill_switch_unhealthy, map_service_ready_error, plan_failure,
-        protected_dns_unhealthy, proxy_endpoint_of, reconnect_allowed, retry_now_is_noop, select_action,
-        sign_out_needs_release, single_flight_begin, stale_exit_needs_release, stop_core_before_release,
+        FailurePlan, MAX_DIRECT_ENDPOINTS, RELEASE_RECONCILING_PREFIX, SERVICE_BUSY_PREFIX,
+        SERVICE_TOO_OLD_PREFIX, SelectAction, build_direct_plan, collect_ipv4_literals,
+        health_threshold_reached, is_fake_ip, is_retryable_lock_error, kill_switch_unhealthy,
+        map_service_ready_error, plan_failure, protected_dns_unhealthy, proxy_endpoint_of,
+        reconnect_allowed, retry_now_is_noop, select_action, sign_out_needs_release,
+        single_flight_begin, stale_exit_needs_release, stop_core_before_release,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use tono_core::{connection::ConnectionStatus, node::ValidatedNode};
@@ -1771,7 +2242,7 @@ mod tests {
         // Armed, no disconnect in flight: keep blocking (stop, never
         // release), restrict to bootstrap, latch the armed flag.
         assert_eq!(
-            plan_failure(true, false),
+            plan_failure(true, true, false),
             FailurePlan {
                 mark_armed: true,
                 stop_core: Some(false),
@@ -1780,7 +2251,16 @@ mod tests {
         );
         // Pre-arm failure: full release.
         assert_eq!(
-            plan_failure(false, false),
+            plan_failure(false, false, false),
+            FailurePlan {
+                mark_armed: false,
+                stop_core: Some(true),
+                restrict_bootstrap: false,
+            }
+        );
+        // Initial post-arm failure has not crossed the verification barrier: full release.
+        assert_eq!(
+            plan_failure(true, false, false),
             FailurePlan {
                 mark_armed: false,
                 stop_core: Some(true),
@@ -1791,7 +2271,7 @@ mod tests {
         // transaction does nothing, whatever the arm state.
         for armed in [true, false] {
             assert_eq!(
-                plan_failure(armed, true),
+                plan_failure(armed, false, true),
                 FailurePlan {
                     mark_armed: false,
                     stop_core: None,
@@ -1953,6 +2433,8 @@ mod tests {
         fsm.connect_failed();
         assert!(single_flight_begin(&mut fsm, 7, 7));
         // While connected, nothing may start a parallel transaction.
+        fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_succeeded().unwrap();
         assert!(!single_flight_begin(&mut fsm, 7, 7));
     }
@@ -1979,6 +2461,25 @@ mod tests {
     }
 
     #[test]
+    fn lock_retries_only_tun_not_ready_errors() {
+        assert!(is_retryable_lock_error(
+            r#"interface alias "Tono" did not resolve to a LUID: Windows error 87"#
+        ));
+        assert!(is_retryable_lock_error(
+            "interface LUID 123 is not a tunnel device (type 6, description \"Ethernet\"); refusing to lock"
+        ));
+        assert!(is_retryable_lock_error("Service unavailable: busy"));
+        // Permanent failures must fail the stage, not loop for 50 lifecycle IPCs.
+        assert!(!is_retryable_lock_error("kill switch is not armed"));
+        assert!(!is_retryable_lock_error("kill switch belongs to a different owner"));
+        assert!(!is_retryable_lock_error("WFP error 0x80320009"));
+        assert!(!is_retryable_lock_error("authentication failed"));
+        // Stable prefixes used by the UI for release/protocol gates.
+        assert!(RELEASE_RECONCILING_PREFIX.starts_with("TONO_"));
+        assert!(SERVICE_TOO_OLD_PREFIX.starts_with("TONO_"));
+    }
+
+    #[test]
     fn health_probes_require_two_consecutive_failures() {
         assert!(!health_threshold_reached(0));
         assert!(!health_threshold_reached(1));
@@ -1996,6 +2497,7 @@ mod tests {
         };
         let healthy = KillSwitchStatus {
             wanted: true,
+            verified: true,
             live: true,
             mode: KillSwitchStatusMode::Locked,
             endpoints: vec![endpoint.clone()],
@@ -2011,6 +2513,7 @@ mod tests {
         ] {
             let status = KillSwitchStatus {
                 wanted,
+                verified: false,
                 live,
                 mode,
                 endpoints: vec![endpoint.clone()],
@@ -2082,7 +2585,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_plan_builds_deduped_rules_and_capped_endpoints() {
+    fn direct_plan_builds_deduped_rules_and_matching_endpoints() {
         use tono_core::policy::PolicyMedia;
         let node = node();
         // The fixture node is 203.0.113.7; pins include it to prove the
@@ -2117,16 +2620,46 @@ mod tests {
                 ports: vec![443],
             },
         ];
-        let (plan, endpoints) = build_direct_plan("Ethernet 2".to_string(), &pins, &media, &node);
-        // TCP tuples deduped: (9.0.0.10, 80|443) + (9.0.0.11, 80|443) = 4.
-        assert_eq!(plan.tcp_rules.len(), 4);
+        let web_pins = vec![
+            (
+                "www.bilibili.com".to_string(),
+                vec![std::net::Ipv4Addr::new(9, 0, 0, 30)],
+                vec![443],
+            ),
+            (
+                "api.bilibili.com".to_string(),
+                // Shared CDN tuple must not consume a second WFP slot.
+                vec![std::net::Ipv4Addr::new(9, 0, 0, 10)],
+                vec![443],
+            ),
+        ];
+        let (plan, endpoints) = build_direct_plan("Ethernet 2".to_string(), &pins, &web_pins, &media, &node).unwrap();
+        // WeChat TCP tuples deduped: (9.0.0.10, 80|443) +
+        // (9.0.0.11, 80|443) = 4; exact web remains separate by host.
+        assert_eq!(plan.tcp_wechat_rules.len(), 4);
+        assert_eq!(
+            plan.tcp_web_rules,
+            vec![
+                (
+                    "api.bilibili.com".to_string(),
+                    std::net::Ipv4Addr::new(9, 0, 0, 10),
+                    443,
+                ),
+                (
+                    "www.bilibili.com".to_string(),
+                    std::net::Ipv4Addr::new(9, 0, 0, 30),
+                    443,
+                ),
+            ]
+        );
         // UDP: only (9.0.0.20, 443|8000).
         assert_eq!(plan.udp_wechat_rules.len(), 2);
-        // hosts carry both domains' addresses.
-        assert_eq!(plan.hosts.len(), 3);
+        // hosts carry both WeChat domains and the exact web domain.
+        assert_eq!(plan.hosts.len(), 5);
         assert!(plan.hosts.iter().all(|(_, ip)| ip != "203.0.113.7"));
-        // Endpoints: 4 TCP + 2 UDP, protocols mapped, none for the node IP.
-        assert_eq!(endpoints.len(), 6);
+        // Endpoints: 4 WeChat TCP + 1 distinct web TCP + 2 UDP. The shared
+        // 9.0.0.10:443 tuple consumes only one WFP permit.
+        assert_eq!(endpoints.len(), 7);
         assert!(endpoints.iter().all(|endpoint| endpoint.ip != "203.0.113.7"));
         assert_eq!(
             endpoints
@@ -2135,11 +2668,34 @@ mod tests {
                 .count(),
             2
         );
-        assert!(plan.tcp_rules.iter().all(|(_ip, port)| [80, 443].contains(port)));
+        assert!(
+            plan.tcp_wechat_rules
+                .iter()
+                .all(|(_host, _ip, port)| [80, 443].contains(port))
+        );
         assert!(
             plan.udp_wechat_rules
                 .iter()
                 .all(|(_ip, port)| [443, 8000].contains(port))
         );
+    }
+
+    #[test]
+    fn direct_plan_rejects_more_endpoints_than_wfp_can_permit() {
+        let node = node();
+        let pins = (0..=MAX_DIRECT_ENDPOINTS)
+            .map(|index| {
+                (
+                    format!("edge-{index}.example"),
+                    vec![std::net::Ipv4Addr::new(11, 1, (index / 256) as u8, (index % 256) as u8)],
+                    vec![443],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let error = build_direct_plan("Ethernet 2".to_string(), &pins, &[], &[], &node)
+            .expect_err("a partial WFP permit set must never be emitted");
+
+        assert!(error.contains("257 unique endpoints"));
     }
 }

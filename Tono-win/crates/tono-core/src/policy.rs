@@ -27,11 +27,28 @@ pub const MAX_POLICY_JSON_BYTES: usize = 64 * 1024;
 pub const MAX_POLICY_CACHE_BYTES: u64 = 256 * 1024;
 /// Cache file name inside the Tono data dir.
 pub const POLICY_CACHE_FILE_NAME: &str = "managed-traffic-policy.json";
-/// The only accepted policy document version.
-pub const POLICY_VERSION: u32 = 1;
+pub const POLICY_VERSION_V1: u32 = 1;
+pub const POLICY_VERSION_V2: u32 = 2;
 /// Limits shared with the Mac validator.
 pub const MAX_POLICY_DOMAINS: usize = 32;
 pub const MAX_POLICY_MEDIA: usize = 64;
+pub const MAX_POLICY_WEB_DOMAINS: usize = 16;
+
+pub const ALLOWED_WEB_DOMAIN_SUFFIXES: [&str; 13] = [
+    "bilibili.com",
+    "biliapi.net",
+    "bilivideo.com",
+    "hdslb.com",
+    "qq.com",
+    "gtimg.cn",
+    "gtimg.com",
+    "iqiyi.com",
+    "qiyi.com",
+    "qiyipic.com",
+    "iqiyipic.com",
+    "youku.com",
+    "ykimg.com",
+];
 
 /// Domain suffixes allowed for DIRECT routing (Mac
 /// `validatedManagedDirectDomain` parity). A host must equal a suffix or be
@@ -75,6 +92,8 @@ pub struct TonoTrafficPolicy {
     pub domains: Vec<PolicyDomain>,
     #[serde(rename = "mediaEndpoints", default)]
     pub media_endpoints: Vec<PolicyMedia>,
+    #[serde(rename = "webDomains", default)]
+    pub web_domains: Vec<PolicyDomain>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,12 +135,55 @@ pub enum PolicyError {
 pub fn is_allowed_direct_domain(host: &str) -> bool {
     let host = host.trim().to_lowercase();
     let host = host.strip_suffix('.').unwrap_or(&host);
-    if host.is_empty() || host.len() > 253 || host.bytes().any(|byte| !(0x21..=0x7E).contains(&byte)) {
+    if host.is_empty()
+        || host.len() > 253
+        || host.bytes().any(|byte| !(0x21..=0x7E).contains(&byte))
+    {
         return false;
     }
     ALLOWED_DOMAIN_SUFFIXES
         .iter()
         .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
+/// Exact-web hosts use a separate, deliberately narrow suffix allowlist.
+pub fn is_allowed_web_domain(host: &str) -> bool {
+    if host.is_empty()
+        || host.len() > 253
+        || host != host.trim()
+        || host.ends_with('.')
+        || host.split('.').count() < 2
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return false;
+    }
+    if matches!(
+        host,
+        "anthropic.com" | "claude.ai" | "tono.app" | "tono.com"
+    ) || ["anthropic.com", "claude.ai", "tono.app", "tono.com"]
+        .iter()
+        .any(|s| host.ends_with(&format!(".{s}")))
+    {
+        return false;
+    }
+    host == "ykimg.alicdn.com"
+        || ALLOWED_WEB_DOMAIN_SUFFIXES
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
 fn sorted_unique_ports(ports: &[u16], allowed: [u16; 2]) -> Option<Vec<u16>> {
@@ -151,11 +213,33 @@ pub fn validate_policy(
     if response.sha256 != catalog_digest(&response.json) {
         return Err(PolicyError::InvalidResponse);
     }
+    let shape: serde_json::Value =
+        serde_json::from_str(&response.json).map_err(|_| PolicyError::InvalidResponse)?;
+    let object = shape.as_object().ok_or(PolicyError::InvalidResponse)?;
+    let version = object
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(PolicyError::InvalidResponse)?;
+    let expected: BTreeSet<&str> = if version == POLICY_VERSION_V1 {
+        ["version", "domains", "mediaEndpoints"]
+            .into_iter()
+            .collect()
+    } else if version == POLICY_VERSION_V2 {
+        ["version", "domains", "mediaEndpoints", "webDomains"]
+            .into_iter()
+            .collect()
+    } else {
+        return Err(PolicyError::InvalidResponse);
+    };
+    if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err(PolicyError::InvalidResponse);
+    }
     let document: TonoTrafficPolicy =
         serde_json::from_str(&response.json).map_err(|_| PolicyError::InvalidResponse)?;
-    if document.version != POLICY_VERSION
-        || document.domains.len() > MAX_POLICY_DOMAINS
+    if document.domains.len() > MAX_POLICY_DOMAINS
         || document.media_endpoints.len() > MAX_POLICY_MEDIA
+        || document.web_domains.len() > MAX_POLICY_WEB_DOMAINS
     {
         return Err(PolicyError::InvalidResponse);
     }
@@ -172,7 +256,8 @@ pub fn validate_policy(
         if !is_allowed_direct_domain(&entry.host) {
             return Err(PolicyError::Domain(entry.host.clone()));
         }
-        let ports = sorted_unique_ports(&entry.ports, [80, 443]).ok_or(PolicyError::InvalidResponse)?;
+        let ports =
+            sorted_unique_ports(&entry.ports, [80, 443]).ok_or(PolicyError::InvalidResponse)?;
         domains.push(PolicyDomain {
             host: normalized.to_string(),
             ports,
@@ -182,6 +267,23 @@ pub fn validate_policy(
     let before = domains.len();
     domains.dedup_by(|left, right| left.host == right.host);
     if domains.len() != before {
+        return Err(PolicyError::InvalidResponse);
+    }
+
+    let mut web_domains = Vec::with_capacity(document.web_domains.len());
+    for entry in &document.web_domains {
+        if !is_allowed_web_domain(&entry.host) || entry.ports != [443] {
+            return Err(PolicyError::InvalidResponse);
+        }
+        if domains.iter().any(|domain| domain.host == entry.host) {
+            return Err(PolicyError::InvalidResponse);
+        }
+        web_domains.push(entry.clone());
+    }
+    web_domains.sort_by(|a, b| a.host.cmp(&b.host));
+    let before = web_domains.len();
+    web_domains.dedup_by(|a, b| a.host == b.host);
+    if web_domains.len() != before {
         return Err(PolicyError::InvalidResponse);
     }
 
@@ -197,7 +299,8 @@ pub fn validate_policy(
         {
             return Err(PolicyError::Address(entry.address.clone()));
         }
-        let ports = sorted_unique_ports(&entry.ports, [443, 8000]).ok_or(PolicyError::InvalidResponse)?;
+        let ports =
+            sorted_unique_ports(&entry.ports, [443, 8000]).ok_or(PolicyError::InvalidResponse)?;
         media.push(PolicyMedia {
             address: address.to_string(),
             ports,
@@ -211,9 +314,10 @@ pub fn validate_policy(
     }
 
     Ok(TonoTrafficPolicy {
-        version: POLICY_VERSION,
+        version,
         domains,
         media_endpoints: media,
+        web_domains,
     })
 }
 
@@ -337,11 +441,18 @@ impl PolicyCache {
 
     /// Atomically persist a policy. Re-validates before writing so the
     /// "only verified copies reach disk" invariant holds by construction.
-    pub fn store(&self, response: &TonoTrafficPolicyResponse, protected: &BTreeSet<Ipv4Addr>) -> Result<(), PolicyError> {
+    pub fn store(
+        &self,
+        response: &TonoTrafficPolicyResponse,
+        protected: &BTreeSet<Ipv4Addr>,
+    ) -> Result<(), PolicyError> {
         validate_policy(response, protected)?;
-        let body = serde_json::to_string(response).map_err(|err| PolicyError::Io(err.to_string()))?;
+        let body =
+            serde_json::to_string(response).map_err(|err| PolicyError::Io(err.to_string()))?;
         if body.len() as u64 > MAX_POLICY_CACHE_BYTES {
-            return Err(PolicyError::Io("serialized policy exceeds the cache limit".to_string()));
+            return Err(PolicyError::Io(
+                "serialized policy exceeds the cache limit".to_string(),
+            ));
         }
         let dir = self
             .path
@@ -360,7 +471,9 @@ impl PolicyCache {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = options.open(&temp).map_err(|err| PolicyError::Io(err.to_string()))?;
+            let mut file = options
+                .open(&temp)
+                .map_err(|err| PolicyError::Io(err.to_string()))?;
             file.write_all(body.as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|err| PolicyError::Io(err.to_string()))?;
@@ -473,6 +586,58 @@ mod tests {
         assert_eq!(policy.domains[1].ports, vec![80, 443]);
         assert_eq!(policy.media_endpoints[0].address, "9.0.0.9");
         assert_eq!(policy.media_endpoints[0].ports, vec![443, 8000]);
+        assert!(
+            policy.web_domains.is_empty(),
+            "old v1 decodes with no web list"
+        );
+    }
+
+    #[test]
+    fn accepts_v2_exact_web_and_rejects_v1_web() {
+        let v2 = r#"{"version":2,"domains":[],"mediaEndpoints":[],"webDomains":[{"host":"video.bilibili.com","ports":[443]},{"host":"ykimg.alicdn.com","ports":[443]}]}"#;
+        let policy = validate_policy(&response(1, v2), &no_protected()).unwrap();
+        assert_eq!(policy.version, 2);
+        assert_eq!(policy.web_domains.len(), 2);
+        let v1_web = v2.replace("\"version\":2", "\"version\":1");
+        assert_eq!(
+            validate_policy(&response(1, &v1_web), &no_protected()),
+            Err(PolicyError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn web_boundaries_fail_closed() {
+        for host in [
+            "Claude.ai",
+            "claude.ai",
+            "x.claude.ai",
+            "anthropic.com",
+            "tono.app",
+            "evilbilibili.com",
+        ] {
+            let doc = format!(
+                r#"{{"version":2,"domains":[],"mediaEndpoints":[],"webDomains":[{{"host":"{host}","ports":[443]}}]}}"#
+            );
+            assert_eq!(
+                validate_policy(&response(1, &doc), &no_protected()),
+                Err(PolicyError::InvalidResponse),
+                "{host}"
+            );
+        }
+        for ports in ["[]", "[80]", "[443,443]"] {
+            let doc = format!(
+                r#"{{"version":2,"domains":[],"mediaEndpoints":[],"webDomains":[{{"host":"bilibili.com","ports":{ports}}}]}}"#
+            );
+            assert_eq!(
+                validate_policy(&response(1, &doc), &no_protected()),
+                Err(PolicyError::InvalidResponse)
+            );
+        }
+        let duplicate = r#"{"version":2,"domains":[{"host":"qq.com","ports":[443]}],"mediaEndpoints":[],"webDomains":[{"host":"qq.com","ports":[443]}]}"#;
+        assert_eq!(
+            validate_policy(&response(1, duplicate), &no_protected()),
+            Err(PolicyError::InvalidResponse)
+        );
     }
 
     #[test]
@@ -511,10 +676,13 @@ mod tests {
     fn rejects_disallowed_and_protected_addresses() {
         for address in ["10.0.0.1", "198.18.0.1", "1.1.1.1", "8.8.8.8", "not-an-ip"] {
             let doc = policy_json("", &format!(r#"{{"address":"{address}","ports":[443]}}"#));
-            assert!(matches!(
-                validate_policy(&response(0, &doc), &no_protected()),
-                Err(PolicyError::Address(_)) | Err(PolicyError::InvalidResponse),
-            ), "{address}");
+            assert!(
+                matches!(
+                    validate_policy(&response(0, &doc), &no_protected()),
+                    Err(PolicyError::Address(_)) | Err(PolicyError::InvalidResponse),
+                ),
+                "{address}"
+            );
         }
         // The selected node's IP is protected at sync time.
         let mut protected = BTreeSet::new();
@@ -557,12 +725,16 @@ mod tests {
     #[test]
     fn tracker_enforces_revision_monotonicity() {
         let mut tracker = PolicyTracker::new();
-        let outcome = tracker.install(&response(5, &good_document()), &no_protected()).unwrap();
+        let outcome = tracker
+            .install(&response(5, &good_document()), &no_protected())
+            .unwrap();
         assert!(matches!(outcome, PolicyInstallOutcome::Installed(_)));
         assert_eq!(tracker.current_revision(), 5);
         // Same revision + digest: idempotent.
         assert_eq!(
-            tracker.install(&response(5, &good_document()), &no_protected()).unwrap(),
+            tracker
+                .install(&response(5, &good_document()), &no_protected())
+                .unwrap(),
             PolicyInstallOutcome::Unchanged
         );
         // Older: benign stale.
@@ -583,7 +755,9 @@ mod tests {
             "",
         );
         assert!(matches!(
-            tracker.install(&response(6, &newer), &no_protected()).unwrap(),
+            tracker
+                .install(&response(6, &newer), &no_protected())
+                .unwrap(),
             PolicyInstallOutcome::Installed(_)
         ));
         assert_eq!(tracker.current_revision(), 6);

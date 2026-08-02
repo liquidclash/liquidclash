@@ -5,15 +5,12 @@ use anyhow::Result;
 use crate::{
     config::Config,
     core::{
-        CoreManager, Timer,
-        handle::Handle,
-        hotkey::Hotkey,
+        CoreManager,
         logger::Logger,
         service::{SERVICE_MANAGER, ServiceManager},
         tray::Tray,
     },
     feat,
-    module::{auto_backup::AutoBackupManager, lightweight::auto_lightweight_boot},
     process::AsyncHandler,
     utils::{init, server, window_manager::WindowManager},
 };
@@ -50,16 +47,12 @@ pub fn resolve_setup_async() {
 
         #[cfg(target_os = "macos")]
         resolve_dock_show().await;
-        init_startup_script().await;
         init_service_manager().await;
         let config_initialized = init_verge_config_before_window().await;
         // Tono P0-10: hand-edited dangerous fields never survive startup.
         feat::sanitize_verge_config_for_tono().await;
         init_window().await;
         init_resources().await;
-        if let Err(e) = init::init_dns_config().await {
-            logging!(warn, Type::Setup, "DNS config initialization failed: {}", e);
-        }
         if config_initialized {
             init_verge_config().await;
         }
@@ -69,15 +62,9 @@ pub fn resolve_setup_async() {
         // core may only be started by the Tono connect transaction (§6).
         // Automatic updates stay disabled until Tono owns a release endpoint
         // and signing key; never inherit the upstream Clash Verge channel.
-        let _ = futures::join!(
-            init_tray(),
-            init_timer(),
-            init_hotkey(),
-            init_auto_lightweight_boot(),
-            init_auto_backup(),
-        );
-
-        Handle::refresh_clash();
+        // Tono keeps the user-facing tray, but does not start legacy profile timers, global
+        // hotkeys, lightweight mode, backup jobs, or old Core refresh traffic in the background.
+        init_tray().await;
         refresh_tray_menu().await;
         resolve_done();
     });
@@ -112,28 +99,6 @@ pub(super) fn init_embed_server() {
 
 pub(super) async fn init_resources() {
     logging_error!(Type::Setup, init::init_resources().await);
-}
-
-pub(super) async fn init_startup_script() {
-    logging_error!(Type::Setup, init::startup_script().await);
-}
-
-pub(super) async fn init_timer() {
-    logging_error!(Type::Setup, Timer::global().init().await);
-}
-
-pub(super) async fn init_hotkey() {
-    // if hotkey is not use by global, skip init it
-    let skip_register_hotkeys = !Config::verge().await.latest_arc().enable_global_hotkey.unwrap_or(true);
-    logging_error!(Type::Setup, Hotkey::global().init(skip_register_hotkeys).await);
-}
-
-pub(super) async fn init_auto_lightweight_boot() {
-    logging_error!(Type::Setup, auto_lightweight_boot().await);
-}
-
-pub(super) async fn init_auto_backup() {
-    logging_error!(Type::Setup, AutoBackupManager::global().init().await);
 }
 
 pub fn init_signal() {
@@ -177,6 +142,8 @@ pub(super) async fn init_window() {
 
 #[cfg(target_os = "macos")]
 pub(super) async fn resolve_dock_show() {
+    use crate::core::handle::Handle;
+
     let is_silent_start = Config::verge().await.data_arc().enable_silent_start.unwrap_or(false);
     if is_silent_start {
         Handle::global().set_activation_policy_accessory();

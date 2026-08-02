@@ -58,7 +58,14 @@ const CardHeader = ({
   const dark = useThemeMode() !== 'light'
   const text = tonoText(dark)
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        marginBottom: 10,
+      }}
+    >
       <span
         aria-hidden
         style={{
@@ -95,12 +102,21 @@ const Row = ({
   const text = tonoText(dark)
   return (
     <div className="tono-row">
-      <span style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
+      <span
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 2,
+          minWidth: 0,
+        }}
+      >
         <span style={{ fontSize: 13, fontWeight: 500, color: text.primary }}>
           {label}
         </span>
         {subtitle && (
-          <span style={{ fontSize: 11, color: text.secondary }}>{subtitle}</span>
+          <span style={{ fontSize: 11, color: text.secondary }}>
+            {subtitle}
+          </span>
         )}
       </span>
       {children}
@@ -195,7 +211,9 @@ const GeneralCard = () => {
             padding: '6px 8px',
             borderRadius: 8,
             color: text.primary,
-            background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.7)',
+            background: dark
+              ? 'rgba(255,255,255,0.08)'
+              : 'rgba(255,255,255,0.7)',
             border: `1px solid ${dark ? 'rgba(255,255,255,0.16)' : 'rgba(20,22,30,0.12)'}`,
           }}
         >
@@ -272,7 +290,11 @@ const ProxyEngineCard = () => {
         label={t('tono.settings.proxyEngine.tun')}
         subtitle={t('tono.settings.proxyEngine.tunSubtitle')}
       >
-        <TonoToggle checked disabled label={t('tono.settings.proxyEngine.tun')} />
+        <TonoToggle
+          checked
+          disabled
+          label={t('tono.settings.proxyEngine.tun')}
+        />
       </Row>
       <Row
         label={t('tono.settings.proxyEngine.allowLan')}
@@ -292,7 +314,7 @@ const ProxyEngineCard = () => {
             color: text.secondary,
           }}
         >
-          7890
+          {t('tono.settings.proxyEngine.disabled')}
         </span>
       </Row>
     </GlassCard>
@@ -449,8 +471,8 @@ const SettingPage = () => {
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: 24,
+          gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+          gap: 18,
           alignItems: 'start',
         }}
       >

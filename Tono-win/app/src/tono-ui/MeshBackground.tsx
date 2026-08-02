@@ -2,9 +2,9 @@ import { glassOpacity, useGlassTransparency } from './theme'
 
 /**
  * The frosted-glass window background (MeshGradientBackground.swift): a soft
- * ambient gradient sheet plus a content layer that blurs and saturates it —
- * blur(40px) saturate(1.8) — under a near-opaque wash whose alpha follows
- * the Appearance slider (default 83%). It never reacts to connection state.
+ * ambient gradient sheet under a near-opaque wash whose alpha follows the
+ * Appearance slider. The gradients are already soft, so the previous full-window
+ * 40px backdrop blur only forced continuous WebView2 GPU composition.
  */
 
 const LIGHT_MESH = [
@@ -40,11 +40,10 @@ export const MeshBackground = ({ dark }: { dark: boolean }) => {
         }}
       />
       <div
+        className="tono-mesh-wash"
         style={{
           position: 'absolute',
           inset: 0,
-          backdropFilter: 'blur(40px) saturate(1.8)',
-          WebkitBackdropFilter: 'blur(40px) saturate(1.8)',
           background: dark
             ? `rgba(9, 11, 18, ${opacity})`
             : `rgba(243, 245, 250, ${opacity})`,

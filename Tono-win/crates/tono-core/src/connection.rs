@@ -1,10 +1,9 @@
 //! Connect state machine (product-contract.md §6/§7).
 //!
 //! Pure logic only: stages, UI state derivation, reconnect backoff, and the
-//! failure decision table. The fail-closed invariant is that the kill
-//! switch, once armed, is released only by explicit Disconnect, Sign Out, or
-//! Quit — never by crashes, sleep, network changes, catalog problems, or
-//! API outages.
+//! failure decision table. An initial, not-yet-verified attempt is released
+//! on failure; after a tunnel has been fully verified the logical session
+//! remains fail-closed until explicit Disconnect, Sign Out, or Quit.
 
 use std::time::Duration;
 
@@ -132,9 +131,9 @@ pub enum FailureAction {
     FullRelease,
 }
 
-/// The single decision rule of §6: anything after arm keeps blocking.
-pub fn on_connect_failure(kill_switch_armed: bool) -> FailureAction {
-    if kill_switch_armed {
+/// Initial attempts release on failure; only a verified armed session reconnects fail-closed.
+pub fn on_connect_failure(kill_switch_armed: bool, session_verified: bool) -> FailureAction {
+    if kill_switch_armed && session_verified {
         FailureAction::KeepBlockingAndReconnect
     } else {
         FailureAction::FullRelease
@@ -178,7 +177,7 @@ impl std::fmt::Display for ConnectTransitionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectTransitionError::InvalidSuccessPrecondition => f.write_str(
-                "connect can only succeed while connecting with an armed kill switch",
+                "connect can only succeed while connecting with a verified armed kill switch",
             ),
         }
     }
@@ -193,6 +192,7 @@ impl std::error::Error for ConnectTransitionError {}
 pub struct ConnectionFsm {
     status: ConnectionStatus,
     kill_switch_armed: bool,
+    session_verified: bool,
     backoff: ReconnectBackoff,
 }
 
@@ -207,6 +207,15 @@ impl ConnectionFsm {
 
     pub fn kill_switch_armed(&self) -> bool {
         self.kill_switch_armed
+    }
+
+    pub fn session_verified(&self) -> bool {
+        self.session_verified
+    }
+
+    /// Record (or restore) that this logical protection session completed all checks.
+    pub fn mark_session_verified(&mut self) {
+        self.session_verified = true;
     }
 
     /// Step 1: begin a connect transaction.
@@ -232,11 +241,11 @@ impl ConnectionFsm {
         self.status.is_protection_blocked = true;
     }
 
-    /// Step 10: all checks passed. Hard precondition, enforced in release
-    /// too (M2): a transaction must be in flight and the kill switch
-    /// armed — an unarmed `Connected` must never exist.
+    /// Step 10: all checks passed. A transaction must be in flight, the kill
+    /// switch armed, and the Service verification commit durable — an
+    /// unverified or unarmed `Connected` must never exist.
     pub fn connect_succeeded(&mut self) -> Result<(), ConnectTransitionError> {
-        if !self.status.is_connecting || !self.kill_switch_armed {
+        if !self.status.is_connecting || !self.kill_switch_armed || !self.session_verified {
             return Err(ConnectTransitionError::InvalidSuccessPrecondition);
         }
         self.status.is_connected = true;
@@ -248,10 +257,10 @@ impl ConnectionFsm {
         Ok(())
     }
 
-    /// Connect transaction failed. The decision table (§6): armed → keep
-    /// blocking + Protected Offline + backoff; pre-arm → full release.
+    /// Connect transaction failed. A verified armed session stays blocked
+    /// and reconnects; an initial attempt receives a full release.
     pub fn connect_failed(&mut self) -> FailureAction {
-        match on_connect_failure(self.kill_switch_armed) {
+        match on_connect_failure(self.kill_switch_armed, self.session_verified) {
             FailureAction::KeepBlockingAndReconnect => {
                 self.status.is_connected = false;
                 self.status.is_connecting = false;
@@ -267,16 +276,35 @@ impl ConnectionFsm {
         }
     }
 
+    /// A required initial full release failed. Keep the real armed state visible and do not
+    /// claim either network restoration or a reconnectable established session.
+    pub fn initial_release_failed(&mut self) {
+        self.status.is_connected = false;
+        self.status.is_connecting = false;
+        self.status.is_disconnecting = false;
+        self.status.is_protection_blocked = self.kill_switch_armed;
+        self.status.stage = None;
+    }
+
     /// Mihomo crash or TUN disappearance at runtime: identical to a
     /// connect failure after arm (§6) — keep blocking, reconnect behind
     /// the barrier.
     pub fn tunnel_died(&mut self) -> FailureAction {
-        debug_assert!(self.kill_switch_armed, "a live tunnel implies an armed kill switch");
+        debug_assert!(
+            self.kill_switch_armed,
+            "a live tunnel implies an armed kill switch"
+        );
+        debug_assert!(
+            self.session_verified,
+            "a live tunnel implies a verified session"
+        );
         self.status.is_connected = false;
         self.status.is_connecting = false;
         self.status.stage = None;
         self.status.is_protection_blocked = self.kill_switch_armed;
-        on_connect_failure(self.kill_switch_armed)
+        // Runtime tunnel loss is always fail-closed. Preserve (rather than manufacture) the
+        // logical verification latch across the reconnect attempt.
+        FailureAction::KeepBlockingAndReconnect
     }
 
     /// Delay before the next protected reconnect attempt. Handed out only
@@ -284,6 +312,7 @@ impl ConnectionFsm {
     /// disconnecting, or mid-transaction (M1).
     pub fn next_reconnect_delay(&mut self) -> Option<Duration> {
         if self.status.is_protection_blocked
+            && self.session_verified
             && !self.status.is_connected
             && !self.status.is_disconnecting
             && !self.status.is_connecting
@@ -320,6 +349,7 @@ impl ConnectionFsm {
 
     fn release(&mut self) {
         self.kill_switch_armed = false;
+        self.session_verified = false;
         self.backoff.reset();
         self.status = ConnectionStatus::default();
     }
@@ -388,9 +418,10 @@ mod tests {
 
     #[test]
     fn failure_decision_table() {
-        assert_eq!(on_connect_failure(false), FailureAction::FullRelease);
+        assert_eq!(on_connect_failure(false, false), FailureAction::FullRelease);
+        assert_eq!(on_connect_failure(true, false), FailureAction::FullRelease);
         assert_eq!(
-            on_connect_failure(true),
+            on_connect_failure(true, true),
             FailureAction::KeepBlockingAndReconnect
         );
     }
@@ -424,6 +455,7 @@ mod tests {
             }
         }
         assert!(fsm.kill_switch_armed());
+        fsm.mark_session_verified();
         fsm.connect_succeeded().unwrap();
         assert_eq!(fsm.status().ui_state(), UiState::Connected);
         assert!(fsm.kill_switch_armed(), "kill switch stays armed while connected");
@@ -447,11 +479,12 @@ mod tests {
     }
 
     #[test]
-    fn failure_after_arm_keeps_blocking_and_backs_off() {
+    fn failure_after_verified_session_keeps_blocking_and_backs_off() {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.advance_stage(ConnectStage::StartingKillSwitch);
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.advance_stage(ConnectStage::StartingTunnel);
         assert_eq!(
             fsm.connect_failed(),
@@ -469,6 +502,7 @@ mod tests {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_succeeded().unwrap();
         assert_eq!(
             fsm.tunnel_died(),
@@ -484,6 +518,7 @@ mod tests {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_failed();
         assert_eq!(fsm.next_reconnect_delay(), Some(Duration::from_secs(2)));
         // The protected reconnect run succeeds.
@@ -500,6 +535,7 @@ mod tests {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_failed();
         assert_eq!(fsm.status().ui_state(), UiState::ProtectedOffline);
         fsm.begin_disconnect();
@@ -513,6 +549,7 @@ mod tests {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_succeeded().unwrap();
         fsm.begin_disconnect();
         fsm.finish_disconnect();
@@ -531,6 +568,7 @@ mod tests {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_succeeded().unwrap();
         fsm.sign_out_or_quit();
         assert_eq!(fsm.status().ui_state(), UiState::NotConnected);
@@ -545,6 +583,7 @@ mod tests {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_failed();
         assert_eq!(fsm.status().ui_state(), UiState::ProtectedOffline);
         assert!(fsm.next_reconnect_delay().is_some());
@@ -560,6 +599,7 @@ mod tests {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
         fsm.mark_kill_switch_armed();
+        fsm.mark_session_verified();
         fsm.connect_failed();
         assert!(fsm.next_reconnect_delay().is_some());
         fsm.begin_connect();
@@ -570,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_succeeded_requires_armed_connect_transaction() {
+    fn connect_succeeded_requires_verified_armed_connect_transaction() {
         // M2: fresh machine — no transaction, no arm. Success must be
         // refused, never producing an unarmed Connected state.
         let mut fsm = ConnectionFsm::new();
@@ -590,6 +630,14 @@ mod tests {
         // Connecting but not yet armed (pre-WFP failure path) likewise.
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
+        assert_eq!(
+            fsm.connect_succeeded(),
+            Err(ConnectTransitionError::InvalidSuccessPrecondition)
+        );
+        assert!(!fsm.status().is_connected);
+        // Connecting and armed is still insufficient until the durable
+        // verification commit succeeds.
+        fsm.mark_kill_switch_armed();
         assert_eq!(
             fsm.connect_succeeded(),
             Err(ConnectTransitionError::InvalidSuccessPrecondition)

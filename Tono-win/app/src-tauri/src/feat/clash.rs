@@ -28,7 +28,16 @@ pub async fn restart_app() {
     handle::Handle::global().set_is_exiting();
 
     // Tono: restart releases the kill switch like quit does (§6, P0-8).
-    crate::tono::commands::quit_release(handle::Handle::app_handle().clone()).await;
+    if let Err(error) = crate::tono::commands::quit_release(handle::Handle::app_handle().clone()).await {
+        logging!(
+            error,
+            Type::Service,
+            "Tono: 无法证明重启前已恢复网络保护，取消重启: {error}"
+        );
+        handle::Handle::global().clear_is_exiting();
+        handle::Handle::notice_message("app_restart::core_stop_failed", "");
+        return;
+    }
 
     Config::apply_all_and_save_file().await;
 

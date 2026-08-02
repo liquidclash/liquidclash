@@ -13,6 +13,8 @@ pub enum IpcCommand {
     GetKillSwitchStatus,
     #[strum(serialize = "/kill-switch/lock")]
     LockKillSwitch,
+    #[strum(serialize = "/kill-switch/mark-verified")]
+    MarkKillSwitchVerified,
     #[strum(serialize = "/kill-switch/restrict-bootstrap")]
     RestrictKillSwitchBootstrap,
     #[strum(serialize = "/kill-switch/release")]

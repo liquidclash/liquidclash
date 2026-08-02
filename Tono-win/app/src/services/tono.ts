@@ -91,6 +91,38 @@ const toError = (error: unknown): Error => {
   }
 }
 
+/** Stable Rust prefixes → i18n keys for Connect/Disconnect action errors. */
+const STABLE_ERROR_KEYS: Array<{ prefix: string; key: string }> = [
+  { prefix: 'TONO_SERVICE_BUSY', key: 'tono.dashboard.errors.serviceBusy' },
+  {
+    prefix: 'TONO_RELEASE_RECONCILING',
+    key: 'tono.dashboard.errors.releaseReconciling',
+  },
+  { prefix: 'TONO_SERVICE_TOO_OLD', key: 'tono.dashboard.errors.serviceTooOld' },
+]
+
+/**
+ * Map backend error strings (including stable `TONO_*` prefixes) to a UI message.
+ * Pass `t` from `useTranslation` when available; falls back to the raw string.
+ */
+export const formatTonoActionError = (
+  error: unknown,
+  t?: (key: string) => string,
+): string => {
+  const raw =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : String(error)
+  for (const { prefix, key } of STABLE_ERROR_KEYS) {
+    if (raw.startsWith(prefix) || raw.includes(`${prefix}:`)) {
+      return t ? t(key) : raw
+    }
+  }
+  return raw
+}
+
 const call = <T>(command: string, args?: Record<string, unknown>): Promise<T> =>
   invoke<T>(command, args).catch((error: unknown) => {
     throw toError(error)
@@ -116,6 +148,9 @@ export const tonoServers = () => call<TonoServer[]>('tono_servers')
 export const tonoSelectServer = (name: string) =>
   call<void>('tono_select_server', { name })
 
+export const tonoTestCurrentServer = () =>
+  call<number>('tono_test_current_server')
+
 export const tonoConnect = () => call<void>('tono_connect')
 
 export const tonoDisconnect = () => call<void>('tono_disconnect')
@@ -134,9 +169,14 @@ export interface TonoAuditLogInfo {
   droppedCount: number
 }
 
-export const tonoAuditLogPath = () => call<TonoAuditLogInfo>('tono_audit_log_path')
+export const tonoAuditLogPath = () =>
+  call<TonoAuditLogInfo>('tono_audit_log_path')
 
-export type TonoConnectStepState = 'pending' | 'current' | 'completed' | 'failed'
+export type TonoConnectStepState =
+  | 'pending'
+  | 'current'
+  | 'completed'
+  | 'failed'
 
 export interface TonoConnectStep {
   key: string
@@ -187,7 +227,10 @@ const ensureSharedListener = () => {
       subscribedCallbacks.clear()
     })
     .catch((error) => {
-      console.error(`[tono] failed to subscribe to ${TONO_STATUS_EVENT}:`, error)
+      console.error(
+        `[tono] failed to subscribe to ${TONO_STATUS_EVENT}:`,
+        error,
+      )
     })
     .finally(() => {
       sharedRegistration = null

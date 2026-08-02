@@ -85,6 +85,7 @@ async fn sync_once_inner(state: &Arc<TonoState>, app: &AppHandle, auth_generatio
                     revision: response.revision,
                     domains: policy.domains.len(),
                     media: policy.media_endpoints.len(),
+                    web_domains: policy.web_domains.len(),
                 });
                 changed && (inner.fsm.status().is_connected || inner.fsm.status().is_connecting)
             }
