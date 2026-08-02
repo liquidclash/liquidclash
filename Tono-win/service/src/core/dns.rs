@@ -515,15 +515,23 @@ pub(crate) async fn ensure_restored() -> Result<()> {
 }
 
 pub(crate) async fn status() -> DnsProtectionStatus {
-    DNS_STATUS_CACHE.lock().unwrap().clone()
+    // Status is the recovery/diagnosis path: do not turn a past panic into permanent silence.
+    DNS_STATUS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 fn publish_status(status: &DnsProtectionStatus) {
-    *DNS_STATUS_CACHE.lock().unwrap() = status.clone();
+    *DNS_STATUS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = status.clone();
 }
 
 fn publish_status_error(error: &anyhow::Error) {
-    let mut status = DNS_STATUS_CACHE.lock().unwrap();
+    let mut status = DNS_STATUS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     status.last_error = Some(format!("{error:#}"));
 }
 

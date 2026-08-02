@@ -88,7 +88,30 @@ const VERIFY_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1
 const API_HOST_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn note_verify(ok: bool) {
-    *LAST_VERIFY.lock().unwrap() = Some((std::time::Instant::now(), ok));
+    *LAST_VERIFY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((std::time::Instant::now(), ok));
+}
+
+/// Status and diagnostics must never turn a past panic into a permanent Service freeze.
+/// Recover the guard contents after poison so `/kill-switch/status` and startup restore keep
+/// answering while the next mutation re-serializes through `WFP_OPERATION`.
+fn armed_guard() -> std::sync::MutexGuard<'static, Option<Armed>> {
+    ARMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn last_error_guard() -> std::sync::MutexGuard<'static, Option<String>> {
+    LAST_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn last_verify_guard() -> std::sync::MutexGuard<'static, Option<(std::time::Instant, bool)>> {
+    LAST_VERIFY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn intent_path() -> PathBuf {
@@ -869,7 +892,7 @@ pub(crate) async fn status() -> KillSwitchStatus {
     // Never join the WFP writer queue. The watchdog refreshes `LAST_VERIFY`; mutations publish
     // `ARMED` only at their commit boundary, so a concurrent read gets the previous committed
     // state rather than blocking behind an RPC that may itself be the thing under diagnosis.
-    let armed = { ARMED.lock().unwrap().clone() };
+    let armed = { armed_guard().clone() };
     let Some(armed) = armed else {
         return KillSwitchStatus {
             wanted: false,
@@ -877,13 +900,11 @@ pub(crate) async fn status() -> KillSwitchStatus {
             live: false,
             mode: KillSwitchStatusMode::Blocked,
             endpoints: Vec::new(),
-            last_error: LAST_ERROR.lock().unwrap().clone(),
+            last_error: last_error_guard().clone(),
         };
     };
     let live = if ENGINE_LIVE {
-        LAST_VERIFY
-            .lock()
-            .unwrap()
+        last_verify_guard()
             .as_ref()
             .is_some_and(|(at, ok)| *ok && at.elapsed() < VERIFY_CACHE_TTL)
     } else {
@@ -896,7 +917,7 @@ pub(crate) async fn status() -> KillSwitchStatus {
         live,
         mode: armed.intent.mode,
         endpoints: armed.intent.endpoints.clone(),
-        last_error: LAST_ERROR.lock().unwrap().clone(),
+        last_error: last_error_guard().clone(),
     }
 }
 
