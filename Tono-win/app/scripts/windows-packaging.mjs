@@ -73,6 +73,34 @@ export function validateResourcesWhitelist(resources) {
  * @param {{ name: string, base?: string }[]} entries
  * @returns {string | null}
  */
+/**
+ * Parse a 7-Zip bare listing (`7zz l -ba`) into payload entries.
+ *
+ * Real 7zz output for a Tauri NSIS installer leaves the date/time columns
+ * blank for entries without stored timestamps and the compressed column
+ * blank for members of the solid block — a parser that requires all six
+ * columns reports an empty payload and fails the gate against a perfectly
+ * good installer. Directories (attr `D…` or trailing `/`) are skipped.
+ *
+ * @param {string} listing raw stdout of `7zz l -ba <installer>`
+ * @returns {{ name: string, base: string, size: number }[]}
+ */
+export function parseNsisListing(listing) {
+  const entries = []
+  for (const line of String(listing).split(/\r?\n/)) {
+    const match = line.match(
+      /^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|\s{19})\s+(\S+)\s+(\d+)(?:\s+(\d+))?\s+(.+)$/,
+    )
+    if (!match) continue
+    const [, attr, size, , rawName] = match
+    if (attr.toUpperCase().includes('D')) continue
+    const name = rawName.trim().replaceAll('\\', '/')
+    if (!name || name.endsWith('/')) continue
+    entries.push({ name, base: name.split('/').pop() || name, size: Number(size) })
+  }
+  return entries
+}
+
 export function validatePayloadEntries(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
     return 'payload listing is empty'

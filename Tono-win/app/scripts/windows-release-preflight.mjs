@@ -10,6 +10,7 @@ import {
   STABLE_EXTERNAL_BIN,
   WINDOWS_RESOURCE_ALLOWLIST,
   WINDOWS_RESOURCE_BUNDLE_ENTRIES,
+  parseNsisListing,
   validateExternalBin,
   validatePayloadEntries,
   validateResourcesWhitelist,
@@ -138,18 +139,10 @@ export const listNsisEntries = (sevenZip, installer) => {
     )
   }
 
-  const entries = []
-  for (const line of listing.split(/\r?\n/)) {
-    // 7-Zip bare listing: date time attr size compressed name
-    const match = line.match(
-      /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+(\d+)\s+(\d+)\s+(.+)$/,
-    )
-    if (!match) continue
-    const size = Number(match[1])
-    const name = match[3].trim().replaceAll('\\', '/')
-    if (!name || name.endsWith('/')) continue
-    entries.push({ name, base: path.posix.basename(name), size })
-  }
+  // Parsing lives in windows-packaging.mjs (parseNsisListing) so the unit
+  // tests cover the real 7zz column variants (blank date/time, blank
+  // compressed size) that the old inline regex rejected wholesale.
+  const entries = parseNsisListing(listing)
   if (!entries.length) {
     fail(
       '7-Zip returned no file entries from the installer; install 7-Zip or inspect the package manually',
