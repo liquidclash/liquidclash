@@ -607,9 +607,18 @@ FunctionEnd
     ; Preserve the recovery files but return control instead of hanging forever if cleanup stalls.
     nsExec::ExecToLog /TIMEOUT=180000 '"$INSTDIR\resources\tono-service-uninstall.exe"'
     Pop $0
-    ; nsExec may return "error" or "timeout" as well as a numeric string.
-    ${If} $0 != "0"
-      Abort "Tono Service cleanup failed (exit $0). Tono recovery files were preserved; reinstall or retry from an Administrator PowerShell."
+    ; The helper's exit-code contract (uninstall_service.rs `cleanup_exit_code`):
+    ;   0 = the machine is clean (or was already clean)
+    ;   2 = the network was provably restored; only cosmetic cleanup (SCM record/binary) failed
+    ;   3 = cleanup could not prove the network was restored; protection is still armed
+    ; nsExec may also return "error"/"timeout" or another numeric string. Only a proven-safe
+    ; result may let the uninstall continue: anything that is not 0 or 2 is treated exactly
+    ; like 3, because nothing showed the machine was made safe. This keeps the recovery files
+    ; preserved on every blocking path while no longer dead-ending on cosmetic debris.
+    ${If} $0 == "2"
+      DetailPrint "${PRODUCTNAME} network protection was restored; some Service leftovers could not be removed and will be cleaned up by a future install."
+    ${ElseIf} $0 != "0"
+      Abort "Tono could not verify that your network was fully restored (result $0), so nothing was deleted and your connection is still protected by the kill switch. Please reboot Windows and run this uninstaller again; installing Tono again first also repairs the Service."
     ${EndIf}
   ${EndIf}
 !macroend

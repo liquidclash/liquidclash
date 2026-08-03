@@ -9,10 +9,43 @@ use anyhow::Error;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use shared::run_command;
 #[cfg(windows)]
-use shared::stop_windows_service;
+use shared::{read_service_pid_file, stop_windows_service, terminate_process_by_pid};
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
+
+/// How Windows cleanup ended. `main` maps this onto the exit-code contract with the NSIS
+/// uninstall macro, which must only block when the machine cannot be proven safe; the mapping
+/// is a pure, tested function rather than an implicit process exit.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+enum CleanupOutcome {
+    /// Nothing is armed and nothing of the service remains (or nothing existed to begin with).
+    Clean,
+    /// The disarm was proven, but a cosmetic step (SCM record or binary removal) failed.
+    /// Removing further files is safe; the leftovers neither protect nor block anything.
+    CosmeticFailure(Error),
+    /// Cleanup could not prove the network was restored. The kill switch stays armed and every
+    /// recovery file was preserved; only this outcome may block an uninstall.
+    StillProtected(Error),
+}
+
+/// Exit-code contract with `installer.nsi` (`RemoveVergeService`): 0 continues, 2 continues
+/// with a warning, 3 — like every other non-zero result, including nsExec's "error"/"timeout"
+/// strings — blocks the uninstall because the machine is still protected.
+#[cfg(any(windows, test))]
+const EXIT_COSMETIC_FAILURE: i32 = 2;
+#[cfg(any(windows, test))]
+const EXIT_STILL_PROTECTED: i32 = 3;
+
+#[cfg(any(windows, test))]
+fn cleanup_exit_code(outcome: &CleanupOutcome) -> i32 {
+    match outcome {
+        CleanupOutcome::Clean => 0,
+        CleanupOutcome::CosmeticFailure(_) => EXIT_COSMETIC_FAILURE,
+        CleanupOutcome::StillProtected(_) => EXIT_STILL_PROTECTED,
+    }
+}
 
 #[cfg(any(windows, test))]
 fn poll_until<T>(
@@ -158,6 +191,40 @@ fn main() -> Result<(), Error> {
 /// stop and uninstall the service
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
+    if run_maintenance_if_requested()? {
+        return Ok(());
+    }
+    let _gate = enter_repair_gate()?;
+
+    // The repair gate is an OS file lock, so `std::process::exit` releasing it via handle
+    // close (not Drop) is safe here.
+    let outcome = windows_cleanup();
+    let code = cleanup_exit_code(&outcome);
+    match outcome {
+        CleanupOutcome::Clean => {
+            println!("Service and protected network state were removed successfully.");
+            Ok(())
+        }
+        CleanupOutcome::CosmeticFailure(error) => {
+            eprintln!(
+                "Protected network state was restored, but service debris remains and will be \
+                 cleaned up by a future install: {error:#}"
+            );
+            std::process::exit(code);
+        }
+        CleanupOutcome::StillProtected(error) => {
+            eprintln!(
+                "Cleanup could not prove the network was restored; the kill switch stays armed \
+                 and all recovery files were preserved: {error:#}"
+            );
+            std::process::exit(code);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_cleanup() -> CleanupOutcome {
+    use anyhow::Context as _;
     use platform_lib::{
         Error as WindowsServiceError,
         service::ServiceAccess,
@@ -173,44 +240,89 @@ fn main() -> anyhow::Result<()> {
         matches!(error, WindowsServiceError::Winapi(error) if error.raw_os_error() == Some(code))
     }
 
-    if run_maintenance_if_requested()? {
-        return Ok(());
-    }
-    let _gate = enter_repair_gate()?;
+    // Everything up to the proven disarm is fail-closed: any error keeps the kill switch armed.
     let manager_access = ServiceManagerAccess::CONNECT;
-    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
+    let service_manager = match ServiceManager::local_computer(None::<&str>, manager_access) {
+        Ok(manager) => manager,
+        Err(error) => return CleanupOutcome::StillProtected(error.into()),
+    };
 
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    // CHANGE_CONFIG lets the stop escalation suppress the SCM crash-restart actions before
+    // terminating a wedged daemon (see `force_stop_windows_service`).
+    let service_access = ServiceAccess::QUERY_STATUS
+        | ServiceAccess::STOP
+        | ServiceAccess::DELETE
+        | ServiceAccess::CHANGE_CONFIG;
     let service = match service_manager.open_service(
         clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
         service_access,
     ) {
         Ok(service) => Some(service),
         Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => None,
-        Err(error) => return Err(error.into()),
+        Err(error) => return CleanupOutcome::StillProtected(error.into()),
     };
 
-    if let Some(service) = service.as_ref() {
-        stop_windows_service(service)?;
+    // No service, no kill-switch intent, no DNS snapshot, no live daemon: the machine is
+    // already clean. Report success instead of failing a repeated uninstall over disarm
+    // plumbing that has nothing left to operate on.
+    if service.is_none() && !windows_recovery_state_present() {
+        println!("No service, kill-switch intent, or DNS snapshot present; nothing to clean up.");
+        return match remove_windows_service_binary() {
+            Ok(()) => CleanupOutcome::Clean,
+            Err(error) => CleanupOutcome::CosmeticFailure(error),
+        };
+    }
+
+    if let Some(service) = service.as_ref()
+        && let Err(error) = stop_windows_service(service)
+    {
+        return CleanupOutcome::StillProtected(error);
     }
 
     // The helper links the same recovery library as the service binary, so cleanup does not
     // depend on an intact installed `tono-service.exe` and cannot pipe-wait on a child process.
     // The owner lock proves no standalone daemon/core still owns the WFP and DNS state.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let Some(_owner_guard) = clash_verge_service_ipc::acquire_service_owner().await? else {
-            anyhow::bail!("service daemon is still running; refusing to open the kill switch");
-        };
-        clash_verge_service_ipc::emergency_disarm_windows_kill_switch().await
-    })?;
+    let disarm = (|| -> Result<(), Error> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let owner_guard = match clash_verge_service_ipc::acquire_service_owner().await? {
+                Some(guard) => Some(guard),
+                // A daemon that still answers on the pipe even though the SCM record is gone or
+                // stopped (a standalone or orphaned build) would race the disarm. Terminate it
+                // by the pid it recorded, then take the lock over.
+                None => {
+                    let pid = read_service_pid_file().context(
+                        "a running daemon holds the owner lock but left no pid file; \
+                         refusing to open the kill switch",
+                    )?;
+                    println!(
+                        "Owner lock is held by live daemon {pid}; terminating it before disarm."
+                    );
+                    terminate_process_by_pid(pid)?;
+                    clash_verge_service_ipc::acquire_service_owner().await?
+                }
+            };
+            let Some(_owner_guard) = owner_guard else {
+                anyhow::bail!("service daemon is still running; refusing to open the kill switch");
+            };
+            clash_verge_service_ipc::emergency_disarm_windows_kill_switch().await
+        })
+    })();
+    if let Err(error) = disarm {
+        return CleanupOutcome::StillProtected(error);
+    }
+    println!("Kill switch was disarmed and protected DNS restore was verified.");
 
+    // Only cosmetic state remains. A failure below must not block the uninstall: the network
+    // is provably restored, and nothing left behind protects or blocks anything.
     if let Some(service) = service {
-        service.delete()?;
+        if let Err(error) = service.delete() {
+            return CleanupOutcome::CosmeticFailure(error.into());
+        }
         drop(service);
-        poll_until(
+        if let Err(error) = poll_until(
             POLL_ATTEMPTS,
             || match service_manager.open_service(
                 clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
@@ -225,23 +337,76 @@ fn main() -> anyhow::Result<()> {
             },
             || thread::sleep(POLL_INTERVAL),
             "timed out waiting for service deletion",
-        )?;
+        ) {
+            return CleanupOutcome::CosmeticFailure(error);
+        }
     }
-    let target =
-        clash_verge_service_ipc::prepare_service_install_directory()?.join("tono-service.exe");
+    match remove_windows_service_binary() {
+        Ok(()) => CleanupOutcome::Clean,
+        Err(error) => CleanupOutcome::CosmeticFailure(error),
+    }
+}
+
+/// Whether any fail-closed recovery state may still exist. File names must match the library
+/// (`windows_kill_switch::intent_path`, `dns::snapshot_path`, `owner.rs`): the intent record
+/// and the DNS snapshot are the artifacts service-start recovery acts on, and a pid file means
+/// a daemon may be alive that could still be arming them.
+#[cfg(windows)]
+fn windows_recovery_state_present() -> bool {
+    let paths = clash_verge_service_ipc::service_paths();
+    let state = paths.persistent_state_dir();
+    state.join("kill-switch.json").exists()
+        || state.join("protected-dns.json").exists()
+        || paths.pid_file_path().exists()
+}
+
+/// Best-effort binary removal; runs only after the disarm was proven (or nothing was armed),
+/// so a failure is cosmetic. Uses the plain paths accessor: an uninstall must not recreate or
+/// re-ACL the install directory just to look inside it.
+#[cfg(windows)]
+fn remove_windows_service_binary() -> Result<(), Error> {
+    let target = clash_verge_service_ipc::service_paths()
+        .install_dir()
+        .join("tono-service.exe");
     if target.exists() {
         std::fs::remove_file(&target).map_err(|error| {
             anyhow::anyhow!("Failed to remove service binary {target:?}: {error}")
         })?;
     }
-    println!("Service and protected network state were removed successfully.");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::poll_until;
+    use super::{
+        CleanupOutcome, EXIT_COSMETIC_FAILURE, EXIT_STILL_PROTECTED, cleanup_exit_code, poll_until,
+    };
     use std::cell::Cell;
+
+    #[test]
+    fn clean_outcome_exits_zero() {
+        assert_eq!(cleanup_exit_code(&CleanupOutcome::Clean), 0);
+    }
+
+    #[test]
+    fn cosmetic_failure_is_distinct_and_never_reads_as_blocking() {
+        let code =
+            cleanup_exit_code(&CleanupOutcome::CosmeticFailure(anyhow::anyhow!("leftover")));
+        assert_eq!(code, EXIT_COSMETIC_FAILURE);
+        assert_ne!(code, 0);
+        assert_ne!(code, EXIT_STILL_PROTECTED);
+        // A generic `fn main` anyhow failure exits 1; the continue-anyway code must never
+        // collide with it, or an unproven cleanup could pass as cosmetic.
+        assert_ne!(code, 1);
+    }
+
+    #[test]
+    fn still_protected_maps_to_the_blocking_exit_code() {
+        let code = cleanup_exit_code(&CleanupOutcome::StillProtected(anyhow::anyhow!("armed")));
+        assert_eq!(code, EXIT_STILL_PROTECTED);
+        assert_ne!(code, 0);
+        assert_ne!(code, 1);
+    }
 
     #[test]
     fn poll_until_retries_transient_state_before_success() -> anyhow::Result<()> {
