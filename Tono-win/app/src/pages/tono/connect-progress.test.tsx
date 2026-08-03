@@ -37,7 +37,10 @@ const {
   noticeError: vi.fn(),
 }))
 
-vi.mock('@/services/tono', () => ({
+vi.mock('@/services/tono', async (importOriginal) => ({
+  // Pure helpers (formatTonoActionError and friends) stay real so the card
+  // renders exactly as in production; only the IPC surface is stubbed.
+  ...(await importOriginal<typeof import('@/services/tono')>()),
   tonoConnectProgress: tonoConnectProgressMock,
   tonoRetryNow: tonoRetryNowMock,
   tonoDisconnect: tonoDisconnectMock,
