@@ -135,6 +135,14 @@ pub fn list_network_interfaces() -> Vec<String> {
     networks.keys().map(|name| name.to_owned()).collect()
 }
 
+/// The long OS version string ("Windows 11 Pro 23H2"), for callers that need
+/// it without going through the plugin's `Platform` state — the diagnostics
+/// report is assembled off the Tauri main thread and cannot borrow it.
+#[inline]
+pub fn os_long_version() -> String {
+    System::long_os_version().unwrap_or_else(|| "Unknown".into())
+}
+
 #[inline]
 pub fn set_app_core_mode<R: Runtime>(app: &tauri::AppHandle<R>, mode: impl Into<String>) {
     let platform_spec = app.state::<RwLock<Platform>>();

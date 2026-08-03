@@ -35,6 +35,9 @@ pub mod endpoints {
     pub const DEVICES: &str = "devices";
     pub const EXIT_CATALOG: &str = "exit-catalog";
     pub const TRAFFIC_POLICY: &str = "traffic-policy";
+    /// User-initiated diagnostics upload (never automatic; see
+    /// [`super::DiagnosticsReport`]).
+    pub const DIAGNOSTICS_REPORTS: &str = "diagnostics/reports";
     pub fn device(id: &str) -> String {
         format!("devices/{id}")
     }
@@ -97,6 +100,11 @@ pub enum ApiError {
     NotFound,
     #[error("this Tono account has reached its device allowance; revoke another device first")]
     DeviceLimit,
+    /// HTTP 429. Distinct from the generic `Server` bucket so a caller can
+    /// say "wait and try again" instead of "something broke" — the
+    /// diagnostics upload is the first endpoint the server rate-limits.
+    #[error("too many requests; please wait and try again")]
+    RateLimited,
     #[error("server error {status}: {message}")]
     Server { status: u16, message: String },
     #[error("Tono returned an invalid response")]
@@ -300,6 +308,120 @@ pub struct AuthMethodsResponse {
     pub google: AuthMethod,
 }
 
+// ---- Diagnostics upload (user-initiated only) ----
+//
+// THE ONE PLACE the diagnostics wire contract is spelled. If the server's
+// intake disagrees, change it *here* — nothing else declares these names.
+//
+// `POST /api/v1/diagnostics/reports`, Bearer-authorized (the report is tied
+// to the signed-in account; that is stated in the UI before the upload).
+//
+// Request body:
+//
+// ```json
+// {"report": {
+//   "schemaVersion": 1,                       // number
+//   "reportedAtMs": 1712345678901,            // number, epoch ms, client clock
+//   "appVersion": "0.0.3",                    // string
+//   "osVersion": "Windows 11 Pro 23H2",       // string
+//   "osArch": "x86_64",                       // string
+//   "serviceProtocol": "1.14",                // string "epoch.revision" | null
+//   "serviceBuild": "2.6.2",                  // string | null
+//   "uiState": "protectedOffline",            // string
+//   "accountState": "ready",                  // string
+//   "selectedServer": "US West 1",            // string (catalog display name) | null
+//   "catalogRevision": 12,                    // number | null
+//   "killSwitchMode": "blocked",              // string | null
+//   "killSwitchWanted": true,                 // bool | null
+//   "killSwitchLive": false,                  // bool | null
+//   "killSwitchLastError": "…",               // string | null (redacted)
+//   "dnsEnabled": true,                       // bool | null
+//   "dnsLastError": "…",                      // string | null (redacted)
+//   "failedStage": "securingDNS",             // string | null
+//   "error": "…",                             // string | null (redacted)
+//   "retryAttempt": 2,                        // number
+//   "totalElapsedMs": 4600,                   // number | null
+//   "steps": [                                // array
+//     {"key": "preparing", "state": "completed", "elapsedMs": 1200}
+//   ],
+//   "virtualAdapters": ["hyperV", "wsl"],     // array of fixed class strings
+//   "auditLogPath": "%USERPROFILE%\\…\\traffic-audit.jsonl",     // string
+//   "serviceLogPath": "C:\\ProgramData\\Tono\\logs\\tono-service.log" // string
+// }}
+// ```
+//
+// Response body: `{"referenceCode": "TON-4F2K-9QX1", "receivedAt": 1712345678}`
+// — `receivedAt` is optional and display-only; `referenceCode` is required
+// and non-empty (an empty one is an [`ApiError::InvalidResponse`]).
+//
+// PRIVACY: every field is enumerated below by hand. The struct is a
+// whitelist, never a projection of product state — adding a field here is
+// the only way to add a field to the upload, and the app-side builder
+// (`tono::diagnostics`) has the tests that prove it.
+
+/// One connect step as uploaded (mirrors the UI's step record minus its
+/// localized label, which the server has no use for).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsStep {
+    pub key: String,
+    /// "pending" | "current" | "completed" | "failed".
+    pub state: String,
+    pub elapsed_ms: Option<u64>,
+}
+
+/// The whitelisted diagnostics payload. See the module comment above for the
+/// exact JSON. NOTHING may be added here without also being added to the
+/// app-side allow-list test.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsReport {
+    pub schema_version: u32,
+    pub reported_at_ms: i64,
+    pub app_version: String,
+    pub os_version: String,
+    pub os_arch: String,
+    pub service_protocol: Option<String>,
+    pub service_build: Option<String>,
+    pub ui_state: String,
+    pub account_state: String,
+    pub selected_server: Option<String>,
+    pub catalog_revision: Option<i64>,
+    pub kill_switch_mode: Option<String>,
+    pub kill_switch_wanted: Option<bool>,
+    pub kill_switch_live: Option<bool>,
+    pub kill_switch_last_error: Option<String>,
+    pub dns_enabled: Option<bool>,
+    pub dns_last_error: Option<String>,
+    pub failed_stage: Option<String>,
+    pub error: Option<String>,
+    pub retry_attempt: u32,
+    pub total_elapsed_ms: Option<u64>,
+    pub steps: Vec<DiagnosticsStep>,
+    pub virtual_adapters: Vec<String>,
+    pub audit_log_path: String,
+    pub service_log_path: String,
+}
+
+/// The current [`DiagnosticsReport`] schema. Bump when a field is added or
+/// its meaning changes, so the intake can tell payload generations apart.
+pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagnosticsReportRequest<'a> {
+    report: &'a DiagnosticsReport,
+}
+
+/// The intake's answer: a short human-readable code the user reads out to
+/// support.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsReceipt {
+    pub reference_code: String,
+    #[serde(default, deserialize_with = "de_opt_epoch")]
+    pub received_at: Option<i64>,
+}
+
 /// Server error envelope `{error:{message,code}}` (§1).
 #[derive(Debug, Clone, Deserialize)]
 struct ErrorEnvelope {
@@ -458,6 +580,37 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
     pub async fn traffic_policy(&self) -> Result<crate::policy::TonoTrafficPolicyResponse, ApiError> {
         let body = self.authorized(HttpMethod::Get, endpoints::TRAFFIC_POLICY, None).await?;
         decode_json(&body)
+    }
+
+    /// `POST diagnostics/reports`: upload one user-initiated diagnostics
+    /// report and return its support reference code.
+    ///
+    /// This call exists *only* on a path the user explicitly took. There is
+    /// no automatic, scheduled, or crash-triggered caller, and adding one
+    /// would break the product's stated privacy posture.
+    ///
+    /// It rides the ordinary authorized transport on purpose: while the kill
+    /// switch has the machine blocked, the WFP bootstrap policy still permits
+    /// the pinned API IPs on TCP/443, so this upload works in exactly the
+    /// situation ("no other connectivity") that produces the reports worth
+    /// having. As a POST it inherits the Dns/Connect-only transport retry —
+    /// a timeout is never resent, so a delivered report cannot be duplicated.
+    pub async fn upload_diagnostics_report(
+        &self,
+        report: &DiagnosticsReport,
+    ) -> Result<DiagnosticsReceipt, ApiError> {
+        let body = serde_json::to_string(&DiagnosticsReportRequest { report })
+            .map_err(|_| ApiError::InvalidResponse)?;
+        let response = self
+            .authorized(HttpMethod::Post, endpoints::DIAGNOSTICS_REPORTS, Some(body))
+            .await?;
+        let receipt: DiagnosticsReceipt = decode_json(&response)?;
+        // A receipt with no code is useless to the user: they would be told
+        // to quote nothing. Treat it as a malformed response.
+        if receipt.reference_code.trim().is_empty() {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(receipt)
     }
 
     /// `DELETE devices/{uuid}`. Any device except the current one may be
@@ -645,6 +798,7 @@ fn map_status(response: ApiResponse) -> Result<Vec<u8>, ApiError> {
         403 => Err(ApiError::Forbidden),
         404 => Err(ApiError::NotFound),
         409 if code.as_deref() == Some("DEVICE_LIMIT") => Err(ApiError::DeviceLimit),
+        429 => Err(ApiError::RateLimited),
         status => Err(ApiError::Server {
             status,
             message: message.unwrap_or_else(|| format!("Tono request failed ({status}).")),
@@ -1299,6 +1453,136 @@ mod tests {
         assert_eq!(mock.count_to("auth/methods"), 2, "one transport retry");
         client.me().await.unwrap(); // 401 → refresh → replay ok
         assert_eq!(mock.count_to("auth/refresh"), 1, "one 401 replay");
+    }
+
+    // ---- diagnostics upload ----
+
+    fn sample_report() -> DiagnosticsReport {
+        DiagnosticsReport {
+            schema_version: DIAGNOSTICS_SCHEMA_VERSION,
+            reported_at_ms: 1_712_345_678_901,
+            app_version: "0.0.3".to_string(),
+            os_version: "Windows 11 Pro".to_string(),
+            os_arch: "x86_64".to_string(),
+            ui_state: "protectedOffline".to_string(),
+            account_state: "ready".to_string(),
+            retry_attempt: 2,
+            steps: vec![DiagnosticsStep {
+                key: "preparing".to_string(),
+                state: "completed".to_string(),
+                elapsed_ms: Some(1200),
+            }],
+            audit_log_path: "%USERPROFILE%/traffic-audit.jsonl".to_string(),
+            service_log_path: r"C:\ProgramData\Tono\logs\tono-service.log".to_string(),
+            ..DiagnosticsReport::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_upload_posts_the_wrapped_report_and_returns_the_code() {
+        let (client, mock, store) = test_client(|request| {
+            assert!(request.url.ends_with("api/v1/diagnostics/reports"));
+            assert_eq!(request.method, HttpMethod::Post);
+            assert_eq!(request.bearer.as_deref(), Some("access-1"));
+            let body: serde_json::Value =
+                serde_json::from_str(request.json_body.as_deref().unwrap()).unwrap();
+            // The payload is wrapped in `report` and camelCased.
+            assert_eq!(body["report"]["schemaVersion"], 1);
+            assert_eq!(body["report"]["uiState"], "protectedOffline");
+            assert_eq!(body["report"]["steps"][0]["elapsedMs"], 1200);
+            json(200, r#"{"referenceCode":"TON-4F2K-9QX1","receivedAt":1712345678}"#)
+        });
+        store.set_refresh_token("r0").unwrap();
+        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        let receipt = client.upload_diagnostics_report(&sample_report()).await.unwrap();
+        assert_eq!(receipt.reference_code, "TON-4F2K-9QX1");
+        assert_eq!(receipt.received_at, Some(1_712_345_678));
+        assert_eq!(mock.count_to("diagnostics/reports"), 1);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_upload_rejects_a_receipt_without_a_code() {
+        let (client, _mock, store) = test_client(|_| json(200, r#"{"referenceCode":"   "}"#));
+        store.set_refresh_token("r0").unwrap();
+        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        assert_eq!(
+            client.upload_diagnostics_report(&sample_report()).await.unwrap_err(),
+            ApiError::InvalidResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_uploads_map_to_their_own_error() {
+        let (client, _mock, store) = test_client(|_| {
+            json(429, r#"{"error":{"message":"slow down","code":"RATE_LIMITED"}}"#)
+        });
+        store.set_refresh_token("r0").unwrap();
+        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        assert_eq!(
+            client.upload_diagnostics_report(&sample_report()).await.unwrap_err(),
+            ApiError::RateLimited
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnostics_upload_never_retries_a_timeout() {
+        let (client, mock, store) = test_client(|_| {
+            Err(ApiError::Transport {
+                kind: TransportKind::Timeout,
+                message: "timeout".to_string(),
+            })
+        });
+        store.set_refresh_token("r0").unwrap();
+        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        assert!(client.upload_diagnostics_report(&sample_report()).await.is_err());
+        assert_eq!(
+            mock.count_to("diagnostics/reports"),
+            1,
+            "a possibly-delivered report must never be sent twice"
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_serializes_exactly_the_whitelisted_keys() {
+        // The wire contract, spelled out. A field added to the struct without
+        // a deliberate update here fails this test — which is the point.
+        let value = serde_json::to_value(sample_report()).unwrap();
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "accountState",
+                "appVersion",
+                "auditLogPath",
+                "catalogRevision",
+                "dnsEnabled",
+                "dnsLastError",
+                "error",
+                "failedStage",
+                "killSwitchLastError",
+                "killSwitchLive",
+                "killSwitchMode",
+                "killSwitchWanted",
+                "osArch",
+                "osVersion",
+                "reportedAtMs",
+                "retryAttempt",
+                "schemaVersion",
+                "selectedServer",
+                "serviceBuild",
+                "serviceLogPath",
+                "serviceProtocol",
+                "steps",
+                "totalElapsedMs",
+                "uiState",
+                "virtualAdapters",
+            ]
+        );
+        let step = value["steps"][0].as_object().unwrap();
+        let mut step_keys: Vec<&str> = step.keys().map(String::as_str).collect();
+        step_keys.sort_unstable();
+        assert_eq!(step_keys, ["elapsedMs", "key", "state"]);
     }
 
     #[tokio::test]
