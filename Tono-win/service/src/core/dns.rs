@@ -1,8 +1,9 @@
 //! Per-adapter DNS protection for the Windows kill switch.
 //!
 //! Snapshot every adapter's IPv4/IPv6 `NameServer`/`ProfileNameServer` → point IPv4 at the
-//! loopback resolver (`127.0.0.1`) and leave IPv6 with **no servers at all** → verify by
-//! read-back → restore from the snapshot on disconnect. The snapshot (`protected-dns.json`) is
+//! loopback resolver (`127.0.0.1`) and leave IPv6 with **no servers at all** → read back what
+//! can be read back (evidence on the way in, a *gate* only on the way out) → restore from the
+//! snapshot on disconnect. The snapshot (`protected-dns.json`) is
 //! written atomically to the service state directory *before* any value is changed — the same
 //! discipline as the kill-switch intent record.
 //!
@@ -20,9 +21,39 @@
 //! protected/loopback value everywhere on the proof path, because adapters left that way by an
 //! older build must not read as restored.
 //!
+//! **The enable-time read-back is evidence, not a gate.** Applying loopback DNS is a *write*;
+//! proving it from Windows is not reliably possible. The registry stores "static, no servers"
+//! and "use DHCP" identically (which is why the IPv6 leg of the read-back was already removed),
+//! and the live apply runs through PowerShell/CIM/netsh, which fails on real machines for
+//! reasons that have nothing to do with whether DNS works: pseudo-adapters, constrained language
+//! mode, EDR hooks, a damaged WMI repository. Gating `enable` on that weak proof killed connects
+//! on machines whose DNS was fine — the last one bailed with "loopback DNS could not be verified
+//! on every active adapter" at 1.1 s, *before* the strong proof ever ran. So `enable` now
+//! **records** what it could not verify (per-adapter live-apply failures in the snapshot and in
+//! [`LIVE_APPLY_FAILURES`]; the whole round in `DNS_LAST_ERROR` and therefore in the status
+//! payload, behind [`DNS_PROTECTION_UNVERIFIED_PREFIX`]) and returns success, so the connect
+//! reaches the proof that is actually direct: `verify_fake_ip` in the App resolves a name through
+//! the OS and demands an answer in `198.18/16`. Nothing is traded away by demoting the weak
+//! proof, because WFP independently blocks DNS to every non-loopback address on **both** families
+//! (the weight-6 `block-dns` filters plus the condition-free block-alls): a machine whose DNS
+//! configuration cannot be verified cannot leak, it can only fail to resolve — and failing to
+//! resolve is exactly what the fake-ip probe catches, with the recorded note in the status
+//! payload to say why. What stays a hard failure of `enable` is the case where **no per-adapter
+//! outcome exists at all** (the adapter enumeration or the apply batch itself errored, or the
+//! record of the round could not be persisted): then there is nothing to restore, nothing to
+//! reconcile, and nothing truthful to report.
+//!
 //! **DNS-before-disarm invariant (identical to the macOS helper):** the kill switch may only
 //! disarm after DNS restore is *proven*; if restore cannot be proven, the disarm is refused
 //! and the block stays armed. See `windows_kill_switch::disarm_unlocked`.
+//!
+//! **The one place that invariant is deliberately traded away is *uninstall*.** Refusing to
+//! release while the product stays installed costs the user a retry; refusing at uninstall time
+//! costs them an application they cannot remove, which is not an acceptable outcome for
+//! consumer software. [`restore_for_uninstall`] is the escalation ladder that replaces the
+//! single refusal there — exact restore, then automatic (DHCP), then refusal — and it is
+//! reached only from the uninstaller. Read the block comment above `uninstall_restore_rung`
+//! before changing it; nothing on the Disconnect / release / quit path goes through it.
 //!
 //! **Proof is read off the machine as it is now, never off history:** a restore is proven when
 //! the registry read-back matches the snapshot exactly *and* a live read says that nothing on
@@ -126,6 +157,162 @@ fn snapshot_path() -> PathBuf {
 static DNS_OPERATION: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 static DNS_LAST_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
+// --- Self-inflicted network-change suppression ---
+//
+// Writing an adapter's DNS servers *is* an IP-interface parameter change, so every per-adapter
+// write here can make Windows call back into `NotifyIpInterfaceChange` — the same notification
+// `netmon` publishes to the product layer as "the machine's networking changed underneath us".
+// The product layer answers that signal with a full teardown + reconnect, and a reconnect
+// re-applies DNS: Connected → Protected Offline → Connecting → Connected, for ever, restarting
+// the core and recreating WinTUN every few seconds. A change *we* just made is not a change to
+// the machine's networking underneath us, so it must not be published as one.
+//
+// The window is opened by the two functions that actually write ([`engine_apply_loopback`] and
+// [`engine_apply_snapshot`]) and by nothing else. It deliberately does **not** cover the
+// enumeration, the read-back or the cache flush, which are reads and are also the slowest part
+// of an `enable` round: keeping them outside is what keeps the window narrow enough that a
+// genuine change is very unlikely to land entirely inside it.
+//
+// **Concurrency.** No lock protects this state and none can: `netmon`'s reader runs on an
+// IPHelper callback thread that must never block, and it is not a tokio context, so it cannot
+// take `DNS_OPERATION` (the tokio mutex every apply already holds, which is what keeps the
+// depth at one in practice). The state is therefore three atomics, read with a single pure
+// decision function, and every race in it resolves toward *publishing* — never toward silence.
+//
+// **The window cannot stick on.** It is opened by an RAII guard whose `Drop` is the only writer
+// that lowers the depth, so a panic, an early `?`, a timed-out `bounded_dns_call` or a dropped
+// (cancelled) future all close it. `SELF_WRITE_MAX_WINDOW` is the belt-and-braces half: past
+// that age an open window stops suppressing even if the depth were somehow leaked.
+//
+// **It is harmless if DNS writes never raise the notification at all** (the one link in the
+// audit that only a Windows machine can settle): with no notification there is nothing to
+// suppress and the code is dead weight during a handful of milliseconds per connect.
+
+/// How long after the last write window closes a raw notification is still attributed to it.
+/// `NotifyIpInterfaceChange` is asynchronous — the callback arrives on an IPHelper thread some
+/// time after the write returns — so the window needs a tail or it would suppress nothing.
+/// 1.5 s is twice `netmon`'s 750 ms debounce, so a callback that arrives late enough to open a
+/// fresh debounce burst is still inside the window that caused it.
+const SELF_WRITE_TAIL: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// Hard age cap on a single open window, independent of the guard. `DNS_APPLY_TIMEOUT` bounds
+/// the apply itself, so a window older than this cannot be an apply that is still running; it
+/// could only be a leaked depth, and a leaked depth must not mute the machine's network events
+/// for the life of the service.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+const SELF_WRITE_MAX_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Number of currently-open write windows (`0` = none).
+static SELF_WRITE_DEPTH: AtomicU32 = AtomicU32::new(0);
+/// Monotonic millis at which the outermost currently-open window was opened.
+static SELF_WRITE_OPENED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Monotonic millis until which the tail of the last closed window runs.
+static SELF_WRITE_TAIL_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Raw notifications `netmon` attributed to a window and did not publish. Diagnostic only.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+static SELF_WRITE_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-lifetime monotonic clock in milliseconds. `Instant` is boot-relative on Windows and
+/// not `const`-constructible, so the anchor is lazy and everything else is a plain `u64`.
+fn monotonic_millis() -> u64 {
+    static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ANCHOR
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// The whole suppression decision, as a pure function of the four observable values.
+///
+/// An open window suppresses only while it is younger than [`SELF_WRITE_MAX_WINDOW`]; once it
+/// is older, the answer falls through to the tail of the last *closed* window, which is in the
+/// past — so an aged-out window publishes again by itself.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+fn self_write_window_is_open(
+    now_millis: u64,
+    depth: u32,
+    opened_at_millis: u64,
+    tail_until_millis: u64,
+) -> bool {
+    if depth > 0
+        && now_millis.saturating_sub(opened_at_millis) < SELF_WRITE_MAX_WINDOW.as_millis() as u64
+    {
+        return true;
+    }
+    now_millis < tail_until_millis
+}
+
+/// Whether a network notification observed *now* is attributable to a DNS write of ours.
+/// Called from `netmon`'s notification callback: loads only, never blocks, never allocates.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+pub(crate) fn in_self_write_window() -> bool {
+    self_write_window_is_open(
+        monotonic_millis(),
+        SELF_WRITE_DEPTH.load(Ordering::Acquire),
+        SELF_WRITE_OPENED_AT.load(Ordering::Relaxed),
+        SELF_WRITE_TAIL_UNTIL.load(Ordering::Relaxed),
+    )
+}
+
+/// Count a notification `netmon` attributed to a window and dropped. Returns the running total
+/// so the caller can put it in one log line.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+pub(crate) fn note_suppressed_self_write() -> u64 {
+    SELF_WRITE_SUPPRESSED.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(test)]
+fn suppressed_self_writes() -> u64 {
+    SELF_WRITE_SUPPRESSED.load(Ordering::Relaxed)
+}
+
+/// Test hooks for `netmon`, whose own callback path is `cfg`-ed out of test builds — and whose
+/// whole module is Windows-only, so they are dead on every other host.
+#[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn open_self_write_window_for_tests() -> SelfWriteWindow {
+    SelfWriteWindow::open()
+}
+
+#[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn self_write_depth_for_tests() -> u32 {
+    SELF_WRITE_DEPTH.load(Ordering::Acquire)
+}
+
+/// RAII marker for "this service is writing adapter DNS right now".
+///
+/// Deliberately a guard and not a flag: the apply it wraps can fail, panic, time out inside
+/// `bounded_dns_call`, or have its future dropped, and every one of those must close the
+/// window. Nothing else in this module may set the state directly.
+#[must_use = "the suppression window closes the moment the guard is dropped"]
+pub(crate) struct SelfWriteWindow(());
+
+impl SelfWriteWindow {
+    fn open() -> Self {
+        let now = monotonic_millis();
+        // Stamp the age anchor *before* the depth becomes observable, so a reader that sees
+        // `depth > 0` can never pair it with a stale anchor from an earlier window and decide
+        // the window has already aged out.
+        if SELF_WRITE_DEPTH.load(Ordering::Acquire) == 0 {
+            SELF_WRITE_OPENED_AT.store(now, Ordering::Relaxed);
+        }
+        SELF_WRITE_DEPTH.fetch_add(1, Ordering::AcqRel);
+        SelfWriteWindow(())
+    }
+}
+
+impl Drop for SelfWriteWindow {
+    fn drop(&mut self) {
+        // Extend the tail *before* lowering the depth: the reverse order leaves an instant in
+        // which the window reads as closed and the tail has not started yet, and a callback
+        // landing in it would publish the write we just made.
+        let until = monotonic_millis().saturating_add(SELF_WRITE_TAIL.as_millis() as u64);
+        SELF_WRITE_TAIL_UNTIL.fetch_max(until, Ordering::AcqRel);
+        SELF_WRITE_DEPTH.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 // --- Pure logic (platform-independent, unit-tested below) ---
 
 /// Registry `NameServer` values are comma-separated; tolerate spaces and empty segments.
@@ -223,6 +410,14 @@ fn is_loopback_value(value: Option<&str>) -> bool {
 /// resolvers — and is genuinely unprotected. `::1` is accepted so that an upgrade over a build
 /// that wrote it does not trigger a pointless machine-wide replay.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+/// Whether an IPv6 name-server value is one we consider protected: an empty list (what the
+/// protect path writes) or the `::1` an older build wrote.
+///
+/// No longer a gate on the protect path — the registry stores "no servers" and "use DHCP"
+/// identically, so this can never prove the state it names. Kept because it still documents
+/// the intended shape and is asserted by tests; the enable-time verification requires only
+/// IPv4 loopback (see `engine::all_loopback`).
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_protected_v6_value(value: Option<&str>) -> bool {
     let Some(value) = value else {
         return false;
@@ -259,6 +454,127 @@ fn needs_loopback_replay(
     live_apply_failed: bool,
 ) -> bool {
     !snapshot_present || !all_loopback || live_apply_failed
+}
+
+/// What the post-apply read-back was able to say about the protected state. Four states, not a
+/// `bool`: "we could not look" and "this build has no engine to look with" are not the same as
+/// "nothing was found", and reporting either as a failure is what used to kill connects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopbackReadBack {
+    /// Every active adapter reads back as protected.
+    Verified,
+    /// The read succeeded and at least one active adapter does not read as protected.
+    Contradicted,
+    /// The read itself failed (engine error, wedged call, timeout).
+    Unavailable,
+    /// No live engine in this build, so there was nothing to attempt. Carries no information and
+    /// never contributes to the note.
+    NotAttempted,
+}
+
+/// How the read-back reads in an operator-facing message.
+fn read_back_label(read_back: LoopbackReadBack) -> &'static str {
+    match read_back {
+        LoopbackReadBack::Verified => "verified",
+        LoopbackReadBack::Contradicted => "not-protected",
+        LoopbackReadBack::Unavailable => "unreadable",
+        LoopbackReadBack::NotAttempted => "not-attempted",
+    }
+}
+
+/// Adapter GUIDs are long; name at most this many in the note and count the rest.
+const UNVERIFIED_NAMED_ADAPTERS: usize = 4;
+
+/// Compose the note for an `enable` round that applied loopback DNS but could not prove it.
+///
+/// `None` means the round is clean — every adapter's live apply succeeded and the read-back
+/// either confirmed the state or was never attempted (a build with no engine). Everything else
+/// produces a note that is deliberately *not* an error: it rides in `DNS_LAST_ERROR` and
+/// therefore in the status payload on an otherwise successful enable, so that when the connect
+/// later dies in `verify_fake_ip` with "system DNS lookup exceeded 2s" the diagnostics report and
+/// the service log already name the real cause. It also states why this is not a leak, because
+/// the next person to read it will ask.
+fn unverified_note(
+    failed: &[String],
+    total: usize,
+    read_back: LoopbackReadBack,
+) -> Option<String> {
+    if failed.is_empty()
+        && matches!(
+            read_back,
+            LoopbackReadBack::Verified | LoopbackReadBack::NotAttempted
+        )
+    {
+        return None;
+    }
+    let named = failed
+        .iter()
+        .take(UNVERIFIED_NAMED_ADAPTERS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let adapters = match failed.len() {
+        0 => "none — the apply reported success on every adapter".to_owned(),
+        count if count > UNVERIFIED_NAMED_ADAPTERS => {
+            format!("{named} (+{} more)", count - UNVERIFIED_NAMED_ADAPTERS)
+        }
+        _ => named,
+    };
+    Some(format!(
+        "{DNS_PROTECTION_UNVERIFIED_PREFIX}: loopback DNS was applied but could not be verified \
+         on {} of {total} adapter(s) — live apply failed on: {adapters}; read-back={}. \
+         Protection was NOT abandoned and this is not a leak: WFP blocks DNS to every \
+         non-loopback address on both address families, so an adapter whose configuration cannot \
+         be verified can only fail to resolve, never resolve past the tunnel. The connect \
+         continues to the fake-ip probe, which resolves a name through the OS and proves the \
+         answering resolver directly; if that probe fails (\"system DNS lookup exceeded\"), this \
+         is the reason. Automatic reconciliation keeps retrying these adapters.",
+        failed.len(),
+        read_back_label(read_back)
+    ))
+}
+
+/// Whether a status payload carries an unverified-enable note. The marker is the contract; the
+/// text around it is free to change.
+fn status_is_unverified(status: &DnsProtectionStatus) -> bool {
+    status
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains(DNS_PROTECTION_UNVERIFIED_PREFIX))
+}
+
+/// Drop a stale unverified note (and only that) from `DNS_LAST_ERROR`.
+///
+/// Called when protection is observed complete. Without it the note outlives the condition it
+/// describes and [`needs_reconcile`] keeps the watchdog re-applying DNS for ever on a machine
+/// that is already healthy — the demoted gate's version of the "permanently unsatisfiable"
+/// failure this module keeps having to design out.
+fn clear_unverified_note() {
+    let mut last = DNS_LAST_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last
+        .as_deref()
+        .is_some_and(|error| error.contains(DNS_PROTECTION_UNVERIFIED_PREFIX))
+    {
+        *last = None;
+    }
+}
+
+/// The watchdog's repair gate.
+///
+/// `!enabled` alone is no longer sufficient. Since `enable` stopped failing on an unverifiable
+/// apply, a machine can sit at `enabled == true` — the registry read-back is happy — while the
+/// *live* apply failed on an adapter and the running resolver never picked the change up. Those
+/// recorded failures are precisely the work the reconciler exists to retry, and they are also
+/// what [`needs_loopback_replay`] keys on, so the two agree on when there is something to do.
+fn needs_reconcile(
+    protection_wanted: bool,
+    snapshot_present: bool,
+    enabled: bool,
+    unverified: bool,
+) -> bool {
+    protection_wanted && snapshot_present && (!enabled || unverified)
 }
 
 /// Registry-only comparison of one adapter: the four saved values against the read-back
@@ -389,6 +705,105 @@ const DEGRADED_RESTORE_STREAK: u32 = 3;
 /// payload with its own marker — it is never silent.
 fn accepts_degraded_restore(consecutive_live_failures: u32, registry_matches: bool) -> bool {
     registry_matches && consecutive_live_failures >= DEGRADED_RESTORE_STREAK
+}
+
+// --- Uninstall-only escalation ladder ---
+//
+// **The design error this ladder corrects.** Everywhere else in this module, "refuse unless the
+// network is provably restored" is right: the product is staying installed, the user can retry,
+// and the App still has a way to open the block. At *uninstall* time the same rule produced an
+// **unremovable application** — the machine that reported this could not get past
+// `RemoveVergeService` because the live CIM/netsh apply was failing on one adapter, so the exact
+// restore could never be proven and the NSIS macro aborted the whole uninstall, every time.
+// Unremovable consumer software is a worse outcome than an inexact DNS configuration, and it is
+// not a trade the user ever agreed to.
+//
+// The danger the old refusal was aimed at is real, but the aim was wrong. What must never
+// happen is *removing the app while leaving persistent WFP filters armed* — a blocked machine
+// with no software left to unblock it. Refusing the uninstall is not the only way to prevent
+// that, and it is the way that costs the most: it leaves the user blocked **and** stuck.
+// `windows_kill_switch::emergency_disarm_windows_kill_switch` removes the WFP objects whether
+// or not DNS could be restored, so the barrier is gone on every rung below; this ladder decides
+// only what to do about the *resolver*.
+//
+// Rung 1 — exact restore, proven exactly as on the Disconnect path (`restore_protected`).
+// Rung 2 — put the adapters Tono redirected back on **automatic (DHCP)**, both families, and
+//          verify the machine is no longer resolving through the loopback core. DHCP is a
+//          universally-correct resting state: the user gets working DNS from their network. It
+//          is not their exact prior configuration, and at uninstall time — when the product is
+//          being removed and connectivity matters more than fidelity — that is the right trade.
+// Rung 3 — only when the machine is *provably* still on the loopback resolver, or when neither
+//          the DHCP write nor the read-back produced any evidence at all. Then, and only then,
+//          the refusal stands.
+//
+// None of this loosens the Disconnect / "Restore normal internet" path: `restore_protected`,
+// `ensure_restored` and `disarm_unlocked` are untouched, and this ladder is reached only from
+// the uninstaller's opt-in (`windows_kill_switch::uninstall_ladder_requested`).
+
+/// Stable, App/installer-mappable marker for "the exact DNS restore could not be proven, so the
+/// adapters were reset to automatic (DHCP) instead". Same substring contract as the wedge
+/// markers. `uninstall_service.rs` matches this literal to pick its continue-with-warning exit
+/// code, so the text is part of the exit-code contract and must not drift.
+pub(crate) const DNS_RESTORED_AUTOMATIC_PREFIX: &str = "TONO_DNS_RESTORED_AUTOMATIC";
+
+/// Stable marker for the last rung: the machine could not be taken off the loopback resolver at
+/// all. This is the only DNS state that still blocks an uninstall.
+pub(crate) const DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX: &str = "TONO_DNS_STILL_ON_LOOPBACK";
+
+/// Which rung of the uninstall ladder the evidence lands on. Pure, so the whole decision table
+/// is unit-tested off Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UninstallRung {
+    /// Rung 1: the snapshot was restored and proven.
+    Exact,
+    /// Rung 2: not exact, but the machine is off the loopback resolver (or its configured
+    /// resolvers are now DHCP, which is what the DNS Client reads for the next lookup).
+    Automatic,
+    /// Rung 3: provably still redirected, or no evidence either way.
+    StillOnLoopback,
+}
+
+/// The ladder's decision table.
+///
+/// * `automatic_apply_ok` — the DHCP reset was written for every targeted adapter. The registry
+///   half of that write is what the DNS Client reads for the next lookup, so it is positive
+///   evidence in exactly the sense [`accepts_degraded_restore`] already relies on.
+/// * `live_loopback` — `Some(true)` the machine provably still resolves through our loopback
+///   core, `Some(false)` provably does not, `None` the engine could not be asked.
+///
+/// The one asymmetry against the rest of this module: `None` (unobtainable evidence) does *not*
+/// force a refusal here as long as the DHCP write succeeded. Everywhere else unobtainable
+/// evidence is unproven and fails closed, because failing closed costs the user a retry. Here
+/// failing closed costs them an application they cannot remove, while the thing that would
+/// actually strand them — the WFP barrier — is already gone. `Some(true)` is still an
+/// unconditional refusal: a machine we can *see* is still pointed at a resolver that has
+/// stopped answering is not a machine we quietly walk away from.
+fn uninstall_restore_rung(
+    exact_proven: bool,
+    automatic_apply_ok: bool,
+    live_loopback: Option<bool>,
+) -> UninstallRung {
+    if exact_proven {
+        return UninstallRung::Exact;
+    }
+    if live_loopback == Some(true) {
+        return UninstallRung::StillOnLoopback;
+    }
+    if automatic_apply_ok || live_loopback == Some(false) {
+        return UninstallRung::Automatic;
+    }
+    UninstallRung::StillOnLoopback
+}
+
+/// What the uninstall ladder achieved. `Ok` of either variant means the machine is not left
+/// resolving through a loopback core that is about to stop answering; rung 3 is the `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UninstallDnsRestore {
+    /// Rung 1 — the snapshot was restored and proven, exactly as on every other path.
+    Exact,
+    /// Rung 2 — the adapters Tono redirected were reset to automatic (DHCP) for both families.
+    /// Carries the adapters that were reset, so the uninstaller can name them.
+    Automatic { adapters: Vec<String> },
 }
 
 /// Why `enable_unlocked` is running. The distinction is a safety boundary, not bookkeeping.
@@ -536,6 +951,13 @@ pub(crate) const DNS_SNAPSHOT_UNREADABLE_PREFIX: &str = "TONO_DNS_SNAPSHOT_UNREA
 /// an otherwise *successful* restore, so the App must treat it as a warning to surface, not as a
 /// failed operation.
 pub(crate) const DNS_RESTORE_DEGRADED_PREFIX: &str = "TONO_DNS_RESTORE_DEGRADED";
+
+/// Stable, App-mappable marker for "loopback DNS was applied, but the apply or its read-back
+/// could not be verified on every adapter". Like [`DNS_RESTORE_DEGRADED_PREFIX`] it rides in
+/// `last_error` on an otherwise **successful** operation, so the App must treat it as a warning
+/// to surface (and to put in the diagnostics report), never as a failed enable. It is the
+/// explanation the user gets when the connect subsequently fails in the fake-ip probe.
+pub(crate) const DNS_PROTECTION_UNVERIFIED_PREFIX: &str = "TONO_DNS_UNVERIFIED";
 
 /// Budget for one *reading* DNS engine call (registry sweep + `GetAdaptersAddresses`). A
 /// healthy enumeration is milliseconds; 25 s is the same clock `WFP_CALL_TIMEOUT` uses, so the
@@ -776,6 +1198,9 @@ async fn engine_collect() -> Result<Vec<AdapterDnsSnapshot>> {
 }
 
 async fn engine_apply_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<Vec<(String, bool)>> {
+    // The only two writers of adapter DNS are this and `engine_apply_snapshot`; both mark the
+    // window so `netmon` does not report our own writes as the machine's network changing.
+    let _self_write = SelfWriteWindow::open();
     #[cfg(all(windows, not(feature = "test")))]
     {
         let guids = adapters
@@ -789,14 +1214,26 @@ async fn engine_apply_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<Vec<(S
     }
     #[cfg(not(all(windows, not(feature = "test"))))]
     {
+        // The stub models the two shapes the real engine fails in, because the difference is now
+        // the difference between a hard failure and a recorded one:
+        //   * the batch cannot be run at all — no adapter touched, no per-adapter outcome;
+        //   * the batch runs and reports per-adapter live failures while the registry write
+        //     underneath it landed (the real-machine case).
+        if test_hooks::apply_batch_unavailable() {
+            bail!("the DNS apply batch could not be run at all (test hook)");
+        }
+        let ok = !test_hooks::live_apply_fails();
         Ok(adapters
             .iter()
-            .map(|adapter| (adapter.interface_guid.clone(), true))
+            .map(|adapter| (adapter.interface_guid.clone(), ok))
             .collect())
     }
 }
 
 async fn engine_apply_snapshot(snapshot: &DnsSnapshot) -> Result<Vec<(String, bool)>> {
+    // Restore writes the same per-adapter registry values and runs the same CIM/netsh batch as
+    // the loopback apply, so it raises the same notifications and gets the same window.
+    let _self_write = SelfWriteWindow::open();
     #[cfg(all(windows, not(feature = "test")))]
     {
         let snapshot = snapshot.clone();
@@ -812,12 +1249,36 @@ async fn engine_apply_snapshot(snapshot: &DnsSnapshot) -> Result<Vec<(String, bo
         // it succeeds (`engine::apply_snapshot` writes the four registry values whatever the
         // PowerShell batch reported).
         let ok = !test_hooks::live_apply_fails();
+        // A successful *automatic (DHCP)* reset takes the machine off the loopback resolver, so
+        // the stubbed live read has to start answering that way — otherwise rung 2 of the
+        // uninstall ladder is unreachable in every test build. The stub models "the reset lands
+        // completely or not at all"; on a real machine the registry deletion is independent of
+        // the PowerShell batch, which is precisely why rung 2 verifies on the reported machine
+        // even though its live apply keeps failing.
+        if ok && is_automatic_reset(snapshot) {
+            test_hooks::set_live_dns_on_loopback(false);
+        }
         Ok(snapshot
             .adapters
             .iter()
             .map(|adapter| (adapter.interface_guid.clone(), ok))
             .collect())
     }
+}
+
+/// Whether this snapshot is the uninstall ladder's automatic (DHCP) reset: a non-empty adapter
+/// list in which every entry has all four values absent. "Absent" is what the engine turns into
+/// a registry delete and a DHCP live apply, so this is a precise structural test rather than a
+/// flag that could drift from what is actually applied.
+#[cfg(not(all(windows, not(feature = "test"))))]
+fn is_automatic_reset(snapshot: &DnsSnapshot) -> bool {
+    !snapshot.adapters.is_empty()
+        && snapshot.adapters.iter().all(|adapter| {
+            adapter.ipv4_name_server.is_none()
+                && adapter.ipv4_profile_name_server.is_none()
+                && adapter.ipv6_name_server.is_none()
+                && adapter.ipv6_profile_name_server.is_none()
+        })
 }
 
 async fn engine_all_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<bool> {
@@ -894,8 +1355,23 @@ pub(crate) mod test_hooks {
     /// Simulate the machine from the real regression: PowerShell/CIM reports the live apply as
     /// failed (which records `live_apply_failed` and starts the streak) while the registry
     /// restore underneath it succeeded.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_live_apply_fails(fails: bool) {
         LIVE_APPLY_FAILS.store(fails, Ordering::Relaxed);
+    }
+
+    static APPLY_BATCH_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn apply_batch_unavailable() -> bool {
+        APPLY_BATCH_UNAVAILABLE.load(Ordering::Relaxed)
+    }
+
+    /// Simulate the one apply outcome that is still a hard failure of `enable`: the batch could
+    /// not be run at all, so nothing was written to any adapter and there is no per-adapter
+    /// result to record — adapter enumeration failed, or the engine call was wedged.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_apply_batch_unavailable(unavailable: bool) {
+        APPLY_BATCH_UNAVAILABLE.store(unavailable, Ordering::Relaxed);
     }
 }
 
@@ -972,13 +1448,17 @@ fn note_live_results(snapshot: &mut DnsSnapshot, results: &[(String, bool)]) {
     }
 }
 
-/// Move an unreadable `protected-dns.json` aside instead of deleting it: it may still be the
-/// only record of the original resolvers, and a support case can decode by hand what this build
-/// could not. Called *only* after [`restore_established_without_snapshot`] has held, so the
-/// file is never removed from the disarm path while the machine could still be redirected.
-async fn quarantine_snapshot(reason: &str) -> Result<()> {
+/// Move `protected-dns.json` aside instead of deleting it: it may still be the only record of
+/// the original resolvers, and a support case can decode by hand what this build could not.
+///
+/// `label` names why (`corrupt` / `superseded`) and becomes part of the retained file name.
+/// Called *only* once the machine is known not to be redirected any more — after
+/// [`restore_established_without_snapshot`] on the recovery path, or after the uninstall
+/// ladder's rung 2 has verified the same property — so the live snapshot is never removed while
+/// the machine could still be pointed at the loopback core.
+async fn quarantine_snapshot(label: &str, reason: &str) -> Result<()> {
     let path = snapshot_path();
-    let quarantined = path.with_extension(format!("corrupt-{}.json", now_unix()));
+    let quarantined = path.with_extension(format!("{label}-{}.json", now_unix()));
     if let Err(error) = tokio::fs::rename(&path, &quarantined).await {
         if error.kind() == std::io::ErrorKind::NotFound {
             return Ok(());
@@ -987,9 +1467,8 @@ async fn quarantine_snapshot(reason: &str) -> Result<()> {
     }
     crate::core::platform_security::secure_private_service_file_if_exists(&quarantined)?;
     tracing::error!(
-        "dns: {reason}; no adapter still resolves through the loopback core, so restoration \
-         holds without it — the file was quarantined as {} and protection starts from a clean \
-         snapshot",
+        "dns: {reason} — the file was kept as {} rather than deleted, so the original resolvers \
+         stay recoverable by hand",
         quarantined.display()
     );
     Ok(())
@@ -1029,7 +1508,15 @@ async fn recover_unreadable_snapshot(reason: &str) -> Result<()> {
              escape hatch. The unreadable file is kept for diagnosis."
         );
     }
-    quarantine_snapshot(reason).await
+    quarantine_snapshot(
+        "corrupt",
+        &format!(
+            "protected-dns.json cannot be read ({reason}); no adapter still resolves through the \
+             loopback core, so restoration holds without it and protection starts from a clean \
+             snapshot"
+        ),
+    )
+    .await
 }
 
 /// Snapshot → set loopback → verify. Idempotent: a second call while protected keeps the
@@ -1110,33 +1597,75 @@ async fn enable_unlocked(trigger: EnableTrigger) -> Result<DnsProtectionStatus> 
     // that appeared after the first enable, and any later failure must retain their originals.
     atomic_write(&snapshot_path(), &serde_json::to_vec_pretty(&snapshot)?).await?;
     if !needs_loopback_replay(snapshot_present, all_loopback, live_apply_failed) {
+        // Protection is complete and nothing is outstanding: retire any note from an earlier
+        // round so the reconciler is not kept awake by evidence that no longer holds.
+        clear_unverified_note();
         return status_unlocked().await;
     }
-    let outcome: Result<()> = async {
+    // `Some(note)` = applied, but at least one adapter could not be verified — a *success* that
+    // must be recorded, not a failure (see the module docs). `Err` is reserved for the round
+    // that produced no per-adapter outcome at all.
+    let outcome: Result<Option<String>> = async {
+        // Hard failure #1: the batch could not be run, so not one adapter was touched and there
+        // is no result to record. `?` on purpose — with nothing applied there is nothing to
+        // restore and nothing for the watchdog to reconcile, and a status that claimed
+        // "protected" would be a lie. A wedged engine (`DNS_ENGINE_WEDGED_PREFIX`) surfaces here.
         let live = engine_apply_loopback(&snapshot.adapters).await?;
         note_apply_round(live.iter().any(|(_, ok)| !ok));
         note_live_results(&mut snapshot, &live);
-        // Persist both failures and successful retries. Otherwise a recovered adapter keeps its
-        // old `live_apply_failed` bit on disk and every later enable unnecessarily replays DNS.
+        // Hard failure #2: the record of the round could not be persisted. Persist both failures
+        // and successful retries — otherwise a recovered adapter keeps its old
+        // `live_apply_failed` bit on disk and every later enable unnecessarily replays DNS, and
+        // (since the demotion) an unpersisted failure is a failure the restore proof and the
+        // reconciler would never learn about.
         atomic_write(&snapshot_path(), &serde_json::to_vec_pretty(&snapshot)?).await?;
-        let failed = live.iter().filter(|(_, ok)| !ok).count();
-        if failed > 0 {
-            bail!("live DNS apply failed on {failed} adapter(s)");
-        }
-        if ENGINE_LIVE {
-            let active_after_apply = engine_collect().await?;
-            if !engine_all_loopback(&active_after_apply).await? {
-                bail!("loopback DNS could not be verified on every active adapter");
+        let failed = live
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(guid, _)| guid.clone())
+            .collect::<Vec<_>>();
+        // Everything from here down is evidence, never a gate. The read-back is indirect (the
+        // registry cannot even express the protected IPv6 state) and fails for environmental
+        // reasons; the direct proof is the App's fake-ip probe, which runs seconds later in the
+        // same connect transaction. Both outcomes — and a read that could not be performed at
+        // all — are recorded and reported instead of aborting the connect.
+        let read_back = if ENGINE_LIVE {
+            match engine_collect().await {
+                Ok(active_after_apply) => match engine_all_loopback(&active_after_apply).await {
+                    Ok(true) => LoopbackReadBack::Verified,
+                    Ok(false) => LoopbackReadBack::Contradicted,
+                    Err(error) => {
+                        tracing::warn!("dns: the loopback read-back could not be run: {error:#}");
+                        LoopbackReadBack::Unavailable
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("dns: adapters could not be re-read after the apply: {error:#}");
+                    LoopbackReadBack::Unavailable
+                }
             }
-        }
-        Ok(())
+        } else {
+            LoopbackReadBack::NotAttempted
+        };
+        Ok(unverified_note(&failed, live.len(), read_back))
     }
     .await;
-    record_outcome(outcome)?;
-    // Loopback is applied and verified: flush the resolver cache best-effort. Real-IP answers
-    // cached before the switch are otherwise served without consulting the loopback core, so the
-    // fake-ip readiness probe never sees a 198.18/16 answer until the entries expire. A failed
-    // flush must not fail enable — DNS protection itself is already in place.
+    let unverified = record_outcome(outcome)?;
+    if let Some(note) = unverified {
+        // `record_outcome` cleared `last_error` on the way through: this round *succeeded* for
+        // the caller, but it must never be silent — put the note back so it reaches the status
+        // payload (`status_unlocked` reads `DNS_LAST_ERROR`), the App's diagnostics report and
+        // the service log. It is also what `needs_reconcile` keys on.
+        tracing::warn!("dns: {note}");
+        *DNS_LAST_ERROR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+    }
+    // Loopback is applied (verified or recorded as unverified): flush the resolver cache
+    // best-effort. Real-IP answers cached before the switch are otherwise served without
+    // consulting the loopback core, so the fake-ip readiness probe never sees a 198.18/16 answer
+    // until the entries expire. A failed flush must not fail enable — DNS protection itself is
+    // already in place.
     if let Err(error) = engine_flush_cache().await {
         tracing::warn!("DNS cache flush after enable failed: {error:#}");
     }
@@ -1292,6 +1821,178 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
     status_unlocked().await
 }
 
+/// The adapters rung 2 is allowed to reset to automatic (DHCP).
+///
+/// Only ever adapters Tono redirected. Resetting an adapter we never touched would destroy a
+/// static DNS configuration the user chose, which is exactly the kind of collateral damage the
+/// uninstall trade does *not* license.
+///
+/// * With a readable snapshot: its adapters, minus any whose *originals were themselves a
+///   loopback resolver* (a machine that already ran Acrylic / dnscrypt-proxy / a local Pi-hole).
+///   For those, loopback is the correct end state, so DHCP would be the wrong answer and their
+///   loopback reading is not evidence of our redirect.
+/// * Without a readable snapshot: the adapters that provably read as a loopback resolver right
+///   now. We cannot say what they were, but we can say they are pointed at a core that is about
+///   to stop existing.
+async fn uninstall_reset_targets() -> Result<Vec<String>> {
+    let snapshot = match tokio::fs::read(snapshot_path()).await {
+        Ok(bytes) => parse_snapshot(&bytes).ok(),
+        Err(_) => None,
+    };
+    if let Some(snapshot) = snapshot {
+        return Ok(snapshot
+            .adapters
+            .iter()
+            .filter(|saved| !saved_dns_was_loopback(saved))
+            .map(|saved| saved.interface_guid.clone())
+            .collect());
+    }
+    // `saved_dns_was_loopback` is just "any of the four values is a loopback resolver"; here it
+    // is asked of a *live* read rather than of saved originals.
+    Ok(engine_collect()
+        .await?
+        .iter()
+        .filter(|adapter| saved_dns_was_loopback(adapter))
+        .map(|adapter| adapter.interface_guid.clone())
+        .collect())
+}
+
+/// The uninstall-only escalation ladder (see the block comment above [`uninstall_restore_rung`]).
+///
+/// Rung 1 is [`restore_protected`], unchanged and unrelaxed. If it cannot prove itself, rung 2
+/// writes automatic (DHCP) DNS for both families over the adapters Tono redirected and verifies
+/// the machine is off the loopback core; rung 3 is the `Err`, and is the only DNS state that may
+/// still block an uninstall.
+///
+/// This function is never on the Disconnect / release / quit path. `restore_protected`,
+/// `ensure_restored` and `windows_kill_switch::disarm_unlocked` keep the strict proof: while the
+/// product stays installed, a refusal costs a retry, and the App can still open the block.
+pub(crate) async fn restore_for_uninstall() -> Result<UninstallDnsRestore> {
+    if !SUPPORTED {
+        return Ok(UninstallDnsRestore::Exact);
+    }
+
+    // Rung 1. Also the path that clears `PROTECTION_WANTED`, deletes the snapshot on success and
+    // handles the unreadable-snapshot recovery, so nothing below has to repeat any of it.
+    let exact_error = match restore_protected().await {
+        Ok(_) => return Ok(UninstallDnsRestore::Exact),
+        Err(error) => error,
+    };
+    tracing::error!(
+        "dns: the exact restore could not be proven while uninstalling ({exact_error:#}); \
+         escalating to automatic (DHCP) DNS rather than leaving an application that cannot be \
+         removed"
+    );
+
+    // Rung 2. `restore_protected` has released the operation lock by now; take it for the reset
+    // so the watchdog and any concurrent caller stay serialized behind the same single writer.
+    let _operation = DNS_OPERATION.lock().await;
+    // An engine that cannot even enumerate must not produce a *vacuous* success below: an empty
+    // target list would otherwise report "every targeted adapter was reset" while nothing was
+    // looked at. "The snapshot says we redirected nothing" and "we could not find out" are
+    // different answers, and only the first one is evidence.
+    let (targets_listed, targets) = match uninstall_reset_targets().await {
+        Ok(targets) => (true, targets),
+        Err(error) => {
+            tracing::error!("dns: the adapters to reset to DHCP could not be listed: {error:#}");
+            (false, Vec::new())
+        }
+    };
+    // An adapter record whose four values are all `None` *is* "automatic (DHCP)" — the engine
+    // deletes the registry values and drives the live apply with CIM `$null` (IPv4) and
+    // `netsh … source=dhcp` (IPv6). No new engine mechanism is introduced for the fallback: it
+    // is the ordinary restore path applied to a deliberately empty original.
+    let automatic = DnsSnapshot {
+        version: SNAPSHOT_VERSION,
+        taken_at: now_unix(),
+        adapters: targets
+            .iter()
+            .map(|guid| AdapterDnsSnapshot {
+                interface_guid: guid.clone(),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    let automatic_apply_ok = targets_listed
+        && match engine_apply_snapshot(&automatic).await {
+            Ok(results) => results.iter().all(|(_, ok)| *ok),
+            Err(error) => {
+                tracing::error!(
+                    "dns: the automatic (DHCP) fallback could not be applied: {error:#}"
+                );
+                false
+            }
+        };
+    // Ask only about the adapters we redirected. "Is *anything* on loopback?" would refuse for
+    // ever on a machine running its own local resolver on an adapter we never touched.
+    let live_loopback = match engine_any_loopback(&automatic.adapters).await {
+        Ok(any_loopback) => Some(any_loopback),
+        Err(error) => {
+            tracing::warn!(
+                "dns: the live DNS state could not be read after the automatic (DHCP) \
+                 fallback: {error:#}"
+            );
+            None
+        }
+    };
+
+    match uninstall_restore_rung(false, automatic_apply_ok, live_loopback) {
+        // Not reachable with `exact_proven = false`; treated as rung 1 rather than panicking,
+        // because an uninstaller is the last place to turn a logic slip into a crash.
+        UninstallRung::Exact => Ok(UninstallDnsRestore::Exact),
+        UninstallRung::Automatic => {
+            let note = format!(
+                "{DNS_RESTORED_AUTOMATIC_PREFIX}: the saved DNS servers could not be proven \
+                 restored ({exact_error:#}), so {} adapter(s) were set back to automatic (DHCP) \
+                 for both IPv4 and IPv6 and verified off Tono's loopback resolver \
+                 (dhcp_apply_ok={automatic_apply_ok}, still_on_loopback={}). The machine gets \
+                 its DNS from the network again; this is not the exact previous configuration, \
+                 which is the accepted trade at uninstall time.",
+                automatic.adapters.len(),
+                live_loopback_label(live_loopback),
+            );
+            tracing::error!("dns: {note}");
+            *DNS_LAST_ERROR
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+            // The redirect is gone, so the snapshot no longer describes anything in force — but
+            // it is the only record of the user's original servers, so it is retained under a
+            // new name instead of deleted. Retaining it under the *live* name would make a
+            // second uninstall run replay this whole ladder for nothing.
+            if let Err(error) = quarantine_snapshot(
+                "superseded",
+                "the saved DNS servers could not be proven restored, so the adapters were reset \
+                 to automatic (DHCP) during uninstall",
+            )
+            .await
+            {
+                tracing::warn!("dns: the superseded snapshot could not be set aside: {error:#}");
+            }
+            if let Err(error) = engine_flush_cache().await {
+                tracing::warn!("DNS cache flush after the DHCP fallback failed: {error:#}");
+            }
+            Ok(UninstallDnsRestore::Automatic { adapters: targets })
+        }
+        UninstallRung::StillOnLoopback => {
+            // The last rung, and the only one that still refuses. Everything the user needs to
+            // get out of it is in the message: the barrier is already gone, so they are online,
+            // and one change in Windows' own network settings makes the next run take rung 2.
+            bail!(
+                "{DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX}: this machine could not be taken off \
+                 Tono's loopback DNS resolver. The exact restore failed ({exact_error:#}) and \
+                 the automatic (DHCP) fallback did not verify either \
+                 (dhcp_apply_ok={automatic_apply_ok}, still_on_loopback={}). The network barrier \
+                 has already been removed, so the machine is no longer blocked — only name \
+                 resolution is still pointed at Tono. Fix it in Windows: Settings → Network & \
+                 Internet → your adapter → DNS server assignment → Edit → Automatic (DHCP), for \
+                 both IPv4 and IPv6; a reboot also clears a wedged DNS Client service. Then run \
+                 the uninstaller again and it will complete.",
+                live_loopback_label(live_loopback),
+            )
+        }
+    }
+}
+
 /// The disarm gate: succeed when no protection is active, or after a proven restore. An
 /// error here must keep the kill switch armed (see the invariant at the top of this file).
 pub(crate) async fn ensure_restored() -> Result<()> {
@@ -1385,10 +2086,16 @@ pub fn spawn_status_watchdog() {
             };
             publish_status(&status);
             // `PROTECTION_WANTED` is the intent gate: a snapshot that outlived a disarm is
-            // evidence to keep, not a reason to re-apply loopback.
-            let repair = PROTECTION_WANTED.load(Ordering::Acquire)
-                && status.snapshot_present
-                && !status.enabled;
+            // evidence to keep, not a reason to re-apply loopback. The recorded per-adapter
+            // failures are the second trigger: since `enable` stopped failing on an unverifiable
+            // apply, they are the only thing that tells this loop there is still work to do on a
+            // machine whose registry read-back looks healthy.
+            let repair = needs_reconcile(
+                PROTECTION_WANTED.load(Ordering::Acquire),
+                status.snapshot_present,
+                status.enabled,
+                status_is_unverified(&status),
+            );
             if !repair {
                 if failures > 0 {
                     // Nothing left to repair — protection is healthy again, was released, or is
@@ -1407,18 +2114,35 @@ pub fn spawn_status_watchdog() {
             if std::time::Instant::now() < next_attempt {
                 continue;
             }
-            match enable_unlocked(EnableTrigger::Reconcile).await {
-                Ok(_) => {
+            // A repair that *ran* but still could not verify every adapter is not a success for
+            // this loop's purposes. `enable` no longer reports that as an error, so without
+            // folding it in here the backoff and the cap would never engage on the machine they
+            // exist for — one permanently unconfigurable adapter would spawn a PowerShell batch
+            // every two seconds for ever.
+            let incomplete = match enable_unlocked(EnableTrigger::Reconcile).await {
+                Ok(status) if status_is_unverified(&status) => Some(
+                    status
+                        .last_error
+                        .unwrap_or_else(|| "unverified adapters remain".to_owned()),
+                ),
+                Ok(_) => None,
+                Err(error) => {
+                    publish_status_error(&error);
+                    Some(format!("{error:#}"))
+                }
+            };
+            match incomplete {
+                None => {
                     failures = 0;
                     next_attempt = std::time::Instant::now();
                 }
-                Err(error) => {
+                Some(reason) => {
                     failures += 1;
                     next_attempt = std::time::Instant::now()
                         + reconcile_backoff(failures).unwrap_or(DNS_RECONCILE_MAX_BACKOFF);
-                    publish_status_error(&error);
                     tracing::warn!(
-                        "protected DNS reconciliation failed (attempt {failures}): {error:#}"
+                        "protected DNS reconciliation did not complete (attempt {failures}): \
+                         {reason}"
                     );
                     if failures >= DNS_RECONCILE_MAX_FAILURES {
                         tracing::error!(
@@ -1492,10 +2216,7 @@ fn is_active_dns_adapter(oper_status: i32, if_type: u32, has_bound_ip: bool) -> 
 
 #[cfg(all(windows, not(feature = "test")))]
 mod engine {
-    use super::{
-        AdapterDnsSnapshot, DnsSnapshot, is_active_dns_adapter, is_loopback_value,
-        is_protected_v6_value,
-    };
+    use super::{AdapterDnsSnapshot, DnsSnapshot, is_active_dns_adapter, is_loopback_value};
     use anyhow::{Context as _, Result, bail};
     use std::ffi::CStr;
     use windows_sys::Win32::Foundation::{
@@ -2333,13 +3054,15 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
             {
                 return Ok(false);
             }
-            if key_exists(&v6_key(guid))?
-                && (!is_protected_v6_value(adapter.ipv6_name_server.as_deref())
-                    || (adapter.ipv6_profile_name_server.is_some()
-                        && !is_protected_v6_value(adapter.ipv6_profile_name_server.as_deref())))
-            {
-                return Ok(false);
-            }
+            // IPv6 is deliberately NOT a gate here. The protected v6 state is "no servers",
+            // and Windows stores that the same way it stores "use DHCP" — an absent or empty
+            // `NameServer` — so the registry cannot tell the two apart and a read-back can
+            // never prove it. Making it a gate is what turned a machine with a perfectly good
+            // v4 loopback resolver into `Failed to enable protected DNS`. It is also
+            // unnecessary: v6 DNS to a physical resolver is blocked by the weight-6 v6 DNS
+            // filter and the v6 block-all, so an unprovable v6 state is a resolution failure
+            // at worst, never a leak, and the fake-ip probe proves the resolver that answers.
+            // Clearing v6 stays best-effort on the apply side.
         }
         Ok(true)
     }
@@ -2788,6 +3511,151 @@ mod tests {
         );
     }
 
+    // --- The uninstall-only escalation ladder ---
+
+    /// Rung 1 wins whenever the exact restore was proven, whatever the fallback evidence says.
+    #[test]
+    fn a_proven_exact_restore_is_always_rung_one() {
+        for automatic_ok in [true, false] {
+            for live in [Some(true), Some(false), None] {
+                assert_eq!(
+                    uninstall_restore_rung(true, automatic_ok, live),
+                    UninstallRung::Exact,
+                    "automatic_ok={automatic_ok} live={live:?}"
+                );
+            }
+        }
+    }
+
+    /// Rung 2 — the whole point of the ladder. Either the DHCP write landed (the registry is
+    /// what the DNS Client reads for the next lookup) or the live read says nothing is on the
+    /// loopback resolver any more. Both are reasons to let the uninstall finish.
+    #[test]
+    fn an_unprovable_exact_restore_falls_back_to_automatic_dns() {
+        assert_eq!(
+            uninstall_restore_rung(false, true, Some(false)),
+            UninstallRung::Automatic,
+            "the DHCP reset applied and the machine is verifiably off the loopback resolver"
+        );
+        assert_eq!(
+            uninstall_restore_rung(false, true, None),
+            UninstallRung::Automatic,
+            "a DHCP reset that landed is accepted even when the live read cannot be taken: \
+             failing closed here costs the user an application they cannot remove, while the \
+             WFP barrier — the thing that would actually strand them — is already gone"
+        );
+        assert_eq!(
+            uninstall_restore_rung(false, false, Some(false)),
+            UninstallRung::Automatic,
+            "a failed DHCP write over a machine that is provably not on loopback leaves nothing \
+             to refuse for"
+        );
+    }
+
+    /// Rung 3 stays a refusal, and stays narrow: a machine we can *see* is still pointed at a
+    /// resolver that has stopped answering, or one that produced no evidence at all.
+    #[test]
+    fn the_last_rung_refuses_only_on_loopback_or_on_no_evidence_at_all() {
+        for automatic_ok in [true, false] {
+            assert_eq!(
+                uninstall_restore_rung(false, automatic_ok, Some(true)),
+                UninstallRung::StillOnLoopback,
+                "no fallback result may release a machine that provably still resolves through \
+                 Tono's loopback core (automatic_ok={automatic_ok})"
+            );
+        }
+        assert_eq!(
+            uninstall_restore_rung(false, false, None),
+            UninstallRung::StillOnLoopback,
+            "the DHCP write failed and nothing could be read back: no evidence is not evidence"
+        );
+    }
+
+    /// The stub engine has to recognise the DHCP-reset shape, because that is what lets a test
+    /// build reach rung 2 at all. All four values absent on every adapter, and never an empty
+    /// adapter list — an empty reset proves nothing about anything.
+    #[test]
+    fn the_automatic_reset_shape_is_all_four_values_absent() {
+        let reset = DnsSnapshot {
+            version: SNAPSHOT_VERSION,
+            taken_at: 0,
+            adapters: vec![
+                AdapterDnsSnapshot {
+                    interface_guid: "{A}".to_owned(),
+                    ..Default::default()
+                },
+                AdapterDnsSnapshot {
+                    interface_guid: "{B}".to_owned(),
+                    ..Default::default()
+                },
+            ],
+        };
+        assert!(is_automatic_reset(&reset));
+
+        let mut partial = reset.clone();
+        partial.adapters[1].ipv6_profile_name_server = Some("2606:4700:4700::1111".to_owned());
+        assert!(
+            !is_automatic_reset(&partial),
+            "one family left on a saved value is a restore, not a DHCP reset"
+        );
+
+        let empty = DnsSnapshot {
+            version: SNAPSHOT_VERSION,
+            taken_at: 0,
+            adapters: Vec::new(),
+        };
+        assert!(!is_automatic_reset(&empty));
+    }
+
+    /// The two markers the uninstaller and the installer key off. `uninstall_service.rs`
+    /// duplicates the rung-2 literal (it cannot see a `pub(crate)` constant), so a rename on
+    /// either side silently turns rung 2 back into a refusal.
+    #[test]
+    fn the_ladder_markers_are_stable_across_the_binary_boundary() {
+        assert_eq!(DNS_RESTORED_AUTOMATIC_PREFIX, "TONO_DNS_RESTORED_AUTOMATIC");
+        assert_eq!(
+            DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX,
+            "TONO_DNS_STILL_ON_LOOPBACK"
+        );
+        assert_ne!(DNS_RESTORED_AUTOMATIC_PREFIX, DNS_RESTORE_DEGRADED_PREFIX);
+    }
+
+    /// Only adapters Tono redirected may be reset to DHCP. Everything else on the machine is
+    /// the user's own configuration, and an uninstall has no licence to flatten it — least of
+    /// all an adapter whose *original* resolver was a local one (Acrylic, dnscrypt-proxy, a
+    /// Pi-hole), for which loopback is the correct end state and DHCP would be the damage.
+    #[tokio::test]
+    #[serial]
+    async fn the_dhcp_reset_targets_only_adapters_tono_redirected() -> Result<()> {
+        let snapshot = DnsSnapshot {
+            version: SNAPSHOT_VERSION,
+            taken_at: now_unix(),
+            adapters: vec![
+                adapter("{REDIRECTED}", Some("1.1.1.1")),
+                adapter("{OWN-LOCAL-RESOLVER}", Some(LOOPBACK_V4)),
+            ],
+        };
+        atomic_write(&snapshot_path(), &serde_json::to_vec_pretty(&snapshot)?).await?;
+
+        let targets = uninstall_reset_targets().await?;
+
+        assert_eq!(targets, vec!["{REDIRECTED}".to_owned()]);
+        tokio::fs::remove_file(snapshot_path()).await?;
+        Ok(())
+    }
+
+    /// With no readable snapshot the only adapters we may touch are the ones that provably read
+    /// as our own redirect right now. Off Windows the stub enumerates nothing, so the honest
+    /// answer is an empty target list — never "reset everything".
+    #[tokio::test]
+    #[serial]
+    async fn an_unreadable_snapshot_narrows_the_reset_to_provable_redirects() -> Result<()> {
+        atomic_write(&snapshot_path(), b"{ corrupt").await?;
+        assert!(uninstall_reset_targets().await?.is_empty());
+        tokio::fs::remove_file(snapshot_path()).await?;
+        Ok(())
+    }
+
     /// The watchdog may only ever re-apply an existing snapshot. `Reconcile` on a machine with
     /// no snapshot would be an initial enable: it would capture the just-restored resolvers as
     /// "the originals" and point every adapter at a loopback core that is not running.
@@ -2812,6 +3680,99 @@ mod tests {
         Ok(())
     }
 
+    /// The pure half of the P0 fix: what the window says, given only the four observable
+    /// values. In particular an open window that has aged past the cap stops suppressing —
+    /// a leaked depth cannot mute the machine's network events for the life of the service.
+    #[test]
+    fn the_self_write_window_covers_the_apply_and_a_tail_and_then_expires() {
+        let tail = SELF_WRITE_TAIL.as_millis() as u64;
+        let cap = SELF_WRITE_MAX_WINDOW.as_millis() as u64;
+
+        // Nothing open, no tail: every notification is the machine's.
+        assert!(!self_write_window_is_open(10_000, 0, 0, 0));
+        // Open, and young: ours.
+        assert!(self_write_window_is_open(10_000, 1, 9_900, 0));
+        // Closed a moment ago: still inside the tail, because the callback is asynchronous.
+        assert!(self_write_window_is_open(10_000, 0, 9_900, 9_900 + tail));
+        // Past the tail: back to publishing, with no action required from anyone.
+        assert!(!self_write_window_is_open(
+            9_900 + tail,
+            0,
+            9_900,
+            9_900 + tail
+        ));
+        // The belt-and-braces half: a depth that was somehow leaked ages out on its own.
+        assert!(!self_write_window_is_open(10_000 + cap, 1, 10_000, 0));
+        assert!(self_write_window_is_open(10_000 + cap - 1, 1, 10_000, 0));
+    }
+
+    /// The guard is the only writer of the depth, so every exit path closes the window —
+    /// including a panic, which is exactly the case a bare flag would leave latched.
+    #[test]
+    #[serial]
+    fn the_window_cannot_be_left_open_by_a_failed_or_panicking_apply() {
+        let depth_before = SELF_WRITE_DEPTH.load(Ordering::Acquire);
+        {
+            let _window = SelfWriteWindow::open();
+            assert_eq!(SELF_WRITE_DEPTH.load(Ordering::Acquire), depth_before + 1);
+            assert!(in_self_write_window());
+            // Nesting is counted, not latched.
+            {
+                let _inner = SelfWriteWindow::open();
+                assert_eq!(SELF_WRITE_DEPTH.load(Ordering::Acquire), depth_before + 2);
+            }
+            assert_eq!(SELF_WRITE_DEPTH.load(Ordering::Acquire), depth_before + 1);
+            assert!(
+                in_self_write_window(),
+                "the outer window is still open after the inner one closed"
+            );
+        }
+        assert_eq!(SELF_WRITE_DEPTH.load(Ordering::Acquire), depth_before);
+
+        let panicked = std::panic::catch_unwind(|| {
+            let _window = SelfWriteWindow::open();
+            panic!("the apply blew up");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            SELF_WRITE_DEPTH.load(Ordering::Acquire),
+            depth_before,
+            "unwinding through the guard must close the window"
+        );
+    }
+
+    /// The end-to-end shape of the P0: an `enable` applies loopback DNS inside a window, and
+    /// the window is closed again by the time the call returns. A notification arriving during
+    /// the apply is attributable to us; one arriving a second later is the machine's.
+    #[tokio::test]
+    #[serial]
+    async fn the_apply_marks_a_window_and_gives_it_back() -> Result<()> {
+        reset_dns_state().await;
+        assert!(
+            !in_self_write_window(),
+            "no window may be open before the apply"
+        );
+        seed_snapshot(vec![adapter("{A}", Some("9.9.9.9"))]).await?;
+        test_hooks::set_live_dns_on_loopback(false);
+
+        enable().await?;
+
+        assert_eq!(
+            SELF_WRITE_DEPTH.load(Ordering::Acquire),
+            0,
+            "the apply gave the window back"
+        );
+        let suppressed_before = suppressed_self_writes();
+        assert_eq!(
+            note_suppressed_self_write(),
+            suppressed_before + 1,
+            "the diagnostic counter counts what was not published"
+        );
+
+        reset_dns_state().await;
+        Ok(())
+    }
+
     /// Put the DNS globals back where a fresh process would have them; these tests drive the
     /// real facade, and a leaked failure flag or streak would decide the next test's proof.
     async fn reset_dns_state() {
@@ -2824,8 +3785,287 @@ mod tests {
         *DNS_LAST_ERROR
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        PROTECTION_WANTED.store(false, Ordering::Release);
         test_hooks::set_live_dns_on_loopback(false);
         test_hooks::set_live_apply_fails(false);
+        test_hooks::set_apply_batch_unavailable(false);
+        // The tail of an earlier test's write window would otherwise still be running.
+        SELF_WRITE_TAIL_UNTIL.store(0, Ordering::Relaxed);
+    }
+
+    /// Write a snapshot as if a previous enable had taken it, so `enable` takes the replay path
+    /// (the stub engine enumerates nothing, so the adapters have to come from the file).
+    async fn seed_snapshot(adapters: Vec<AdapterDnsSnapshot>) -> Result<()> {
+        atomic_write(
+            &snapshot_path(),
+            &serde_json::to_vec_pretty(&DnsSnapshot {
+                version: SNAPSHOT_VERSION,
+                taken_at: 1,
+                adapters,
+            })?,
+        )
+        .await
+    }
+
+    async fn read_snapshot() -> Result<DnsSnapshot> {
+        let bytes = tokio::fs::read(snapshot_path()).await?;
+        parse_snapshot(&bytes).map_err(|reason| anyhow::anyhow!(reason))
+    }
+
+    /// The note is the whole point of the demotion: it has to name the adapters, the read-back,
+    /// and why an unverifiable configuration is still not a leak — and it must stay silent when
+    /// there is nothing to say.
+    #[test]
+    fn the_unverified_note_names_the_adapters_and_the_read_back() {
+        assert_eq!(
+            unverified_note(&[], 3, LoopbackReadBack::Verified),
+            None,
+            "a clean round must not put a warning in the status payload"
+        );
+        assert_eq!(
+            unverified_note(&[], 0, LoopbackReadBack::NotAttempted),
+            None,
+            "a build with no engine has nothing to report either way"
+        );
+
+        let note = unverified_note(
+            &["{A}".to_owned(), "{B}".to_owned()],
+            5,
+            LoopbackReadBack::Contradicted,
+        )
+        .expect("recorded failures must be reported");
+        assert!(note.contains(DNS_PROTECTION_UNVERIFIED_PREFIX), "{note}");
+        assert!(note.contains("2 of 5"), "{note}");
+        assert!(note.contains("{A}") && note.contains("{B}"), "{note}");
+        assert!(note.contains("read-back=not-protected"), "{note}");
+        assert!(
+            note.contains("WFP blocks DNS") && note.contains("fake-ip"),
+            "the note has to explain why this is not a leak and where the real proof is: {note}"
+        );
+
+        let unreadable = unverified_note(&[], 2, LoopbackReadBack::Unavailable)
+            .expect("a read-back that could not be run is its own state, not a pass");
+        assert!(unreadable.contains("read-back=unreadable"), "{unreadable}");
+
+        let many = unverified_note(
+            &(0..9).map(|index| format!("{{G{index}}}")).collect::<Vec<_>>(),
+            9,
+            LoopbackReadBack::Verified,
+        )
+        .expect("per-adapter failures count even when the read-back is happy");
+        assert!(many.contains("(+5 more)"), "{many}");
+    }
+
+    /// The regression this change exists for: the live apply fails on an adapter, `enable` used
+    /// to abort the whole connect at ~1.1 s with "loopback DNS could not be verified", and the
+    /// fake-ip probe — the only direct proof that the machine's resolver is the tunnel's — never
+    /// ran. Now the round is recorded and the connect proceeds to that proof.
+    #[tokio::test]
+    #[serial]
+    async fn an_unverifiable_apply_is_recorded_rather_than_failing_the_connect() -> Result<()> {
+        reset_dns_state().await;
+        seed_snapshot(vec![
+            adapter("{A}", Some("1.1.1.1")),
+            adapter("{B}", Some("9.9.9.9")),
+        ])
+        .await?;
+        test_hooks::set_live_apply_fails(true);
+
+        let status = enable().await?;
+
+        assert!(
+            status.snapshot_present && status.adapters == 2,
+            "protection is in force and restorable: {status:?}"
+        );
+        let note = status
+            .last_error
+            .clone()
+            .expect("the status must tell the truth about the unverified adapters");
+        assert!(note.contains(DNS_PROTECTION_UNVERIFIED_PREFIX), "{note}");
+        assert!(note.contains("2 of 2"), "{note}");
+        assert!(note.contains("{A}") && note.contains("{B}"), "{note}");
+        assert!(
+            status_is_unverified(&status),
+            "the marker is what the reconciler and the App key off"
+        );
+
+        // Recorded where the restore proof and the next enable will find it.
+        let persisted = read_snapshot().await?;
+        assert!(
+            persisted
+                .adapters
+                .iter()
+                .all(|adapter| adapter.live_apply_failed),
+            "every failed adapter must be flagged in the snapshot: {persisted:?}"
+        );
+        assert_eq!(
+            LIVE_APPLY_FAILURES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "the in-memory record is what survives a snapshot rewrite"
+        );
+        assert_eq!(
+            CONSECUTIVE_LIVE_FAILURES.load(Ordering::Relaxed),
+            1,
+            "the streak the degraded restore exit needs must still advance"
+        );
+
+        reset_dns_state().await;
+        Ok(())
+    }
+
+    /// The line the demotion does **not** cross: a round that produced no per-adapter outcome at
+    /// all — the apply batch could not be run, nothing was written to any adapter — is still a
+    /// hard failure of `enable`. There is nothing to restore from that round, nothing for the
+    /// reconciler to retry, and a status claiming "protected" would be a lie.
+    #[tokio::test]
+    #[serial]
+    async fn enable_still_fails_hard_when_nothing_could_be_applied() -> Result<()> {
+        reset_dns_state().await;
+        seed_snapshot(vec![adapter("{A}", Some("1.1.1.1"))]).await?;
+        test_hooks::set_apply_batch_unavailable(true);
+
+        let error = enable()
+            .await
+            .expect_err("an apply that never ran must not report success");
+        let message = format!("{error:#}");
+        assert!(message.contains("could not be run at all"), "{message}");
+        assert!(
+            !message.contains(DNS_PROTECTION_UNVERIFIED_PREFIX),
+            "this is a failure, not a recorded warning: {message}"
+        );
+        assert_eq!(
+            DNS_LAST_ERROR
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref()
+                .map(|error| error.contains("could not be run at all")),
+            Some(true),
+            "the hard failure still lands in the status payload"
+        );
+        assert!(
+            tokio::fs::metadata(snapshot_path()).await.is_ok(),
+            "the originals are written before the apply and are kept whatever it does"
+        );
+
+        reset_dns_state().await;
+        Ok(())
+    }
+
+    /// Demoting the gate must not stop the retry. The recorded failures are what tell the
+    /// watchdog there is work left — including on a machine whose registry read-back says
+    /// `enabled` — and a repair that still cannot verify counts as a failed round, so the
+    /// backoff and the suspension cap keep applying.
+    #[test]
+    fn the_reconciler_retries_recorded_failures_and_still_backs_off() {
+        let unverified = DnsProtectionStatus {
+            enabled: true,
+            snapshot_present: true,
+            adapters: 1,
+            last_error: unverified_note(&["{A}".to_owned()], 1, LoopbackReadBack::Verified),
+        };
+        assert!(status_is_unverified(&unverified));
+        assert!(
+            needs_reconcile(true, true, true, true),
+            "a recorded live-apply failure is work to do even when the registry looks protected"
+        );
+        assert!(
+            needs_reconcile(true, true, false, false),
+            "drift is still repaired"
+        );
+        assert!(
+            !needs_reconcile(true, true, true, false),
+            "a healthy, verified machine must be left alone"
+        );
+        assert!(
+            !needs_reconcile(false, true, false, true),
+            "intent still gates everything: a snapshot that outlived a disarm is not a reason to \
+             re-apply loopback"
+        );
+        assert!(
+            !needs_reconcile(true, false, false, true),
+            "with no snapshot there is nothing to re-apply"
+        );
+
+        let clean = DnsProtectionStatus {
+            last_error: None,
+            ..unverified
+        };
+        assert!(!status_is_unverified(&clean));
+        assert!(
+            reconcile_backoff(DNS_RECONCILE_MAX_FAILURES).is_none(),
+            "an unverifiable machine must still stop spawning PowerShell eventually"
+        );
+    }
+
+    /// The retry loop end to end: a reconcile round that succeeds clears the note, the snapshot
+    /// flags and the marker, so the watchdog stops repairing instead of looping for ever.
+    #[tokio::test]
+    #[serial]
+    async fn a_successful_reconcile_round_retires_the_unverified_note() -> Result<()> {
+        reset_dns_state().await;
+        seed_snapshot(vec![adapter("{A}", Some("1.1.1.1"))]).await?;
+        test_hooks::set_live_apply_fails(true);
+        let failed = enable().await?;
+        assert!(status_is_unverified(&failed));
+
+        // The next round gets through (the transient PowerShell/CIM failure cleared).
+        test_hooks::set_live_apply_fails(false);
+        let repaired = enable_unlocked(EnableTrigger::Reconcile).await?;
+
+        assert!(
+            !status_is_unverified(&repaired),
+            "a repaired round must retire the note: {repaired:?}"
+        );
+        assert_eq!(repaired.last_error, None);
+        assert!(
+            !read_snapshot()
+                .await?
+                .adapters
+                .iter()
+                .any(|adapter| adapter.live_apply_failed),
+            "the recovered adapter's flag must be cleared on disk too"
+        );
+        assert!(
+            LIVE_APPLY_FAILURES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+
+        reset_dns_state().await;
+        Ok(())
+    }
+
+    /// The demotion is one-directional. Whatever `enable` now tolerates, the restore keeps its
+    /// proof — it is the gate that decides whether WFP may be disarmed — including the live-state
+    /// check: a machine that is provably still on the loopback resolver is refused even though
+    /// the enable that put it there reported success.
+    #[tokio::test]
+    #[serial]
+    async fn a_demoted_enable_does_not_soften_the_restore_proof() -> Result<()> {
+        reset_dns_state().await;
+        seed_snapshot(vec![adapter("{A}", Some("1.1.1.1"))]).await?;
+        test_hooks::set_live_apply_fails(true);
+        let enabled = enable().await?;
+        assert!(status_is_unverified(&enabled), "{enabled:?}");
+
+        // The machine is still resolving through the loopback core when Disconnect is clicked.
+        test_hooks::set_live_dns_on_loopback(true);
+        let error = restore_protected()
+            .await
+            .expect_err("the restore proof must be exactly as strict as before");
+        let message = format!("{error:#}");
+        assert!(message.contains("still_on_loopback=yes"), "{message}");
+        assert!(
+            tokio::fs::metadata(snapshot_path()).await.is_ok(),
+            "a refused restore keeps its snapshot, which keeps the kill switch armed"
+        );
+
+        reset_dns_state().await;
+        Ok(())
     }
 
     /// The real-machine regression, end to end. `securingDNS` aside, this is the half that

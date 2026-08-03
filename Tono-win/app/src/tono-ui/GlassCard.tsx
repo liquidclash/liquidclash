@@ -45,8 +45,8 @@ export const GlassCard = ({
         boxShadow: dark
           ? '0 20px 48px -32px rgba(0,0,0,0.75), inset 0 1px 0 rgba(255,255,255,0.04)'
           : '0 20px 48px -32px rgba(55,72,110,0.3), inset 0 1px 0 rgba(255,255,255,0.5)',
-        backdropFilter: 'blur(12px) saturate(1.08)',
-        WebkitBackdropFilter: 'blur(12px) saturate(1.08)',
+        backdropFilter: 'var(--tono-glass-blur)',
+        WebkitBackdropFilter: 'var(--tono-glass-blur)',
         ...style,
       }}
     >

@@ -266,6 +266,110 @@ async fn recover_tono_state(app_handle: AppHandle, first_error: String) {
     handle::Handle::notice_message("tono_state_init_failed_permanently", error);
 }
 
+/// How often the Tauri main thread is probed, and how long a probe may take before it is logged.
+///
+/// On Windows "(Not Responding)" means exactly one thing: the thread that owns the top-level
+/// window stopped servicing its message queue for ~5 s. Two real-machine reports showed that
+/// title in states where nothing in this process should have been waiting on anything — and a
+/// screenshot cannot tell a blocked native main thread apart from a wedged WebView2 renderer,
+/// because both produce the identical title bar. This probe settles it from the app's own log:
+/// a `run_on_main_thread` round trip can only complete while the event loop is pumping, so a gap
+/// here *is* a stalled pump, and the absence of a gap across a reported freeze rules the main
+/// thread out and points at the WebView.
+///
+/// The threshold is deliberately well under the ~5 s at which Windows starts ghosting the
+/// window, so a stall is recorded before the user can see it and can be lined up with the
+/// connect-stage lines already in the same log.
+const MAIN_THREAD_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const MAIN_THREAD_STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a *visible* window may go without calling `tono_status` before the WebView is
+/// reported as the stuck side. `useTonoStatus` polls every 5 s while visible (plus a read per
+/// status push), so this is several missed polls, not a tight race.
+const FRONTEND_SILENCE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Log which side of the app — the native main thread or the WebView — has stopped running.
+///
+/// Costs one cross-thread dispatch per second and nothing else; it never touches product state,
+/// so it cannot itself become the thing that blocks.
+async fn main_thread_pump_watchdog(app_handle: AppHandle) {
+    let mut interval = tokio::time::interval(MAIN_THREAD_PROBE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut frontend_reported = false;
+    loop {
+        interval.tick().await;
+        if handle::Handle::global().is_exiting() {
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let probe_handle = app_handle.clone();
+        let sent_at = std::time::Instant::now();
+        // The visibility read rides along inside the dispatched closure: it is already on the
+        // main thread there, so it costs nothing extra and can never add a blocking round trip.
+        if app_handle
+            .run_on_main_thread(move || {
+                let visible = probe_handle
+                    .get_webview_window("main")
+                    .and_then(|window| window.is_visible().ok())
+                    .unwrap_or(false);
+                let _ = tx.send(visible);
+            })
+            .is_err()
+        {
+            // The event loop is gone (exit); there is nothing left to watch.
+            return;
+        }
+
+        let mut landed = std::pin::pin!(rx);
+        let visible = match tokio::time::timeout(MAIN_THREAD_STALL_THRESHOLD, landed.as_mut()).await {
+            Ok(Ok(visible)) => visible,
+            // Sender dropped: the loop tore the dispatch down, i.e. we are shutting down.
+            Ok(Err(_)) => return,
+            Err(_) => {
+                logging!(
+                    warn,
+                    Type::System,
+                    "Main thread pump STALLED: no dispatch ran in {MAIN_THREAD_STALL_THRESHOLD:?}. \
+                     A freeze reported around this timestamp is on the native side, not in the WebView"
+                );
+                let Ok(visible) = landed.await else {
+                    return;
+                };
+                logging!(
+                    warn,
+                    Type::System,
+                    "Main thread pump resumed after {:?}",
+                    sent_at.elapsed()
+                );
+                visible
+            }
+        };
+
+        // The pump answered, so the native side is healthy. If a visible window has also stopped
+        // making its scheduled status call, the WebView is the stuck side.
+        match tono::commands::frontend_ipc_silence() {
+            Some(silence) if visible && silence >= FRONTEND_SILENCE_THRESHOLD => {
+                if !frontend_reported {
+                    frontend_reported = true;
+                    logging!(
+                        warn,
+                        Type::Frontend,
+                        "WebView STALLED: main thread is pumping but the visible window has not called \
+                         tono_status for {silence:?}. A freeze reported around this timestamp is in the \
+                         WebView, not on the native side"
+                    );
+                }
+            }
+            _ => {
+                if frontend_reported {
+                    frontend_reported = false;
+                    logging!(info, Type::Frontend, "WebView resumed calling tono_status");
+                }
+            }
+        }
+    }
+}
+
 /// Everything that must still happen once exit is *committed* (`RunEvent::Exit`).
 ///
 /// Deliberately a plain async fn so it can be driven on the async runtime rather than on the
@@ -380,6 +484,12 @@ pub fn run() {
                 logging!(info, Type::Setup, "初始化已启动");
             })) {
                 log_setup_panic("window-core", panic);
+            }
+
+            // Which side is stuck when the window says "(Not Responding)" — see the constants.
+            {
+                let app_handle = app.app_handle().clone();
+                AsyncHandler::spawn(move || main_thread_pump_watchdog(app_handle));
             }
 
             // Tono product layer: state injection + startup session restore.
@@ -639,6 +749,41 @@ mod exit_budget_tests {
         assert!(
             EXIT_CLEANUP_BUDGET > inner,
             "EXIT_CLEANUP_BUDGET ({EXIT_CLEANUP_BUDGET:?}) must exceed the inner budgets it covers ({inner:?})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pump_watchdog_tests {
+    use super::{
+        FRONTEND_SILENCE_THRESHOLD, MAIN_THREAD_PROBE_INTERVAL, MAIN_THREAD_STALL_THRESHOLD,
+    };
+
+    /// Windows ghosts a window ("Not Responding") after roughly five seconds without a pumped
+    /// message. The watchdog is only useful if it records the stall *before* the user can see it,
+    /// and it can only do that if a probe is outstanding when the stall begins.
+    #[test]
+    fn stall_is_recorded_before_windows_ghosts_the_window() {
+        const WINDOWS_HUNG_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        assert!(
+            MAIN_THREAD_PROBE_INTERVAL < MAIN_THREAD_STALL_THRESHOLD,
+            "a probe must be in flight more often than the stall it reports"
+        );
+        assert!(
+            MAIN_THREAD_PROBE_INTERVAL + MAIN_THREAD_STALL_THRESHOLD < WINDOWS_HUNG_WINDOW_TIMEOUT,
+            "worst-case detection ({:?}) must land before Windows marks the window unresponsive",
+            MAIN_THREAD_PROBE_INTERVAL + MAIN_THREAD_STALL_THRESHOLD
+        );
+    }
+
+    /// The WebView-side signal is `useTonoStatus`'s 5 s safety-net poll. The threshold must allow
+    /// several missed polls, or ordinary scheduling jitter would be reported as a stall.
+    #[test]
+    fn frontend_silence_threshold_allows_several_missed_polls() {
+        const FRONTEND_STATUS_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+        assert!(
+            FRONTEND_SILENCE_THRESHOLD >= FRONTEND_STATUS_POLL * 3,
+            "FRONTEND_SILENCE_THRESHOLD ({FRONTEND_SILENCE_THRESHOLD:?}) must cover several missed {FRONTEND_STATUS_POLL:?} polls"
         );
     }
 }

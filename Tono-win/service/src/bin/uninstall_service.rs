@@ -17,6 +17,17 @@ use shared::{enter_repair_gate, run_maintenance_if_requested};
 /// How Windows cleanup ended. `main` maps this onto the exit-code contract with the NSIS
 /// uninstall macro, which must only block when the machine cannot be proven safe; the mapping
 /// is a pure, tested function rather than an implicit process exit.
+///
+/// **What "safe" means here, and what it used to mean.** This helper used to refuse the whole
+/// uninstall unless the network was *provably* restored to the user's exact prior DNS
+/// configuration. On a machine whose live CIM/netsh apply keeps failing that proof is never
+/// obtainable, so the refusal fired every time and produced an **application that cannot be
+/// uninstalled** — the failure this ladder exists to correct. The danger being guarded against
+/// is real, but it is narrower than the guard was: what must never happen is *removing the app
+/// while leaving persistent WFP filters armed*, i.e. a blocked machine with no software left to
+/// unblock it. That is now the whole of the blocking condition. An inexact resolver is not a
+/// blocked machine: the user can change DNS from Windows' own network settings, and cannot
+/// conjure back an uninstaller that refuses to run.
 #[cfg(any(windows, test))]
 #[derive(Debug)]
 enum CleanupOutcome {
@@ -25,25 +36,83 @@ enum CleanupOutcome {
     /// The disarm was proven, but a cosmetic step (SCM record or binary removal) failed.
     /// Removing further files is safe; the leftovers neither protect nor block anything.
     CosmeticFailure(Error),
-    /// Cleanup could not prove the network was restored. The kill switch stays armed and every
-    /// recovery file was preserved; only this outcome may block an uninstall.
+    /// Rung 2 of the DNS ladder: the WFP filters are gone and the affected adapters were reset
+    /// to automatic (DHCP) DNS because the saved servers could not be proven restored. The
+    /// machine is neither blocked nor redirected, so the uninstall **continues**; the deviation
+    /// is reported so the installer can log it.
+    RestoredToAutomatic(Error),
+    /// Cleanup could not prove the machine is unblocked. The recovery files were preserved;
+    /// only this outcome may block an uninstall.
     StillProtected(Error),
 }
 
-/// Exit-code contract with `installer.nsi` (`RemoveVergeService`): 0 continues, 2 continues
-/// with a warning, 3 — like every other non-zero result, including nsExec's "error"/"timeout"
-/// strings — blocks the uninstall because the machine is still protected.
+/// Exit-code contract with `installer.nsi` (`RemoveVergeService`):
+///   0 — clean; continue.
+///   2 — network restored, cosmetic debris remains; continue with a log line.
+///   4 — WFP removed, DNS reset to automatic (DHCP) instead of the exact saved servers;
+///       continue with a log line.
+///   3 — and every other non-zero result, including nsExec's "error"/"timeout" strings and a
+///       plain `anyhow` exit 1: blocks, because nothing showed the machine was made safe.
+/// Unknown results must keep blocking; that discipline is the reason the codes are explicit and
+/// the mapping is tested.
 #[cfg(any(windows, test))]
 const EXIT_COSMETIC_FAILURE: i32 = 2;
 #[cfg(any(windows, test))]
 const EXIT_STILL_PROTECTED: i32 = 3;
+#[cfg(any(windows, test))]
+const EXIT_RESTORED_AUTOMATIC: i32 = 4;
+
+/// The marker `dns::DNS_RESTORED_AUTOMATIC_PREFIX` puts in the disarm error when the ladder
+/// reached rung 2. Duplicated as a literal on purpose — the constant is `pub(crate)` in the
+/// library, and this is the same cross-boundary marker convention the App already uses for
+/// `TONO_WFP_ENGINE_WEDGED` (`app/src-tauri/src/tono/connection.rs`). Matched by substring,
+/// because every layer wraps the message in its own context.
+#[cfg(any(windows, test))]
+const DNS_RESTORED_AUTOMATIC_MARKER: &str = "TONO_DNS_RESTORED_AUTOMATIC";
+
+/// Environment variable that opts this process into the uninstall-only DNS escalation ladder.
+/// Must match `windows_kill_switch::UNINSTALL_LADDER_ENV`. Set in this process image only, so
+/// the Service and the App never inherit it.
+#[cfg(any(windows, test))]
+const UNINSTALL_LADDER_ENV: &str = "TONO_UNINSTALL_DNS_LADDER";
 
 #[cfg(any(windows, test))]
 fn cleanup_exit_code(outcome: &CleanupOutcome) -> i32 {
     match outcome {
         CleanupOutcome::Clean => 0,
         CleanupOutcome::CosmeticFailure(_) => EXIT_COSMETIC_FAILURE,
+        CleanupOutcome::RestoredToAutomatic(_) => EXIT_RESTORED_AUTOMATIC,
         CleanupOutcome::StillProtected(_) => EXIT_STILL_PROTECTED,
+    }
+}
+
+/// Whether an exit code lets the NSIS macro proceed with deleting the application.
+///
+/// The invariant, stated once and asserted in the tests: an uninstall may only continue on an
+/// outcome whose *precondition is that the WFP filters are gone*. `Clean` and
+/// `CosmeticFailure` are reached only after a proven disarm; `RestoredToAutomatic` is reached
+/// only from a disarm error carrying the rung-2 marker, and
+/// `windows_kill_switch::emergency_disarm_windows_kill_switch` produces that marker strictly
+/// after the WFP objects have been deleted. Everything else blocks.
+///
+/// It lives here rather than only in `installer.nsi` so the rule is stated in a language that
+/// can enumerate the outcome space; the macro's `$0 != "0"` fallthrough is its mirror image,
+/// and the tests below cover the unknown-result case that fallthrough has to catch.
+#[cfg(test)]
+fn uninstall_may_continue(exit_code: i32) -> bool {
+    matches!(exit_code, 0 | EXIT_COSMETIC_FAILURE | EXIT_RESTORED_AUTOMATIC)
+}
+
+/// Classify the disarm result. The *only* thing that downgrades a disarm failure from blocking
+/// to continue-with-warning is the rung-2 marker; anything else — a wedged WFP engine, a failed
+/// tombstone write, rung 3, an unrecognised message — stays blocking, because none of those can
+/// show that the barrier was removed.
+#[cfg(any(windows, test))]
+fn classify_disarm_failure(error: Error) -> CleanupOutcome {
+    if format!("{error:#}").contains(DNS_RESTORED_AUTOMATIC_MARKER) {
+        CleanupOutcome::RestoredToAutomatic(error)
+    } else {
+        CleanupOutcome::StillProtected(error)
     }
 }
 
@@ -212,10 +281,20 @@ fn main() -> anyhow::Result<()> {
             );
             std::process::exit(code);
         }
+        CleanupOutcome::RestoredToAutomatic(error) => {
+            eprintln!(
+                "The network barrier was removed, but the saved DNS servers could not be proven \
+                 restored, so the affected adapters were set back to automatic (DHCP) instead. \
+                 The machine is neither blocked nor pointed at Tono's resolver, so the uninstall \
+                 continues; DNS now comes from the network rather than from the exact previous \
+                 configuration: {error:#}"
+            );
+            std::process::exit(code);
+        }
         CleanupOutcome::StillProtected(error) => {
             eprintln!(
-                "Cleanup could not prove the network was restored; the kill switch stays armed \
-                 and all recovery files were preserved: {error:#}"
+                "Cleanup could not prove this machine was made safe, so nothing was deleted and \
+                 all recovery files were preserved: {error:#}"
             );
             std::process::exit(code);
         }
@@ -279,6 +358,17 @@ fn windows_cleanup() -> CleanupOutcome {
         return CleanupOutcome::StillProtected(error);
     }
 
+    // Opt this process — and only this process — into the DNS escalation ladder before the
+    // disarm. Without it the library keeps the strict "prove the exact restore or refuse"
+    // behaviour that made this application impossible to uninstall on a machine whose live DNS
+    // apply keeps failing; with it, an unprovable exact restore escalates to automatic (DHCP)
+    // and the uninstall continues. The variable is scoped to this process image, so the Service
+    // and the App can never inherit it.
+    //
+    // SAFETY: single-threaded at this point — the tokio runtime below is built after this, and
+    // nothing else in this binary reads or writes the environment concurrently.
+    unsafe { std::env::set_var(UNINSTALL_LADDER_ENV, "1") };
+
     // The helper links the same recovery library as the service binary, so cleanup does not
     // depend on an intact installed `tono-service.exe` and cannot pipe-wait on a child process.
     // The owner lock proves no standalone daemon/core still owns the WFP and DNS state.
@@ -310,13 +400,33 @@ fn windows_cleanup() -> CleanupOutcome {
             clash_verge_service_ipc::emergency_disarm_windows_kill_switch().await
         })
     })();
-    if let Err(error) = disarm {
-        return CleanupOutcome::StillProtected(error);
+    // The escalation ladder collapses back into two questions here: are the WFP filters gone,
+    // and if the exact DNS restore failed, is the machine at least off Tono's resolver? Only
+    // the marker answers "yes" to both without an exact restore, and it can only be produced
+    // after the filters were deleted — so `RestoredToAutomatic` continues while every other
+    // failure still blocks with every recovery file preserved.
+    let dns_fallback = match disarm {
+        Ok(()) => None,
+        Err(error) => match classify_disarm_failure(error) {
+            CleanupOutcome::RestoredToAutomatic(error) => {
+                eprintln!(
+                    "Kill switch was disarmed; the saved DNS servers could not be proven \
+                     restored, so the affected adapters were reset to automatic (DHCP): \
+                     {error:#}"
+                );
+                Some(error)
+            }
+            blocking => return blocking,
+        },
+    };
+    if dns_fallback.is_none() {
+        println!("Kill switch was disarmed and protected DNS restore was verified.");
     }
-    println!("Kill switch was disarmed and protected DNS restore was verified.");
 
-    // Only cosmetic state remains. A failure below must not block the uninstall: the network
-    // is provably restored, and nothing left behind protects or blocks anything.
+    // Only cosmetic state remains. A failure below must not block the uninstall: the machine is
+    // provably unblocked, and nothing left behind protects or blocks anything. A cosmetic
+    // failure is reported *instead of* the DNS fallback: both continue, and the leftovers are
+    // the thing a future install has to act on.
     if let Some(service) = service {
         if let Err(error) = service.delete() {
             return CleanupOutcome::CosmeticFailure(error.into());
@@ -342,7 +452,10 @@ fn windows_cleanup() -> CleanupOutcome {
         }
     }
     match remove_windows_service_binary() {
-        Ok(()) => CleanupOutcome::Clean,
+        Ok(()) => match dns_fallback {
+            None => CleanupOutcome::Clean,
+            Some(error) => CleanupOutcome::RestoredToAutomatic(error),
+        },
         Err(error) => CleanupOutcome::CosmeticFailure(error),
     }
 }
@@ -386,7 +499,9 @@ fn remove_windows_service_binary() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CleanupOutcome, EXIT_COSMETIC_FAILURE, EXIT_STILL_PROTECTED, cleanup_exit_code, poll_until,
+        CleanupOutcome, DNS_RESTORED_AUTOMATIC_MARKER, EXIT_COSMETIC_FAILURE,
+        EXIT_RESTORED_AUTOMATIC, EXIT_STILL_PROTECTED, classify_disarm_failure, cleanup_exit_code,
+        poll_until, uninstall_may_continue,
     };
     use std::cell::Cell;
 
@@ -413,6 +528,108 @@ mod tests {
         assert_eq!(code, EXIT_STILL_PROTECTED);
         assert_ne!(code, 0);
         assert_ne!(code, 1);
+    }
+
+    // --- The escalation ladder ---
+
+    /// Rung 2 needs an exit code of its own: distinct from clean, from cosmetic debris, from the
+    /// blocking code, and from the `anyhow` exit 1 — but on the continuing side of the line.
+    #[test]
+    fn restored_to_automatic_is_a_distinct_continuing_exit_code() {
+        let code = cleanup_exit_code(&CleanupOutcome::RestoredToAutomatic(anyhow::anyhow!(
+            "{DNS_RESTORED_AUTOMATIC_MARKER}: reset to DHCP"
+        )));
+        assert_eq!(code, EXIT_RESTORED_AUTOMATIC);
+        for other in [0, 1, EXIT_COSMETIC_FAILURE, EXIT_STILL_PROTECTED] {
+            assert_ne!(code, other);
+        }
+        assert!(uninstall_may_continue(code));
+    }
+
+    /// Rung 2 is reached only on the marker the library emits *after* deleting the WFP objects.
+    #[test]
+    fn only_the_rung_two_marker_downgrades_a_disarm_failure_to_continue() {
+        let outcome = classify_disarm_failure(anyhow::anyhow!(
+            "WFP was removed and 2 adapter(s) were set back to automatic (DHCP) DNS"
+        )
+        .context(format!("{DNS_RESTORED_AUTOMATIC_MARKER}: uninstall fallback")));
+        assert!(matches!(outcome, CleanupOutcome::RestoredToAutomatic(_)));
+        assert!(uninstall_may_continue(cleanup_exit_code(&outcome)));
+    }
+
+    /// Everything that is not the marker keeps blocking: rung 3, a wedged WFP engine, a failed
+    /// tombstone write, and any message this build does not recognise. None of them can show the
+    /// barrier was removed, and an uninstall that continues on them is exactly the "app removed,
+    /// filters left armed" end state the ladder must never produce.
+    #[test]
+    fn every_unmarked_disarm_failure_still_blocks() {
+        for message in [
+            "TONO_DNS_STILL_ON_LOOPBACK: could not be taken off the loopback resolver",
+            "TONO_WFP_ENGINE_WEDGED: the WFP engine did not answer",
+            "TONO_DNS_RESTORE_STALLED: DNS restore did not answer",
+            "failed to write the disarm tombstone",
+            "some future error nobody has written yet",
+            "",
+        ] {
+            let outcome = classify_disarm_failure(anyhow::anyhow!("{message}"));
+            assert!(
+                matches!(outcome, CleanupOutcome::StillProtected(_)),
+                "{message} must not be read as a proven-safe machine"
+            );
+            let code = cleanup_exit_code(&outcome);
+            assert_eq!(code, EXIT_STILL_PROTECTED, "{message}");
+            assert!(!uninstall_may_continue(code), "{message}");
+        }
+    }
+
+    /// The invariant, asserted over the whole outcome space rather than per case: every outcome
+    /// the uninstall may continue on is one whose precondition is that the WFP filters are gone.
+    /// `Clean` and `CosmeticFailure` are only constructed after a successful disarm;
+    /// `RestoredToAutomatic` only from the marker, which the library emits strictly after the
+    /// WFP objects were deleted. `StillProtected` — the one outcome that can be reached while
+    /// filters may still be installed — is the one that blocks.
+    #[test]
+    fn no_continuing_outcome_can_leave_wfp_filters_installed() {
+        let outcomes = [
+            CleanupOutcome::Clean,
+            CleanupOutcome::CosmeticFailure(anyhow::anyhow!("leftover")),
+            CleanupOutcome::RestoredToAutomatic(anyhow::anyhow!(
+                "{DNS_RESTORED_AUTOMATIC_MARKER}: reset to DHCP"
+            )),
+            CleanupOutcome::StillProtected(anyhow::anyhow!("armed")),
+        ];
+        for outcome in &outcomes {
+            let wfp_proven_removed = !matches!(outcome, CleanupOutcome::StillProtected(_));
+            assert_eq!(
+                uninstall_may_continue(cleanup_exit_code(outcome)),
+                wfp_proven_removed,
+                "{outcome:?} continues if and only if the barrier is proven gone"
+            );
+        }
+    }
+
+    /// nsExec hands back "error"/"timeout" strings and future builds may add codes; anything the
+    /// macro cannot place must block. This mirrors `installer.nsi`'s `$0 != "0"` fallthrough.
+    #[test]
+    fn unknown_results_never_read_as_permission_to_continue() {
+        for code in [1, 5, 6, 100, 3010, -1] {
+            assert!(!uninstall_may_continue(code), "exit {code} must block");
+        }
+    }
+
+    /// The marker literal is a cross-binary contract with `dns.rs`; a silent rename on either
+    /// side turns rung 2 back into a refusal and the app back into something unremovable.
+    #[test]
+    fn the_rung_two_marker_literal_is_the_documented_one() {
+        assert_eq!(DNS_RESTORED_AUTOMATIC_MARKER, "TONO_DNS_RESTORED_AUTOMATIC");
+    }
+
+    /// Same contract in the other direction: the ladder only runs if this process image sets the
+    /// exact variable `windows_kill_switch::UNINSTALL_LADDER_ENV` reads. A mismatch silently
+    /// restores the old refuse-forever behaviour.
+    #[test]
+    fn the_uninstall_ladder_opt_in_matches_the_library() {
+        assert_eq!(super::UNINSTALL_LADDER_ENV, "TONO_UNINSTALL_DNS_LADDER");
     }
 
     #[test]

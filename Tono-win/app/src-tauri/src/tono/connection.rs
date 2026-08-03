@@ -63,16 +63,92 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 /// §6.7/§6.8 retry counts.
 const VERIFY_ATTEMPTS: u32 = 3;
 const VERIFY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// C2 — §6.8 exit-probe budgets. The generated runtime sets `unified-delay: true`
+/// (`crates/tono-core/src/config.rs`), under which mihomo performs the measured request **twice**
+/// inside the single `timeout` the delay endpoint is handed. On a distant REALITY exit one
+/// request is realistically 1.5–3.5 s, so the old 5 s core budget was marginal for the pair and
+/// routinely lost to the client's own 6 s ceiling — which discarded mihomo's diagnosis and
+/// reported a transport timeout instead. 8 s gives the doubled request room.
+const EXIT_PROBE_CORE_TIMEOUT_MS: u64 = 8_000;
+/// The HTTP client must always outlast the core budget by a real margin, so the *core* decides
+/// the verdict of an exit probe. 3 s over the core budget covers the loopback round trip, the
+/// core's scheduling, and the JSON reply.
+const EXIT_PROBE_CLIENT_TIMEOUT: Duration = Duration::from_secs(11);
+/// Whole-stage ceiling for one `checkingExit` pass. `VERIFY_ATTEMPTS` full-length attempts would
+/// be 34.5 s — a quarter of the transaction on their own — so the stage refuses to *start* an
+/// attempt the remaining budget cannot hold (fast failures, e.g. a 504, still get all three).
+const EXIT_PROBE_STAGE_TIMEOUT: Duration = Duration::from_secs(24);
+/// Every other controller call keeps the original general budget: `/version` polls are bounded
+/// far tighter by `CONTROLLER_POLL_TIMEOUT`, and a cloud-policy `/dns/query` must not be able to
+/// spend an exit-probe-sized slice of the transaction.
+const CONTROLLER_HTTP_TIMEOUT: Duration = Duration::from_secs(6);
+/// V1/H1 — §6.9 kill-switch verification retries. `KillSwitchStatus.live` on Windows is not a
+/// live query: it is a ~1.5 s-decaying cache refreshed by a 1 s loop, so one slow-but-successful
+/// verify reads `live: false` and fails a healthy tunnel. Every other stage retries (`lock` 50×,
+/// `probe_exit` 3×, `verify_fake_ip` 3×, `wait_controller` 64×); the only stage reading a
+/// time-decayed field retried zero times. The window deliberately spans more than one full
+/// refresh period, so the verdict is never decided by a single sample of a decaying value.
+const VERIFY_LOCK_ATTEMPTS: u32 = 4;
+const VERIFY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(700);
+/// C3 — `checkingExit` + `verifyingTraffic` form one retryable *verification* group.
+///
+/// At that point the barrier is locked and the tunnel is proven up, but `session_verified` is
+/// still false (it is committed only after both stages pass), so `plan_failure(armed = true,
+/// session_verified = false, ..)` resolves to `FullRelease` — and `next_reconnect_delay()`
+/// then requires `is_protection_blocked && session_verified`, both false, so nothing retries.
+/// One transient 504 took the user from a working tunnel to NotConnected with no recovery.
+///
+/// The retry therefore belongs **before** the full release, inside the still-live transaction:
+/// the decision table, the verification latch, and the release rules are untouched, and an
+/// exhausted group still falls through to exactly the old `FullRelease`.
+const POST_LOCK_VERIFY_ROUNDS: u32 = 2;
+const POST_LOCK_VERIFY_ROUND_DELAY: Duration = Duration::from_secs(1);
 /// `lookup_host` delegates to the OS resolver and has no Tokio timeout of its own. Bound every
 /// lookup so a broken adapter/resolver cannot strand Connecting forever.
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// One absolute budget covers service readiness, both possible Core starts (cold WinTUN + WFP),
-/// controller/DNS verification, cloud-policy re-arm, and locking. Per-stage retries never reset
-/// this clock. 45 s was too tight on real Windows: a first StartClash alone can approach the
-/// Service's 60 s handler budget, and a cloud-policy second StartClash plus DNS would then race
-/// the absolute deadline and look like a hang/failure even when the backend was still making
-/// progress. 120 s keeps UI bounded while matching cold first-connect reality.
-const CONNECT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
+/// controller/DNS verification, cloud-policy re-arm, locking, and the post-lock verification
+/// group. Per-stage retries never reset this clock.
+///
+/// C4 — 120 s did not cover a real cold first connect. It was sized while the DNS stage still
+/// failed fast; once DNS starts *succeeding* (10–30 s of PowerShell) the sum crosses 120 s right
+/// at the exit check, and a timeout there lands on the same no-retry path C3 describes. The
+/// accounting below is per-leg worst case, machine-checked by `CONNECT_BUDGET_LEGS`:
+///
+/// | leg                                                    | worst |
+/// |--------------------------------------------------------|-------|
+/// | service readiness probe                                  |   3 s |
+/// | StartClash #1 — cold WinTUN install + WFP arm             |  60 s | Service handler budget
+/// | controller readiness (`CONTROLLER_READY_TIMEOUT`)         |  15 s |
+/// | lock ladder (`LOCK_ATTEMPTS` × `LOCK_RETRY_INTERVAL`)     |  10 s |
+/// | cloud policy — `/dns/query` + StartClash #2 + relock      |  35 s |
+/// | securingDNS — PowerShell batches + read-back              |  30 s |
+/// | fake-ip verification (3 × (2 s + 0.5 s))                  |   8 s |
+/// | checkingExit (`EXIT_PROBE_STAGE_TIMEOUT`)                 |  24 s |
+/// | verifyingTraffic (`VERIFY_LOCK_ATTEMPTS` × IPC + 0.7 s)   |   5 s |
+/// | C3 second verification round + round delay                |  30 s |
+/// | MarkVerified commit IPC                                   |   5 s |
+/// | **total**                                                 | 225 s |
+///
+/// 240 s leaves margin over that sum. It is a backstop for a wedged stage, not an expected
+/// duration: every leg above has its own tighter budget, so a real hang surfaces as that stage's
+/// error long before this deadline — whose own expiry is the one failure with no retry left.
+const CONNECT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(240);
+/// The accounting table above, machine-checked by `connect_budget_covers_a_cold_first_connect`.
+#[cfg(test)]
+const CONNECT_BUDGET_LEGS: [(&str, u64); 11] = [
+    ("service readiness", 3),
+    ("StartClash #1 (cold WinTUN + WFP arm)", 60),
+    ("controller readiness", 15),
+    ("lock ladder", 10),
+    ("cloud policy (StartClash #2 + relock)", 35),
+    ("securingDNS", 30),
+    ("fake-ip verification", 8),
+    ("checkingExit", 24),
+    ("verifyingTraffic", 5),
+    ("C3 second verification round", 30),
+    ("MarkVerified commit", 5),
+];
 /// The redacted runtime copy is a diagnostics convenience, but it lands under `%APPDATA%`,
 /// which enterprise policy can redirect to a UNC share or a sync-provider placeholder folder.
 /// `OpenOptions::open`/`write_all` then have no timeout of their own, so an offline share can
@@ -81,13 +157,32 @@ const CONNECT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const REDACTED_COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// UI budget for an explicit release. The ordered DNS → Core → WFP sequence runs in a detached
 /// reconciliation task, so reaching this budget stops waiting but never cancels a safety step.
-const EXPLICIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// D1 — 30 s was below the Service's own reality, so the user was told the disconnect had failed
+/// while the detached worker completed fine seconds later. One Service-side release runs a DNS
+/// restore (two 10 s PowerShell batches plus two 25 s-budgeted engine reads, Service-side leg
+/// budget 40 s — `service/src/core/dns.rs` / `windows_kill_switch::DNS_RESTORE_TIMEOUT`), a core
+/// stop (≤ 3 s plus a watchdog join) and a WFP transaction. 40 + 3 + ~12 of stop/WFP/IPC
+/// overhead ⇒ 55 s, which must stay strictly under the IPC client's own 65 s
+/// (`service/src/client/mod.rs` `LIFECYCLE_TIMEOUT`) so a genuine hang is reported by the client
+/// with its real cause rather than by this UI deadline.
+const EXPLICIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(55);
+/// The IPC client's own lifecycle budget. Mirrored here only so the invariant
+/// `EXPLICIT_RELEASE_TIMEOUT < LIFECYCLE_TIMEOUT` is asserted rather than assumed.
+#[cfg(test)]
+const SERVICE_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(65);
 /// The WFP model has a hard endpoint budget. The runtime DIRECT plan and its permits must be
 /// generated from the same complete set; silently truncating only the permits creates selective
 /// blackholes that look like random application hangs.
 const MAX_DIRECT_ENDPOINTS: usize = 256;
 /// network_events poll cadence while Connected.
 const NETWORK_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
+/// H4: consecutive *quiet* missing-core samples before a core change is believed. The Service's
+/// `/status` reports `core_pid: None, restart_count: 0` on a non-error path — whenever its
+/// per-poll `is_active` check reads `Ok(None)` it considers the session inactive — so a single
+/// such sample must not be able to tear a healthy tunnel down. Same treatment as `core_is_gone`
+/// in `core/runstate/owner.rs`.
+const CORE_MISSING_SUSTAINED_SAMPLES: u32 = 2;
 /// P0-13: bursts of network events inside this window merge into a single
 /// invalidation (interface-level filtering — GetBestRoute2 — is the
 /// documented follow-up; the debounce covers the common route-flap storm).
@@ -96,7 +191,139 @@ const NETWORK_EVENT_DEBOUNCE: Duration = Duration::from_secs(2);
 /// lesson — a silent tunnel must be caught by probing, not by watching).
 const EXIT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
 /// F2: consecutive failures before the tunnel is declared dead.
+///
+/// H7 — the threshold's premise ("two consecutive failures ≈ 4 s of sustained failure") holds
+/// only because the monitor's interval uses [`MissedTickBehavior::Delay`]. Under the default
+/// `Burst`, a tick that overran (each tick makes two named-pipe round trips, and the Windows pipe
+/// connect is synchronous and bounded only by a 30 s guard) is followed by the next tick ~0 ms
+/// later, so two samples milliseconds apart could read the *same* stale value and tear down a
+/// healthy tunnel. Never build the monitor's interval anywhere but [`monitor_interval`].
 pub const HEALTH_FAILURE_THRESHOLD: u32 = 2;
+
+/// The connected-lifetime monitor's tick source (H7). `Delay` re-bases the schedule after a slow
+/// tick, so every threshold in [`HealthLegs`] counts genuinely *separate* observations spaced by
+/// at least [`NETWORK_MONITOR_INTERVAL`]. `app/src-tauri/src/lib.rs` sets the same behaviour on
+/// the main-thread pump watchdog for the same reason.
+fn monitor_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(NETWORK_MONITOR_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+/// The independent health legs of the connected-lifetime monitor (F2).
+///
+/// H8 — a failing `tono_service_status_snapshot()` used to increment *both* the kill-switch and
+/// the protected-DNS counters against an `||` threshold test, so a single failed observation
+/// counted as two failures and two failing polls guaranteed a teardown (with H7, two polls 0 ms
+/// apart). It now has its own leg: one failed observation is one failure, on one counter.
+/// Fail-closed is preserved — a dead Service still reaches `HEALTH_FAILURE_THRESHOLD` on that
+/// leg and invalidates Connected — but at the honest rate of one failure per tick, and the
+/// unobserved legs are never *reset* by a failed poll either.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HealthLegs {
+    /// Consecutive unhealthy kill-switch snapshots.
+    pub kill_switch: u32,
+    /// Consecutive unhealthy protected-DNS snapshots.
+    pub protected_dns: u32,
+    /// Consecutive failed periodic exit probes.
+    pub probe: u32,
+    /// Consecutive failed Service status IPCs.
+    pub service: u32,
+}
+
+impl HealthLegs {
+    /// One failed Service observation: exactly one failure, on the Service leg. The other legs
+    /// were not observed at all, so they are neither incremented nor cleared.
+    pub const fn observe_service_failure(&mut self) {
+        self.service = self.service.saturating_add(1);
+    }
+
+    /// A Service snapshot arrived; the Service leg is healthy again.
+    pub const fn observe_service_ok(&mut self) {
+        self.service = 0;
+    }
+
+    pub const fn observe_kill_switch(&mut self, unhealthy: bool) {
+        self.kill_switch = if unhealthy { self.kill_switch.saturating_add(1) } else { 0 };
+    }
+
+    pub const fn observe_protected_dns(&mut self, unhealthy: bool) {
+        self.protected_dns = if unhealthy {
+            self.protected_dns.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
+    pub const fn observe_probe(&mut self, failed: bool) {
+        self.probe = if failed { self.probe.saturating_add(1) } else { 0 };
+    }
+
+    /// Any leg that reached the threshold invalidates Connected.
+    pub const fn invalid(&self) -> bool {
+        health_threshold_reached(self.kill_switch)
+            || health_threshold_reached(self.protected_dns)
+            || health_threshold_reached(self.probe)
+            || health_threshold_reached(self.service)
+    }
+}
+
+/// One core-identity observation against the recorded baseline (H4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreSample {
+    /// Same pid, no restart-counter bump.
+    Unchanged,
+    /// The Service reports no core while we recorded one. This is the *quiet* path — a
+    /// `core_pid: None, restart_count: 0` payload the Service emits whenever its per-poll
+    /// `is_active` check reads `Ok(None)`, with no error anywhere — so it must be sustained
+    /// before it counts as a change.
+    Missing,
+    /// A different live pid, or a strictly increased restart counter: the Service is explicitly
+    /// reporting a crash/restart, which still fires on the first sample.
+    Restarted,
+}
+
+/// Classify one `/status` core-identity sample (M4/H4). `restart_count` counts only as an
+/// *increase*: the quiet inactive payload resets it to 0, and a decrease is that artefact, never
+/// a restart.
+pub fn classify_core_sample(
+    last_pid: Option<u32>,
+    last_restart_count: Option<u32>,
+    observed_pid: Option<u32>,
+    observed_restart_count: u32,
+) -> CoreSample {
+    if observed_pid.is_none() && last_pid.is_some() {
+        return CoreSample::Missing;
+    }
+    if last_pid != observed_pid {
+        return CoreSample::Restarted;
+    }
+    match last_restart_count {
+        Some(previous) if observed_restart_count > previous => CoreSample::Restarted,
+        _ => CoreSample::Unchanged,
+    }
+}
+
+/// Whether a classified sample invalidates Connected, given how many consecutive `Missing`
+/// samples (this one included) have been seen. `Missing` needs
+/// [`CORE_MISSING_SUSTAINED_SAMPLES`]; an explicit restart report does not.
+pub const fn core_change_fires(sample: CoreSample, missing_samples: u32) -> bool {
+    match sample {
+        CoreSample::Unchanged => false,
+        CoreSample::Restarted => true,
+        CoreSample::Missing => missing_samples >= CORE_MISSING_SUSTAINED_SAMPLES,
+    }
+}
+
+/// P0-13 debounce: only the first change inside the window invalidates Connected.
+///
+/// H5 — `last_network_event_at` must be cleared on connect success along with the other monitor
+/// seeds. It was not, so a reconnect completing in under [`NETWORK_EVENT_DEBOUNCE`] silently
+/// *discarded* its first genuine event (the counter seed still advanced, so the event was lost,
+/// not deferred). `None` — the post-reset state — always fires.
+pub fn network_event_fires(changed: bool, since_last_event: Option<Duration>) -> bool {
+    changed && since_last_event.is_none_or(|elapsed| elapsed >= NETWORK_EVENT_DEBOUNCE)
+}
 
 /// F2: while Connected, the barrier must be wanted, live, and fully
 /// locked; anything else (or no answer) is unhealthy.
@@ -107,20 +334,43 @@ pub fn kill_switch_unhealthy(status: Option<&KillSwitchStatus>) -> bool {
     }
 }
 
+/// Stable Service markers that ride in `last_error` on an operation that SUCCEEDED. They are
+/// warnings about what could not be proven, not reports of a broken tunnel, and the health
+/// monitor must not tear a live connection down for them.
+///
+/// `TONO_DNS_UNVERIFIED`: DNS was applied but the read-back could not confirm every adapter.
+/// `TONO_DNS_RESTORE_DEGRADED`: a restore was accepted on registry evidence alone.
+///
+/// Treating these as unhealthy is not a cosmetic mistake: two consecutive samples invalidate
+/// Connected, and a machine that can never verify would then reconnect forever.
+const DNS_WARNING_MARKERS: [&str; 2] = ["TONO_DNS_UNVERIFIED", "TONO_DNS_RESTORE_DEGRADED"];
+
+/// Whether a `last_error` string reports an actual failure rather than an unproven-but-applied
+/// state. Substring, not prefix: the Service nests these markers inside its own context.
+fn dns_error_is_a_failure(last_error: Option<&str>) -> bool {
+    match last_error {
+        None => false,
+        Some(text) => !DNS_WARNING_MARKERS.iter().any(|marker| text.contains(marker)),
+    }
+}
+
 /// Connected is not healthy unless every currently known adapter is proven to use loopback DNS.
 /// The Service status deliberately includes adapters that appeared after the original snapshot,
 /// closing the first-netmon-sample race and covering a failed Windows notification registration.
 pub fn protected_dns_unhealthy(status: Option<&DnsProtectionStatus>) -> bool {
     match status {
         Some(status) => {
-            !(status.enabled && status.snapshot_present && status.adapters > 0 && status.last_error.is_none())
+            !(status.enabled
+                && status.snapshot_present
+                && status.adapters > 0
+                && !dns_error_is_a_failure(status.last_error.as_deref()))
         }
         None => true,
     }
 }
 
 /// F2: threshold test shared by the kill-switch and exit-probe legs.
-pub fn health_threshold_reached(consecutive_failures: u32) -> bool {
+pub const fn health_threshold_reached(consecutive_failures: u32) -> bool {
     consecutive_failures >= HEALTH_FAILURE_THRESHOLD
 }
 
@@ -550,7 +800,7 @@ async fn run_stages(
     // Under the transaction like every other stage on this path. `apply_cloud_policy`'s copy is
     // already covered because that whole stage runs inside a `wait`; this one was the only
     // uncovered await in `run_stages`, and an %APPDATA% redirected to an offline share parks it
-    // where the 120 s budget cannot reach — Connecting forever, every retry then rejected as
+    // where the `CONNECT_TRANSACTION_TIMEOUT` budget cannot reach — Connecting forever, every retry then rejected as
     // "already connecting". The write itself never fails the connect (see `write_redacted_copy`),
     // so this wait only trips when the budget was already spent.
     transaction
@@ -657,19 +907,17 @@ async fn run_stages(
         .await?
         .map_err(StageFailure::error)?;
 
-    // §6.8: checkingExit — probe generate_204 through the Tono-Exit group.
-    set_stage(state, app, ConnectStage::CheckingExit, generation, true, started).await?;
-    transaction
-        .wait("exit verification", probe_exit(&secret, controller_port))
-        .await?
-        .map_err(StageFailure::error)?;
-
-    // §6.9: verifyingTraffic — the barrier must be wanted, live, and locked.
-    set_stage(state, app, ConnectStage::VerifyingTraffic, generation, true, started).await?;
-    let mut kill_status = transaction
-        .wait("kill-switch verification", verify_locked())
-        .await?
-        .map_err(StageFailure::error)?;
+    // §6.8 + §6.9: checkingExit → verifyingTraffic, as one retryable verification group (C3).
+    let mut kill_status = verify_post_lock(
+        state,
+        app,
+        &secret,
+        controller_port,
+        generation,
+        started,
+        transaction,
+    )
+    .await?;
 
     // The durable logical-session latch is committed only after every existing check and a
     // final generation guard. A failure remains an ordinary connect failure.
@@ -699,6 +947,11 @@ async fn run_stages(
         inner.network_events_counter = None;
         inner.last_core_pid = None;
         inner.last_restart_count = None;
+        // H5: the debounce timestamp is a monitor seed too. Leaving the previous session's
+        // stamp behind meant a reconnect that completed inside NETWORK_EVENT_DEBOUNCE silently
+        // *discarded* its first genuine event — the counter seed advanced past it, so the event
+        // was lost rather than deferred, and the tunnel stayed green over a changed network.
+        inner.last_network_event_at = None;
         // F3: every step completed; retry bookkeeping resets.
         let elapsed = inner
             .step_started_at
@@ -715,6 +968,77 @@ async fn run_stages(
     });
     spawn_network_monitor(state, app).await;
     Ok(())
+}
+
+/// C3 — the post-lock verification group: `checkingExit` then `verifyingTraffic`, retried as a
+/// pair up to [`POST_LOCK_VERIFY_ROUNDS`] times inside the still-live transaction.
+///
+/// Why here and not in the failure path: by this point WFP is armed *and* locked and the tunnel
+/// is proven up, but `session_verified` is committed only after both stages pass. A failure
+/// therefore reaches `plan_failure(armed = true, session_verified = false, ..)` → `FullRelease`,
+/// which destroys the tunnel — and `next_reconnect_delay()` then requires
+/// `is_protection_blocked && session_verified`, both false afterwards, so nothing retries. A
+/// single transient 504 on the exit probe took a working tunnel to NotConnected with no recovery.
+///
+/// Fail-closed is untouched: this only re-runs the *checks*. Nothing here marks a session
+/// verified, releases or weakens the barrier, or shortens any release; an exhausted group returns
+/// the same error to the same decision table and still resolves to the same `FullRelease`. The
+/// shared transaction deadline and the generation guard bound the retry, so it can neither
+/// outlive a disconnect nor extend the connect past its budget.
+#[allow(clippy::too_many_arguments, reason = "stage helper mirrors run_stages' own context")]
+async fn verify_post_lock(
+    state: &Arc<TonoState>,
+    app: &AppHandle,
+    secret: &str,
+    controller_port: u16,
+    generation: u64,
+    started: std::time::Instant,
+    transaction: &ConnectTransaction,
+) -> Result<KillSwitchStatus, StageFailure> {
+    let mut last = String::from("post-lock verification did not run");
+    for round in 0..POST_LOCK_VERIFY_ROUNDS {
+        // §6.8: checkingExit — probe generate_204 through the Tono-Exit group. Only the first
+        // round announces the stage: `advance_stage` moves forward only (it debug-asserts on a
+        // regression), and a retry of the same group is not a new stage. Later rounds still take
+        // the generation guard `set_stage` would have taken, with the same late-arm patch.
+        if round == 0 {
+            set_stage(state, app, ConnectStage::CheckingExit, generation, true, started).await?;
+        } else if state.lock().await.connect_generation != generation {
+            return Err(stale_after_arm(state, generation).await);
+        }
+        let outcome = match transaction
+            .wait("exit verification", probe_exit(secret, controller_port))
+            .await?
+        {
+            Ok(()) => {
+                // §6.9: verifyingTraffic — the barrier must be wanted, live, and locked.
+                set_stage(state, app, ConnectStage::VerifyingTraffic, generation, true, started).await?;
+                transaction.wait("kill-switch verification", verify_locked()).await?
+            }
+            Err(err) => Err(err),
+        };
+        match outcome {
+            Ok(status) => return Ok(status),
+            Err(err) => last = err,
+        }
+        if round + 1 == POST_LOCK_VERIFY_ROUNDS {
+            break;
+        }
+        logging!(
+            warn,
+            Type::Service,
+            "Tono: 隧道已锁定但验证未通过，重试验证阶段 ({}/{}): {last}",
+            round + 1,
+            POST_LOCK_VERIFY_ROUNDS
+        );
+        transaction
+            .wait(
+                "post-lock verification retry",
+                tokio::time::sleep(POST_LOCK_VERIFY_ROUND_DELAY),
+            )
+            .await?;
+    }
+    Err(StageFailure::error(last))
 }
 
 /// The generation guard used between the long I/O steps.
@@ -924,8 +1248,9 @@ async fn fail_connect(state: &Arc<TonoState>, app: &AppHandle, err: String) -> S
             // ...and stop claiming Connecting while it runs. The predicate below deliberately
             // skips `connect_failed` in this case (it would resolve to FullRelease and disarm
             // before the release had actually run), which left `is_connecting` true alongside
-            // `is_protection_blocked` for the whole of `release_explicit` — up to 30 s of a UI
-            // reading "Connecting" with no transaction in flight, during which `guard_snapshot`
+            // `is_protection_blocked` for the whole of `release_explicit` — a full
+            // `EXPLICIT_RELEASE_TIMEOUT` of a UI reading "Connecting" with no transaction in
+            // flight, during which `guard_snapshot`
             // rejected every new connect. This is the state both exit branches below converge
             // on anyway, minus the release verdict.
             inner.fsm.initial_release_failed();
@@ -1455,12 +1780,35 @@ async fn spawn_network_monitor(state: &Arc<TonoState>, app: &AppHandle) {
     inner.tasks.network_monitor = Some(handle);
 }
 
+/// F2 leg 2: one periodic exit probe while Connected. Returns whether it counts as a failure on
+/// the probe leg — including the "Connected without an authenticated controller endpoint" case,
+/// which is itself abnormal.
+async fn periodic_exit_probe_failed(state: &Arc<TonoState>) -> bool {
+    let controller = {
+        let inner = state.lock().await;
+        inner.controller_secret.clone().zip(inner.controller_port)
+    };
+    let Some((secret, port)) = controller else {
+        return true;
+    };
+    match probe_exit_once(&secret, port).await {
+        Ok(_) => false,
+        Err(err) => {
+            state.audit().log(AuditEvent::HealthProbeFail {
+                probe: "exit",
+                error: err,
+            });
+            true
+        }
+    }
+}
+
 async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
-    let mut interval = tokio::time::interval(NETWORK_MONITOR_INTERVAL);
+    // H7: `Delay`, never the default `Burst` — see `HEALTH_FAILURE_THRESHOLD`.
+    let mut interval = monitor_interval();
     interval.tick().await;
-    let mut kill_switch_abnormal = 0_u32;
-    let mut protected_dns_abnormal = 0_u32;
-    let mut probe_failures = 0_u32;
+    let mut legs = HealthLegs::default();
+    let mut missing_core_samples = 0_u32;
     let mut last_probe = std::time::Instant::now();
     loop {
         interval.tick().await;
@@ -1473,71 +1821,41 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
         let snapshot = match service::tono_service_status_snapshot().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                // A dead/unreachable Service is not a neutral sample. Treat it as a failed
-                // protection probe so two consecutive IPC failures invalidate Connected and
-                // enter the normal fail-closed reconnect path; `continue` here used to leave a
-                // permanently stale green state and also skipped every later health leg.
-                kill_switch_abnormal += 1;
-                protected_dns_abnormal += 1;
+                // A dead/unreachable Service is not a neutral sample: it is one failed
+                // observation on the Service leg (H8 — it used to be counted on the kill-switch
+                // *and* the protected-DNS leg against an `||` test, which made a single failing
+                // poll worth two failures). Fail-closed is unchanged: consecutive failures still
+                // reach the threshold and invalidate Connected. The other legs keep their
+                // counters — a failed poll observed nothing, so it clears nothing either.
+                legs.observe_service_failure();
                 state.audit().log(AuditEvent::HealthProbeFail {
                     probe: "service",
                     error: error.to_string(),
                 });
-                if health_threshold_reached(kill_switch_abnormal) || health_threshold_reached(protected_dns_abnormal) {
+                if legs.invalid() {
                     handle_network_change(&state, &app).await;
                     return;
                 }
                 continue;
             }
         };
+        legs.observe_service_ok();
 
         // F2 leg 1: kill-switch completeness every tick.
-        if kill_switch_unhealthy(snapshot.kill_switch.as_ref()) {
-            kill_switch_abnormal += 1;
-        } else {
-            kill_switch_abnormal = 0;
-        }
+        legs.observe_kill_switch(kill_switch_unhealthy(snapshot.kill_switch.as_ref()));
 
         // DNS health is checked independently of netmon. The first network event is used only
         // to seed the counter (to ignore our own connect-time interface churn), so an adapter
         // arriving in that narrow window would otherwise remain external-DNS until another event.
         let protected_dns = service::tono_protected_dns_status().await.ok();
-        if protected_dns_unhealthy(protected_dns.as_ref()) {
-            protected_dns_abnormal += 1;
-        } else {
-            protected_dns_abnormal = 0;
-        }
+        legs.observe_protected_dns(protected_dns_unhealthy(protected_dns.as_ref()));
 
         // F2 leg 2: periodic single-shot exit probe through the tunnel.
         if last_probe.elapsed() >= EXIT_PROBE_INTERVAL {
             last_probe = std::time::Instant::now();
-            let controller = {
-                let inner = state.lock().await;
-                inner.controller_secret.clone().zip(inner.controller_port)
-            };
-            let failed = match controller {
-                Some((secret, port)) => match probe_exit_once(&secret, port).await {
-                    Ok(_) => false,
-                    Err(err) => {
-                        state.audit().log(AuditEvent::HealthProbeFail {
-                            probe: "exit",
-                            error: err,
-                        });
-                        true
-                    }
-                },
-                // Connected without an authenticated controller endpoint is itself abnormal.
-                None => true,
-            };
-            if failed {
-                probe_failures += 1;
-            } else {
-                probe_failures = 0;
-            }
+            legs.observe_probe(periodic_exit_probe_failed(&state).await);
         }
-        let health_invalid = health_threshold_reached(kill_switch_abnormal)
-            || health_threshold_reached(protected_dns_abnormal)
-            || health_threshold_reached(probe_failures);
+        let health_invalid = legs.invalid();
 
         let (invalidate, kill_switch_snapshot, service_events) = {
             let mut inner = state.lock().await;
@@ -1556,22 +1874,38 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
             let network_changed = !first_sample && inner.network_events_counter != Some(counter);
             inner.network_events_counter = Some(counter);
 
-            // M4: a core crash/restart shows up as a new pid or a bumped
-            // restart counter; the TUN LUID is re-resolved by the fresh
-            // transaction's lock phase.
+            // M4: a core crash/restart shows up as a new pid or a bumped restart counter; the
+            // TUN LUID is re-resolved by the fresh transaction's lock phase.
+            //
+            // H4: a *quiet* `core_pid: None` is not proof of a crash — the Service emits it
+            // (with `restart_count: 0`, no error) whenever its per-poll `is_active` check reads
+            // `Ok(None)` — so it must be sustained before it fires, and the baseline pid is kept
+            // until it does. Overwriting the baseline with the quiet `None` would make the very
+            // next healthy sample look like a pid change and tear the tunnel down anyway.
             let old_pid = inner.last_core_pid;
-            let core_changed = !first_sample
-                && (inner.last_core_pid != snapshot.core_pid
-                    || inner.last_restart_count != Some(snapshot.restart_count));
-            inner.last_core_pid = snapshot.core_pid;
-            inner.last_restart_count = Some(snapshot.restart_count);
+            let sample = classify_core_sample(
+                inner.last_core_pid,
+                inner.last_restart_count,
+                snapshot.core_pid,
+                snapshot.restart_count,
+            );
+            missing_core_samples = if sample == CoreSample::Missing {
+                missing_core_samples.saturating_add(1)
+            } else {
+                0
+            };
+            let core_changed = !first_sample && core_change_fires(sample, missing_core_samples);
+            if sample != CoreSample::Missing || core_changed {
+                inner.last_core_pid = snapshot.core_pid;
+                inner.last_restart_count = Some(snapshot.restart_count);
+            }
 
             // P0-13: merge event bursts — only the first change inside the
             // debounce window invalidates Connected.
-            let invalidated = (network_changed || core_changed)
-                && inner
-                    .last_network_event_at
-                    .is_none_or(|at| at.elapsed() >= NETWORK_EVENT_DEBOUNCE);
+            let invalidated = network_event_fires(
+                network_changed || core_changed,
+                inner.last_network_event_at.map(|at| at.elapsed()),
+            );
             if invalidated {
                 inner.last_network_event_at = Some(std::time::Instant::now());
             }
@@ -1760,11 +2094,14 @@ async fn set_stage(
     }
 }
 
-fn controller_client() -> Result<reqwest::Client, String> {
+/// The controller HTTP client. C2: the total timeout is per call site, because one of them (the
+/// exit probe) hands the *core* a budget of its own and must always outlast it — a client that
+/// times out first throws away mihomo's diagnosis and reports a transport error instead.
+fn controller_client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(500))
-        .timeout(Duration::from_secs(6))
+        .timeout(timeout)
         .build()
         .map_err(|err| err.to_string())
 }
@@ -1814,7 +2151,7 @@ async fn preflight_dns_listener() -> Result<(), String> {
 /// §6.4: poll the mihomo controller `/version` for at most 15 seconds. Each localhost request is
 /// independently bounded as well, so a half-open socket cannot multiply the whole-stage budget.
 async fn wait_controller(secret: &str, controller_port: u16) -> Result<(), String> {
-    let client = controller_client()?;
+    let client = controller_client(CONTROLLER_HTTP_TIMEOUT)?;
     let url = controller_url(controller_port, "/version");
     let mut last = String::from("no response");
     let deadline = tokio::time::Instant::now() + CONTROLLER_READY_TIMEOUT;
@@ -1853,7 +2190,7 @@ async fn wait_controller(secret: &str, controller_port: u16) -> Result<(), Strin
 
 /// §6.5+§6.6: lock, retrying only while the TUN adapter comes up (≤ 50 × 200 ms between
 /// retryable failures). Permanent lock errors fail immediately so a bad owner/WFP state does
-/// not burn the 120 s connect budget on 50 full lifecycle IPCs.
+/// not burn the connect transaction budget on 50 full lifecycle IPCs.
 async fn lock_kill_switch_with_retries() -> Result<(), String> {
     let mut last = String::from("no response");
     for attempt in 0..LOCK_ATTEMPTS {
@@ -1896,28 +2233,42 @@ async fn verify_fake_ip() -> Result<(), String> {
     Err(format!("fake-ip verification failed: {last}"))
 }
 
-/// §6.8: delay-probe the exit group through the selected node (3 tries; no
-/// sleep after the last failure — it only delayed the error).
+/// C2: whether a further exit-probe attempt fits in what is left of the stage budget. A probe
+/// started without room for a full core budget can only ever report the client's timeout, which
+/// is precisely the diagnosis-destroying outcome the re-budget exists to avoid.
+pub fn exit_probe_attempt_fits(remaining: Duration) -> bool {
+    remaining > VERIFY_RETRY_INTERVAL + EXIT_PROBE_CLIENT_TIMEOUT
+}
+
+/// §6.8: delay-probe the exit group through the selected node (≤ `VERIFY_ATTEMPTS` tries; no
+/// sleep after the last failure — it only delayed the error). C2: the attempts are additionally
+/// bounded by [`EXIT_PROBE_STAGE_TIMEOUT`], so three full-length probes cannot silently become a
+/// 34 s stage.
 async fn probe_exit(secret: &str, controller_port: u16) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + EXIT_PROBE_STAGE_TIMEOUT;
     let mut last = String::from("no response");
     for attempt in 0..VERIFY_ATTEMPTS {
         match probe_exit_once(secret, controller_port).await {
             Ok(_) => return Ok(()),
-            Err(err) => {
-                last = err;
-                if attempt + 1 < VERIFY_ATTEMPTS {
-                    tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
-                }
-            }
+            Err(err) => last = err,
         }
+        if attempt + 1 == VERIFY_ATTEMPTS {
+            break;
+        }
+        if !exit_probe_attempt_fits(deadline.saturating_duration_since(tokio::time::Instant::now())) {
+            break;
+        }
+        tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
     }
     Err(format!("exit check failed: {last}"))
 }
 
-/// One exit probe: `GET /proxies/Tono-Exit/delay` against the generate_204
-/// target with a 5 s core-side timeout; a positive delay proves egress.
+/// One exit probe: `GET /proxies/Tono-Exit/delay` against the generate_204 target with an
+/// [`EXIT_PROBE_CORE_TIMEOUT_MS`] core-side budget; a positive delay proves egress. The client
+/// budget ([`EXIT_PROBE_CLIENT_TIMEOUT`]) is strictly larger, so the verdict — including a
+/// mihomo-reported failure — always comes from the core (C2).
 async fn probe_exit_once(secret: &str, controller_port: u16) -> Result<u64, String> {
-    let client = controller_client()?;
+    let client = controller_client(EXIT_PROBE_CLIENT_TIMEOUT)?;
     let mut url = reqwest::Url::parse(&controller_url(
         controller_port,
         &format!("/proxies/{EXIT_GROUP_NAME}/delay"),
@@ -1925,7 +2276,7 @@ async fn probe_exit_once(secret: &str, controller_port: u16) -> Result<u64, Stri
     .map_err(|err| err.to_string())?;
     url.query_pairs_mut()
         .append_pair("url", EXIT_PROBE_URL)
-        .append_pair("timeout", "5000");
+        .append_pair("timeout", &EXIT_PROBE_CORE_TIMEOUT_MS.to_string());
 
     match client.get(url).bearer_auth(secret).send().await {
         Ok(response) if response.status().is_success() => match response.json::<serde_json::Value>().await {
@@ -1964,19 +2315,41 @@ pub async fn test_current_server(state: &Arc<TonoState>) -> Result<u64, String> 
         .map_err(|error| format!("current server test failed: {error}"))
 }
 
+/// V1/H1 — the retry window `verify_locked` spends before it calls a tunnel unverified. Must
+/// exceed the Service-side liveness cache TTL, or the verdict is one sample of a decaying value.
+pub fn verify_lock_retry_window() -> Duration {
+    VERIFY_LOCK_RETRY_INTERVAL * (VERIFY_LOCK_ATTEMPTS.saturating_sub(1))
+}
+
 /// §6.9: the kill switch must be wanted, verified live, and fully locked.
+///
+/// V1/H1: bounded retry, never a single shot. `live` is not a live query on Windows — it is a
+/// ~1.5 s-decaying cache refreshed by a 1 s loop — so a slow-but-successful verify reads
+/// `live: false`. Retrying only re-*reads*: nothing but a `wanted && live && Locked` answer
+/// passes, so the fail-closed verdict is unchanged, it is merely no longer decided by one sample.
 async fn verify_locked() -> Result<KillSwitchStatus, String> {
-    let status = service::tono_kill_switch_status()
-        .await
-        .map_err(|err| err.to_string())?;
-    if status.wanted && status.live && status.mode == KillSwitchStatusMode::Locked {
-        Ok(status)
-    } else {
-        Err(format!(
-            "kill switch not locked (wanted={}, live={}, mode={:?})",
-            status.wanted, status.live, status.mode
-        ))
+    let mut last = String::from("no answer");
+    for attempt in 0..VERIFY_LOCK_ATTEMPTS {
+        match service::tono_kill_switch_status().await {
+            Ok(status) => {
+                if status.wanted && status.live && status.mode == KillSwitchStatusMode::Locked {
+                    return Ok(status);
+                }
+                last = format!(
+                    "kill switch not locked (wanted={}, live={}, mode={:?})",
+                    status.wanted, status.live, status.mode
+                );
+            }
+            Err(err) => last = err.to_string(),
+        }
+        if attempt + 1 < VERIFY_LOCK_ATTEMPTS {
+            tokio::time::sleep(VERIFY_LOCK_RETRY_INTERVAL).await;
+        }
     }
+    Err(format!(
+        "{last} (after {VERIFY_LOCK_ATTEMPTS} samples over {:?})",
+        verify_lock_retry_window()
+    ))
 }
 
 // ---- WeChat-DIRECT cloud policy (Build 28) ----
@@ -2135,7 +2508,7 @@ async fn resolve_direct_domains(
 /// `GET /dns/query?name=<host>&type=A` through the controller; the response
 /// shape is tolerated by collecting every IPv4 literal in the JSON tree.
 async fn dns_query_a(secret: &str, controller_port: u16, host: &str) -> Result<Vec<std::net::Ipv4Addr>, String> {
-    let client = controller_client()?;
+    let client = controller_client(CONTROLLER_HTTP_TIMEOUT)?;
     let mut url = reqwest::Url::parse(&controller_url(controller_port, "/dns/query")).map_err(|err| err.to_string())?;
     url.query_pairs_mut().append_pair("name", host).append_pair("type", "A");
     let response = client
@@ -2428,17 +2801,329 @@ async fn write_redacted_copy(state: &Arc<TonoState>, redacted: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailurePlan, MAX_DIRECT_ENDPOINTS, RELEASE_RECONCILING_PREFIX, SERVICE_BUSY_PREFIX,
-        SERVICE_TOO_OLD_PREFIX, SelectAction, build_direct_plan, collect_ipv4_literals,
-        health_threshold_reached, is_fake_ip, is_retryable_lock_error, kill_switch_unhealthy,
+        CONNECT_BUDGET_LEGS, CONNECT_TRANSACTION_TIMEOUT, CORE_MISSING_SUSTAINED_SAMPLES,
+        CONTROLLER_READY_TIMEOUT, CoreSample, EXIT_PROBE_CLIENT_TIMEOUT, EXIT_PROBE_CORE_TIMEOUT_MS,
+        EXIT_PROBE_STAGE_TIMEOUT, EXPLICIT_RELEASE_TIMEOUT, FailurePlan, HEALTH_FAILURE_THRESHOLD,
+        HealthLegs, LOCK_ATTEMPTS, LOCK_RETRY_INTERVAL, MAX_DIRECT_ENDPOINTS,
+        NETWORK_EVENT_DEBOUNCE, NETWORK_MONITOR_INTERVAL, POST_LOCK_VERIFY_ROUNDS,
+        POST_LOCK_VERIFY_ROUND_DELAY, RELEASE_RECONCILING_PREFIX, SERVICE_BUSY_PREFIX,
+        SERVICE_LIFECYCLE_TIMEOUT, SERVICE_TOO_OLD_PREFIX, SelectAction, VERIFY_ATTEMPTS,
+        VERIFY_LOCK_ATTEMPTS, VERIFY_RETRY_INTERVAL, build_direct_plan, classify_core_sample,
+        collect_ipv4_literals, core_change_fires, exit_probe_attempt_fits, health_threshold_reached,
+        is_fake_ip, is_retryable_lock_error, kill_switch_unhealthy, monitor_interval,
+        network_event_fires, verify_lock_retry_window,
         BFE_NOT_RUNNING_PREFIX, CATALOG_NOT_READY_REJECTION, TRANSITION_IN_FLIGHT_REJECTION,
         WFP_ENGINE_WEDGED_PREFIX, guard_rejection_is_transient, map_service_ready_error,
         map_wfp_engine_error, plan_failure, protected_dns_unhealthy, proxy_endpoint_of,
         reconnect_allowed, retry_now_is_noop, select_action, sign_out_needs_release,
         single_flight_begin, stale_exit_needs_release, stop_core_before_release,
     };
+    use clash_verge_service_ipc::DnsProtectionStatus;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
     use tono_core::{connection::ConnectionStatus, node::ValidatedNode};
+
+    // ---- H7: the monitor's tick source must never collapse its thresholds ----
+
+    /// The default `MissedTickBehavior::Burst` fires the tick after a slow one ~0 ms later, so
+    /// two "consecutive" samples can be milliseconds apart and read the same stale value — the
+    /// premise of every threshold below ("2 failures ≈ 4 s of sustained failure") is then false.
+    #[tokio::test]
+    async fn monitor_interval_delays_missed_ticks_instead_of_bursting() {
+        let interval = monitor_interval();
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
+        assert_eq!(interval.period(), NETWORK_MONITOR_INTERVAL);
+    }
+
+    /// The documented meaning of the threshold, restated as an assertion: reaching it must cost
+    /// at least `(threshold - 1)` real monitor periods of sustained failure.
+    #[test]
+    #[allow(clippy::assertions_on_constants, reason = "these tests exist to pin the constants")]
+    fn health_threshold_spans_real_time() {
+        assert!(HEALTH_FAILURE_THRESHOLD >= 2);
+        let sustained = NETWORK_MONITOR_INTERVAL * (HEALTH_FAILURE_THRESHOLD - 1);
+        assert!(sustained >= Duration::from_secs(2));
+    }
+
+    // ---- H8: one failed observation is one failure ----
+
+    #[test]
+    fn a_failed_service_poll_counts_as_one_failure_not_two() {
+        let mut legs = HealthLegs::default();
+        legs.observe_service_failure();
+        assert_eq!(legs.service, 1);
+        // The legs that were not observed are untouched — neither incremented (the old bug,
+        // which made a single failing poll worth two failures against an `||` test) nor cleared.
+        assert_eq!(legs.kill_switch, 0);
+        assert_eq!(legs.protected_dns, 0);
+        assert_eq!(legs.probe, 0);
+        assert!(!legs.invalid());
+    }
+
+    /// Fail-closed is preserved: a Service that stays dead still invalidates Connected, just at
+    /// the honest rate of one failure per monitor tick.
+    #[test]
+    fn a_dead_service_still_invalidates_connected() {
+        let mut legs = HealthLegs::default();
+        for _ in 0..HEALTH_FAILURE_THRESHOLD {
+            legs.observe_service_failure();
+        }
+        assert!(legs.invalid());
+    }
+
+    #[test]
+    fn a_failed_poll_never_clears_another_leg() {
+        let mut legs = HealthLegs::default();
+        legs.observe_kill_switch(true);
+        legs.observe_service_failure();
+        assert_eq!(legs.kill_switch, 1, "an unobserved leg keeps its history");
+        legs.observe_service_ok();
+        legs.observe_kill_switch(false);
+        assert!(!legs.invalid());
+        assert_eq!(legs.service, 0);
+    }
+
+    #[test]
+    fn each_health_leg_thresholds_independently() {
+        for (name, apply) in [
+            ("kill switch", (|legs: &mut HealthLegs| legs.observe_kill_switch(true)) as fn(&mut HealthLegs)),
+            ("protected dns", |legs: &mut HealthLegs| legs.observe_protected_dns(true)),
+            ("probe", |legs: &mut HealthLegs| legs.observe_probe(true)),
+            ("service", |legs: &mut HealthLegs| legs.observe_service_failure()),
+        ] {
+            let mut legs = HealthLegs::default();
+            apply(&mut legs);
+            assert!(!legs.invalid(), "{name}: one failure must not invalidate");
+            apply(&mut legs);
+            assert!(legs.invalid(), "{name}: a sustained failure must invalidate");
+        }
+    }
+
+    // ---- H4: a quiet `core_pid: None` cannot tear down a healthy tunnel ----
+
+    #[test]
+    fn a_missing_core_pid_is_a_quiet_sample() {
+        assert_eq!(
+            classify_core_sample(Some(42), Some(3), None, 0),
+            CoreSample::Missing
+        );
+        assert!(
+            !core_change_fires(CoreSample::Missing, 1),
+            "the Service reports core_pid: None on its non-error inactive path"
+        );
+        assert!(core_change_fires(
+            CoreSample::Missing,
+            CORE_MISSING_SUSTAINED_SAMPLES
+        ));
+    }
+
+    #[test]
+    fn an_explicit_restart_report_still_fires_on_the_first_sample() {
+        // A different live pid.
+        assert_eq!(
+            classify_core_sample(Some(42), Some(3), Some(77), 3),
+            CoreSample::Restarted
+        );
+        // A bumped restart counter under the same pid.
+        assert_eq!(
+            classify_core_sample(Some(42), Some(3), Some(42), 4),
+            CoreSample::Restarted
+        );
+        assert!(core_change_fires(CoreSample::Restarted, 0));
+    }
+
+    #[test]
+    fn a_steady_core_is_unchanged() {
+        assert_eq!(
+            classify_core_sample(Some(42), Some(3), Some(42), 3),
+            CoreSample::Unchanged
+        );
+        assert!(!core_change_fires(CoreSample::Unchanged, 9));
+    }
+
+    /// The quiet payload also resets `restart_count` to 0. A *decrease* is that artefact, never
+    /// a restart — treating it as one would make the missing-sample threshold pointless.
+    #[test]
+    fn a_reset_restart_counter_is_not_a_restart() {
+        assert_eq!(
+            classify_core_sample(Some(42), Some(3), None, 0),
+            CoreSample::Missing
+        );
+        assert_eq!(
+            classify_core_sample(Some(42), Some(3), Some(42), 0),
+            CoreSample::Unchanged
+        );
+    }
+
+    // ---- H5: the debounce stamp is a monitor seed ----
+
+    #[test]
+    fn a_reconnect_inside_the_debounce_window_keeps_its_first_event() {
+        // The bug: a stale stamp from the previous session swallowed the first genuine event.
+        assert!(!network_event_fires(true, Some(Duration::from_millis(500))));
+        // After the connect-success reset the first event of the new session always fires.
+        assert!(network_event_fires(true, None));
+        assert!(network_event_fires(true, Some(NETWORK_EVENT_DEBOUNCE)));
+        assert!(!network_event_fires(false, None), "no change, no invalidation");
+    }
+
+    // ---- V1/H1: verify_locked must not decide on one sample of a decaying cache ----
+
+    #[test]
+    #[allow(clippy::assertions_on_constants, reason = "these tests exist to pin the constants")]
+    fn kill_switch_verification_outlives_the_liveness_cache() {
+        assert!(VERIFY_LOCK_ATTEMPTS > 1, "single-shot verification is the bug");
+        // The Service caches `live` for ~1.5 s and refreshes it on a 1 s loop; the retry window
+        // must span more than one full refresh so a slow sample is re-read, not believed.
+        assert!(
+            verify_lock_retry_window() > Duration::from_millis(1_500),
+            "retry window {:?} must exceed the liveness cache TTL",
+            verify_lock_retry_window()
+        );
+    }
+
+    // ---- C2: the client must outlast the core, and the stage must stay sane ----
+
+    #[test]
+    fn exit_probe_client_budget_outlasts_the_core_budget() {
+        let core = Duration::from_millis(EXIT_PROBE_CORE_TIMEOUT_MS);
+        assert!(
+            EXIT_PROBE_CLIENT_TIMEOUT >= core + Duration::from_secs(2),
+            "the client must lose to the core by a real margin, or mihomo's diagnosis is discarded"
+        );
+    }
+
+    /// `unified-delay: true` in the generated runtime makes mihomo run the measured request
+    /// twice inside the single core budget, so that budget must hold a *doubled* request.
+    #[test]
+    #[allow(clippy::assertions_on_constants, reason = "these tests exist to pin the constants")]
+    fn exit_probe_core_budget_holds_a_doubled_request() {
+        const SLOW_REALITY_REQUEST_MS: u64 = 3_500;
+        assert!(EXIT_PROBE_CORE_TIMEOUT_MS >= 2 * SLOW_REALITY_REQUEST_MS);
+    }
+
+    #[test]
+    fn exit_probe_stage_stays_within_its_ceiling() {
+        // Two full-length attempts fit; the naive VERIFY_ATTEMPTS × client-timeout ladder does
+        // not, which is exactly why the stage stops starting attempts it cannot finish.
+        assert!(exit_probe_attempt_fits(EXIT_PROBE_STAGE_TIMEOUT));
+        assert!(!exit_probe_attempt_fits(EXIT_PROBE_CLIENT_TIMEOUT));
+        assert!(!exit_probe_attempt_fits(Duration::ZERO));
+        let two_attempts = EXIT_PROBE_CLIENT_TIMEOUT * 2 + VERIFY_RETRY_INTERVAL;
+        assert!(two_attempts <= EXIT_PROBE_STAGE_TIMEOUT);
+        let naive_ladder = EXIT_PROBE_CLIENT_TIMEOUT * VERIFY_ATTEMPTS + VERIFY_RETRY_INTERVAL * 2;
+        assert!(naive_ladder > EXIT_PROBE_STAGE_TIMEOUT);
+    }
+
+    // ---- C3: a transient verification failure is not "the tunnel never came up" ----
+
+    /// Why the retry has to live inside the transaction: at `checkingExit`/`verifyingTraffic`
+    /// the barrier is armed and locked but `session_verified` is still false, so the failure
+    /// decision table resolves to a full release — and the reconnect gate then refuses to hand
+    /// out a delay, because it requires the very latch the release just cleared.
+    #[test]
+    fn a_post_lock_failure_would_otherwise_be_a_dead_end() {
+        assert_eq!(
+            plan_failure(true, false, false),
+            FailurePlan {
+                mark_armed: false,
+                stop_core: Some(true),
+                restrict_bootstrap: false,
+            }
+        );
+        // ...and the FSM confirms the dead end: after that release neither
+        // `is_protection_blocked` nor `session_verified` holds, and `next_reconnect_delay`
+        // requires both — so the user lands on NotConnected with nothing scheduled.
+        let mut fsm = tono_core::connection::ConnectionFsm::new();
+        fsm.begin_connect();
+        fsm.mark_kill_switch_armed();
+        assert!(!fsm.session_verified(), "the latch is committed after these stages");
+        fsm.connect_failed();
+        assert!(!fsm.status().is_protection_blocked);
+        assert_eq!(
+            fsm.next_reconnect_delay(),
+            None,
+            "nothing retries after a post-lock failure — so the retry must happen before it"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants, reason = "these tests exist to pin the constants")]
+    fn the_post_lock_group_retries_before_giving_up() {
+        assert!(
+            POST_LOCK_VERIFY_ROUNDS >= 2,
+            "one transient 504 must not destroy a working tunnel"
+        );
+        // ...but the group stays bounded: it can never outlive the transaction budget.
+        let worst = (EXIT_PROBE_STAGE_TIMEOUT + verify_lock_retry_window() + POST_LOCK_VERIFY_ROUND_DELAY)
+            * POST_LOCK_VERIFY_ROUNDS;
+        assert!(worst < CONNECT_TRANSACTION_TIMEOUT);
+    }
+
+    /// Fail-closed: retrying the checks changes nothing about the decision table. An exhausted
+    /// group still resolves to the same full release an unverified session always did, and a
+    /// verified session still keeps blocking and reconnects.
+    #[test]
+    fn post_lock_retry_does_not_weaken_the_failure_table() {
+        assert_eq!(
+            plan_failure(true, false, false).stop_core,
+            Some(true),
+            "an unverified session is still fully released once the retries are exhausted"
+        );
+        assert_eq!(
+            plan_failure(true, true, false),
+            FailurePlan {
+                mark_armed: true,
+                stop_core: Some(false),
+                restrict_bootstrap: true,
+            }
+        );
+    }
+
+    // ---- C4: the transaction budget must cover a cold first connect ----
+
+    #[test]
+    fn connect_budget_covers_a_cold_first_connect() {
+        let accounted: u64 = CONNECT_BUDGET_LEGS.iter().map(|(_, secs)| secs).sum();
+        assert_eq!(accounted, 225, "the table in the doc comment must stay in sync");
+        assert!(
+            Duration::from_secs(accounted) <= CONNECT_TRANSACTION_TIMEOUT,
+            "the accounted cold-connect worst case ({accounted} s) must fit the budget"
+        );
+        // The legs whose budgets are constants here must match those constants.
+        let leg = |name: &str| {
+            CONNECT_BUDGET_LEGS
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, secs)| Duration::from_secs(*secs))
+                .unwrap_or_default()
+        };
+        assert!(leg("controller readiness") >= CONTROLLER_READY_TIMEOUT);
+        assert!(leg("lock ladder") >= LOCK_RETRY_INTERVAL * LOCK_ATTEMPTS);
+        assert!(leg("checkingExit") >= EXIT_PROBE_STAGE_TIMEOUT);
+        assert!(leg("verifyingTraffic") >= verify_lock_retry_window());
+    }
+
+    // ---- D1: the release UI budget must match the Service's reality ----
+
+    #[test]
+    fn release_budget_matches_the_service_reality() {
+        // DNS restore leg (Service-side budget) + core stop + WFP/IPC overhead.
+        const SERVICE_DNS_RESTORE: Duration = Duration::from_secs(40);
+        const SERVICE_CORE_STOP: Duration = Duration::from_secs(3);
+        assert!(
+            EXPLICIT_RELEASE_TIMEOUT >= SERVICE_DNS_RESTORE + SERVICE_CORE_STOP,
+            "telling the user the disconnect failed while the worker is still inside its own \
+             budget is the D1 defect"
+        );
+        assert!(
+            EXPLICIT_RELEASE_TIMEOUT < SERVICE_LIFECYCLE_TIMEOUT,
+            "the IPC client must be the one that reports a genuine hang"
+        );
+    }
 
     fn node() -> ValidatedNode {
         ValidatedNode {
@@ -2473,6 +3158,47 @@ mod tests {
         assert!(bfe.contains("sc start BFE"));
 
         assert!(map_wfp_engine_error("kill switch lock failed: owner mismatch").is_none());
+    }
+
+    #[test]
+    fn dns_warnings_do_not_tear_down_a_live_tunnel() {
+        // The Service reports these on operations that SUCCEEDED. Judging them unhealthy costs
+        // two samples and then a full teardown, so a machine that can never verify its DNS
+        // would reconnect forever — which is the failure this predicate exists to prevent.
+        let healthy = DnsProtectionStatus {
+            enabled: true,
+            snapshot_present: true,
+            adapters: 3,
+            last_error: None,
+        };
+        assert!(!protected_dns_unhealthy(Some(&healthy)));
+
+        for warning in [
+            "TONO_DNS_UNVERIFIED: applied but unverified on 2 of 5 adapter(s)",
+            "kill switch: TONO_DNS_RESTORE_DEGRADED: accepted on registry evidence",
+        ] {
+            let warned = DnsProtectionStatus {
+                last_error: Some(warning.to_string()),
+                ..healthy.clone()
+            };
+            assert!(
+                !protected_dns_unhealthy(Some(&warned)),
+                "a warning marker must not read as unhealthy: {warning}"
+            );
+        }
+
+        // A real failure still is one.
+        let failed = DnsProtectionStatus {
+            last_error: Some("DNS restore could not be proven".to_string()),
+            ..healthy.clone()
+        };
+        assert!(protected_dns_unhealthy(Some(&failed)));
+        // And a state that is not actually protected stays unhealthy whatever it says.
+        let off = DnsProtectionStatus {
+            enabled: false,
+            ..healthy
+        };
+        assert!(protected_dns_unhealthy(Some(&off)));
     }
 
     #[test]
@@ -2808,6 +3534,7 @@ mod tests {
             live: true,
             mode: KillSwitchStatusMode::Locked,
             endpoints: vec![endpoint.clone()],
+            tunnel_permit_rendered: true,
             last_error: None,
         };
         assert!(!kill_switch_unhealthy(Some(&healthy)));
@@ -2824,6 +3551,7 @@ mod tests {
                 live,
                 mode,
                 endpoints: vec![endpoint.clone()],
+                tunnel_permit_rendered: true,
                 last_error: None,
             };
             assert!(kill_switch_unhealthy(Some(&status)), "{wanted} {live} {mode:?}");

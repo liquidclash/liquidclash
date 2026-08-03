@@ -141,8 +141,8 @@ export const ConnectPill = ({
         background: `linear-gradient(120deg, ${hex(spec.color, dark ? 0.12 : 0.09)} 0%, ${hex(spec.color, 0)} 58%), ${
           dark ? 'rgba(13,18,29,0.84)' : 'rgba(255,255,255,0.82)'
         }`,
-        backdropFilter: 'blur(12px) saturate(1.08)',
-        WebkitBackdropFilter: 'blur(12px) saturate(1.08)',
+        backdropFilter: 'var(--tono-glass-blur)',
+        WebkitBackdropFilter: 'var(--tono-glass-blur)',
         boxShadow:
           uiState === 'connected'
             ? `0 18px 42px -28px ${hex(TONO_COLORS.connected, 0.72)}, inset 0 1px 0 ${hex('#FFFFFF', dark ? 0.06 : 0.65)}`

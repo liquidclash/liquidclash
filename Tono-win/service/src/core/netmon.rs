@@ -7,6 +7,16 @@
 //! armed, and "Connected invalidated → reconnect behind the barrier" is the product layer's
 //! job (it owns the UI `Connected` state; the service merely guarantees the fail-closed link
 //! in the chain: event → invalidation signal → still blocking).
+//!
+//! **What this feed is not.** It answers "the machine's networking changed underneath us", so a
+//! change *we* made is out of scope by definition. Writing an adapter's DNS servers is an
+//! IP-interface parameter change, and this service writes them on every connect, every restore
+//! and every DNS reconcile tick; publishing those callbacks made the product layer tear down
+//! and rebuild a perfectly healthy tunnel every few seconds for ever. `raw_notify` therefore
+//! drops — counts, but does not publish — any raw notification that arrives while the `dns`
+//! module has a write window open ([`crate::core::dns::in_self_write_window`]). Suppression
+//! applies to *arriving* callbacks only: a burst that was already pending when the window
+//! opened still fires, so nothing observed before a write of ours is ever retracted.
 
 use once_cell::sync::Lazy;
 use std::collections::VecDeque;
@@ -92,6 +102,17 @@ fn debounce_should_fire(quiet_millis: u64, pending_for_millis: u64) -> bool {
         || pending_for_millis >= DEBOUNCE_MAX_WAIT.as_millis() as u64
 }
 
+/// Whether a raw notification arriving *now* belongs to the product-facing feed.
+///
+/// `false` means this service is mid-DNS-write and the callback is (very probably) the echo of
+/// that write. The decision is a load-only atomic read in `dns`, which matters: this runs on an
+/// IPHelper callback thread that must never block and is not a tokio context, so it cannot take
+/// the `DNS_OPERATION` lock that the apply itself holds.
+#[cfg_attr(feature = "test", allow(dead_code))]
+fn raw_should_publish() -> bool {
+    !crate::core::dns::in_self_write_window()
+}
+
 /// Register the IP-interface and route change notifications plus the debounce task.
 /// Idempotent; the registrations live for the service's lifetime by design.
 pub fn start() {
@@ -117,6 +138,19 @@ mod imp {
     }
 
     fn raw_notify(kind: &str, notification_type: MIB_NOTIFICATION_TYPE) {
+        // Our own DNS write, echoed back at us. Counted for diagnostics, never published: the
+        // product layer answers a published event with a full teardown + reconnect, and the
+        // reconnect writes DNS again. Note what is *not* done here — `PENDING_RAW` is left
+        // exactly as it is, so a genuine burst that was already pending before the window
+        // opened still fires on schedule.
+        if !super::raw_should_publish() {
+            let total = crate::core::dns::note_suppressed_self_write();
+            tracing::debug!(
+                "netmon: raw notification {kind} (type {notification_type}) attributed to this \
+                 service's own DNS write; not published ({total} suppressed since start)"
+            );
+            return;
+        }
         let now = anchor().elapsed().as_millis() as u64;
         // Timestamps first, `PENDING_RAW` last (release): the debounce task acquires on
         // `PENDING_RAW`, so publishing the flag before `LAST_RAW_MILLIS` would let it fire
@@ -235,6 +269,26 @@ mod tests {
         assert_eq!(events.len(), super::MAX_RECORDED_EVENTS);
         assert!(events.last().unwrap().contains("test-event-"));
         assert!(super::change_count() >= super::MAX_RECORDED_EVENTS as u64);
+    }
+
+    /// The P0: a DNS write of ours must not reach the product-facing feed, and the moment the
+    /// write is over the feed must be back.
+    #[test]
+    fn our_own_dns_writes_are_not_published_as_network_changes() {
+        assert!(
+            super::raw_should_publish(),
+            "with no DNS write in flight every notification is the machine's"
+        );
+        {
+            let _window = crate::core::dns::open_self_write_window_for_tests();
+            assert!(
+                !super::raw_should_publish(),
+                "a notification raised by our own DNS write must not be published"
+            );
+        }
+        // The tail keeps suppressing for a moment after the guard drops (the callback is
+        // asynchronous), but the guard itself never leaves a window open.
+        assert_eq!(crate::core::dns::self_write_depth_for_tests(), 0);
     }
 
     #[test]

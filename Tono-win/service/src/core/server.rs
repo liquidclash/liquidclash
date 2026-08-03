@@ -1376,6 +1376,8 @@ async fn release_kill_switch_for_platform() -> Result<HttpResponse> {
                 verified: false,
                 live,
                 mode: crate::KillSwitchStatusMode::Blocked,
+                // No WFP tunnel permit exists on macOS, and this is a *release* besides.
+                tunnel_permit_rendered: false,
                 endpoints: Vec::new(),
                 last_error: None,
             })

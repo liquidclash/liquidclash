@@ -268,6 +268,16 @@ pub struct KillSwitchStatus {
     /// All expected WFP objects verified by key in the last check.
     pub live: bool,
     pub mode: KillSwitchStatusMode,
+    /// Whether the last render actually included the tunnel permit.
+    ///
+    /// `mode` cannot answer this. A `Locked` session whose permit was retracted — the core was
+    /// respawned, or the core instance could not be identified when the lock was taken — looks
+    /// exactly like a `Locked` session that is carrying traffic, while in fact every
+    /// application's traffic is dropped leaving the TUN and `wanted`/`verified`/`live` all keep
+    /// reporting health. `#[serde(default)]` so an older client (which never sees the field)
+    /// still parses the payload and reads the conservative `false`.
+    #[serde(default)]
+    pub tunnel_permit_rendered: bool,
     #[serde(default)]
     pub endpoints: Vec<ProxyEndpoint>,
     #[serde(default)]
@@ -857,6 +867,7 @@ mod tests {
             verified: false,
             live: true,
             mode: KillSwitchStatusMode::Bootstrap,
+            tunnel_permit_rendered: true,
             endpoints: config.proxy_endpoints.clone(),
             last_error: None,
         };
@@ -866,6 +877,19 @@ mod tests {
                 .expect("status should deserialize"),
             status
         );
+        // A payload from a build that predates the field still parses, and reads the
+        // conservative value — the app must not infer "the permit is up" from its absence.
+        let older = serde_json::json!({
+            "wanted": true,
+            "verified": true,
+            "live": true,
+            "mode": "locked",
+            "endpoints": [],
+        });
+        let parsed = serde_json::from_value::<KillSwitchStatus>(older)
+            .expect("an older payload without the field must still parse");
+        assert!(!parsed.tunnel_permit_rendered);
+        assert_eq!(parsed.mode, KillSwitchStatusMode::Locked);
         assert_eq!(
             serde_json::from_value::<KillSwitchStatusMode>(serde_json::json!("locked")).unwrap(),
             KillSwitchStatusMode::Locked

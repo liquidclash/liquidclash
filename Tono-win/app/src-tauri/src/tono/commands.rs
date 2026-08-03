@@ -64,6 +64,31 @@ pub struct TonoStatus {
 /// lose all progress/diagnostics. Writers still publish only fully assembled states.
 static STATUS_SNAPSHOT: Lazy<ArcSwapOption<TonoStatus>> = Lazy::new(ArcSwapOption::empty);
 
+/// Proof-of-life for the *WebView side* of the app, used by the main-thread pump watchdog.
+///
+/// `tono_status` is the one command the running UI calls on a fixed schedule whenever the window
+/// is visible (`useTonoStatus`, 5 s safety-net poll plus every status push). A window that is
+/// visible and has not invoked it for far longer than that has stopped executing JavaScript —
+/// which is the one thing a "(Not Responding)" screenshot cannot tell us apart from a blocked
+/// native main thread. Recording it costs one relaxed store per status read.
+static PROCESS_START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+static LAST_FRONTEND_IPC_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_frontend_ipc() {
+    // +1 so "never called" stays distinguishable from "called in the first millisecond".
+    let stamp = PROCESS_START.elapsed().as_millis().saturating_add(1) as u64;
+    LAST_FRONTEND_IPC_MS.store(stamp, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long since the WebView last invoked `tono_status`, or `None` if it never has.
+pub(crate) fn frontend_ipc_silence() -> Option<std::time::Duration> {
+    let last = LAST_FRONTEND_IPC_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return None;
+    }
+    Some(PROCESS_START.elapsed().saturating_sub(std::time::Duration::from_millis(last)))
+}
+
 /// TS: `interface TonoSignInChallenge { challengeId: string; expiresIn: number; message: string }`
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -652,6 +677,7 @@ pub async fn tono_retry_now(state: tauri::State<'_, Arc<TonoState>>, app: AppHan
 /// Current product status (also pushed on `tono://status`).
 #[tauri::command]
 pub async fn tono_status(state: tauri::State<'_, Arc<TonoState>>) -> Result<TonoStatus, String> {
+    note_frontend_ipc();
     if let Some(status) = STATUS_SNAPSHOT.load_full() {
         return Ok((*status).clone());
     }

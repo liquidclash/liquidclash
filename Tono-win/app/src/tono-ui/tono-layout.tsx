@@ -11,6 +11,7 @@ import {
   WindowResizeHandles,
 } from '@/components/layout/window-controller'
 import { useI18n } from '@/hooks/use-i18n'
+import { useTonoStatus } from '@/hooks/use-tono'
 import { useVerge } from '@/hooks/use-verge'
 import { useWindowDecorations } from '@/hooks/use-window'
 import {
@@ -45,6 +46,7 @@ const TonoLayout = () => {
   const text = tonoText(isDark)
   const { t } = useTranslation()
   const { theme } = useCustomTheme()
+  const { status } = useTonoStatus()
   const { verge } = useVerge()
   const { language } = verge ?? {}
   const { switchLanguage } = useI18n()
@@ -96,7 +98,15 @@ const TonoLayout = () => {
     <ThemeProvider theme={theme}>
       <NoticeManager position={verge?.notice_position} />
       <div
-        className={`tono-root ${OS}`}
+        // A perpetual spinner over a frosted surface makes WebView2 recomposite
+        // the whole blurred region every frame; on a GPU-less VM or over RDP
+        // that is a software Gaussian blur at 60Hz. Give up the glass exactly
+        // while something is animating — the states a real machine froze in.
+        className={`tono-root ${OS}${
+          status?.uiState === 'connecting' || status?.uiState === 'disconnecting'
+            ? ' tono-root--transacting'
+            : ''
+        }`}
         style={{ fontFamily: TONO_FONT_STACK, color: text.primary }}
       >
         <MeshBackground dark={isDark} />

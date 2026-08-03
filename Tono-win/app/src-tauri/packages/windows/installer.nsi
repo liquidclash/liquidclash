@@ -633,6 +633,15 @@ FunctionEnd
     ; The dedicated helper restores protected DNS, removes persistent WFP objects, then deletes
     ; the SCM registration. Never delete its recovery binaries after a failed or unverifiable
     ; cleanup. A damaged install must be repaired first rather than fail open here.
+    ;
+    ; What "unverifiable" means changed, and the reason is worth keeping: this macro used to
+    ; abort unless the user's exact prior DNS configuration was provably restored. On a machine
+    ; whose live DNS apply keeps failing that proof never arrives, so the abort fired every time
+    ; and Tono could not be uninstalled at all. The helper now escalates instead (exact restore →
+    ; automatic/DHCP → refuse), and the only thing that still blocks here is "the kill-switch
+    ; filters may still be installed" — because removing the app while a persistent WFP barrier
+    ; stays armed leaves a blocked machine with no software left to unblock it. An inexact
+    ; resolver does not: the user can change DNS from Windows' own network settings.
     ${IfNot} ${FileExists} "$INSTDIR\resources\tono-service-uninstall.exe"
       Abort "Tono Service uninstaller is missing. Reinstall Tono, then uninstall again."
     ${EndIf}
@@ -643,15 +652,25 @@ FunctionEnd
     ; The helper's exit-code contract (uninstall_service.rs `cleanup_exit_code`):
     ;   0 = the machine is clean (or was already clean)
     ;   2 = the network was provably restored; only cosmetic cleanup (SCM record/binary) failed
-    ;   3 = cleanup could not prove the network was restored; protection is still armed
+    ;   4 = the kill-switch filters were removed, but the saved DNS servers could not be proven
+    ;       restored, so the affected adapters were reset to automatic (DHCP). The machine is
+    ;       neither blocked nor pointed at Tono's resolver: log it and continue.
+    ;   3 = cleanup could not show the machine was made safe; the barrier may still be installed
     ; nsExec may also return "error"/"timeout" or another numeric string. Only a proven-safe
-    ; result may let the uninstall continue: anything that is not 0 or 2 is treated exactly
-    ; like 3, because nothing showed the machine was made safe. This keeps the recovery files
-    ; preserved on every blocking path while no longer dead-ending on cosmetic debris.
+    ; result may let the uninstall continue: anything that is not 0, 2 or 4 is treated exactly
+    ; like 3, because nothing showed the machine was made safe. That discipline is unchanged —
+    ; unknown results still block, and every blocking path still preserves the recovery files.
     ${If} $0 == "2"
       DetailPrint "${PRODUCTNAME} network protection was restored; some Service leftovers could not be removed and will be cleaned up by a future install."
+    ${ElseIf} $0 == "4"
+      DetailPrint "${PRODUCTNAME} network protection was removed, but your previous DNS servers could not be verified, so the affected adapters were set back to automatic (DHCP). Your machine gets DNS from your network again. If you had entered DNS servers by hand, set them again in Settings > Network & Internet."
     ${ElseIf} $0 != "0"
-      Abort "Tono could not verify that your network was fully restored (result $0), so nothing was deleted and your connection is still protected by the kill switch. Please reboot Windows and run this uninstaller again; installing Tono again first also repairs the Service."
+      ; Two different machines land here and the details above carry the helper's own message
+      ; naming which: the kill-switch filters could not be removed (reboot and retry), or they
+      ; were removed but DNS is still pointed at Tono's stopped resolver (set the adapter's DNS
+      ; back to Automatic/DHCP and retry, which then completes on the fallback path above).
+      ; Both remedies are named here because only the detail log can tell them apart.
+      Abort "Tono could not confirm this machine was made safe to uninstall (result $0), so nothing was deleted and the recovery files were kept. See the messages above for what failed. If the kill switch could not be removed, reboot Windows and run this uninstaller again — removing Tono now would leave the machine blocked with nothing left to unblock it. If instead your DNS could not be restored, open Settings > Network & Internet, set your adapter's DNS server assignment back to Automatic (DHCP), then run this uninstaller again. Installing Tono again first also repairs the Service."
     ${EndIf}
   ${EndIf}
 !macroend
@@ -1025,8 +1044,10 @@ Function .onInstFailed
     DetailPrint "${PRODUCTNAME} Service was removed and network protection was restored."
   ${ElseIf} $0 == "2"
     DetailPrint "${PRODUCTNAME} network protection was restored; some Service leftovers remain and will be cleaned up by a future install."
+  ${ElseIf} $0 == "4"
+    DetailPrint "${PRODUCTNAME} network protection was removed, but your previous DNS servers could not be verified, so the affected adapters were set back to automatic (DHCP)."
   ${Else}
-    DetailPrint "${PRODUCTNAME} Service cleanup could not be verified (result $0); your connection is still protected by the kill switch. Reboot Windows, then run this installer again or uninstall ${PRODUCTNAME} from Add/Remove Programs."
+    DetailPrint "${PRODUCTNAME} Service cleanup could not be verified (result $0); your connection may still be protected by the kill switch. Reboot Windows, then run this installer again or uninstall ${PRODUCTNAME} from Add/Remove Programs."
   ${EndIf}
 FunctionEnd
 

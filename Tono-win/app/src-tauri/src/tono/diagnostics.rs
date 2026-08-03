@@ -403,6 +403,7 @@ mod tests {
                             protocol: ProxyProtocol::Udp,
                         },
                     ],
+                    tunnel_permit_rendered: false,
                     last_error: Some(format!(
                         "WFP permit for {NODE_IP}:443 rejected; Authorization: Bearer {ACCESS_TOKEN}"
                     )),

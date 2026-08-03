@@ -1,6 +1,19 @@
 /* Tono shell/page layout. Build-time stylesheet (vite) — loaded via <link> so the
    layout never depends on runtime <style> injection surviving in the webview. */
 
+:root {
+  --tono-glass-blur: blur(12px) saturate(1.08);
+}
+
+/* A spinner over a frosted surface makes WebView2 recomposite the whole blurred
+   region every frame. On a GPU-less VM or an RDP session that is a full-window
+   software Gaussian blur at 60 Hz, and the two states that render a perpetual
+   spinner are exactly the two a real machine was seen frozen in. Idle keeps the
+   glass; anything animating gives it up. */
+.tono-root--transacting {
+  --tono-glass-blur: none;
+}
+
 .tono-root {
   position: relative;
   width: 100vw;
@@ -51,8 +64,8 @@
   flex-direction: column;
   padding: 18px 12px;
   box-sizing: border-box;
-  backdrop-filter: blur(12px) saturate(1.08);
-  -webkit-backdrop-filter: blur(12px) saturate(1.08);
+  backdrop-filter: var(--tono-glass-blur);
+  -webkit-backdrop-filter: var(--tono-glass-blur);
 }
 .tono-brand {
   display: flex;

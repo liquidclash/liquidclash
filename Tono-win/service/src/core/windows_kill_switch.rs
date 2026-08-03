@@ -128,9 +128,31 @@ static RESTORE_WAS_LOCKED: AtomicBool = AtomicBool::new(false);
 static LAST_VERIFY: Lazy<Mutex<Option<(std::time::Instant, bool)>>> =
     Lazy::new(|| Mutex::new(None));
 
-/// How long a status read may trust the cached verify: the watchdog re-verifies every
-/// second, so this keeps reads at most one tick stale while staying off the RPC path.
-const VERIFY_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// The watchdog's sleep between verify-after-write ticks. Named so the staleness budget below
+/// can be derived from it instead of restating it.
+const WATCHDOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a status read may trust the cached verify.
+///
+/// This is a *staleness* budget, not an optimism budget: a verify that actually fails writes
+/// `note_verify(false)` and `live` goes false on the next read regardless of the TTL. What the
+/// TTL decides is only whether "no fresh answer yet" reads as dead — and that has to allow for
+/// how long a **successful** tick can legitimately take.
+///
+/// One refresh interval is `WATCHDOG_PERIOD` (1 s) plus the verify itself, which is one
+/// `FwpmFilterGetByKey0` RPC to BFE per expected filter — 30-60 round trips. This module
+/// already declares how slow that is allowed to get while still being a success:
+/// `WFP_SLOW_CALL` (2 s) is "pathological but reportable", not "failed"; the failure budget is
+/// `WFP_CALL_TIMEOUT` (25 s). At the old 1.5 s the cache expired *before* a merely slow tick
+/// could refresh it, so a healthy machine reported `live: false` — which the app reads as
+/// unhealthy — purely because BFE was busy.
+///
+/// So the floor is `WATCHDOG_PERIOD + WFP_SLOW_CALL` = 3 s, and the budget is that plus one
+/// more period-and-slow-call of headroom for a tick that also had to queue behind another
+/// writer on `WFP_OPERATION`: **5 s**. It stays far below `WFP_CALL_TIMEOUT`, so an engine that
+/// is genuinely wedged — the case where no answer ever arrives — still reads dead within five
+/// seconds, well inside the app's own reconnect budget.
+const VERIFY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Stable, App-mappable marker for "the WFP engine stopped answering". The App keys its i18n
 /// off prefixes like `TONO_SERVICE_BUSY` by substring, and every handler wraps this message in
@@ -151,6 +173,36 @@ const DNS_RESTORE_STALLED_PREFIX: &str = "TONO_DNS_RESTORE_STALLED";
 /// the module's own worst case fits inside this and the bound only fires on a genuine stall. It
 /// also stays under the IPC handler's 60 s budget, so the refusal still reaches the client.
 const DNS_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// Budget for the uninstall-only DNS escalation ladder (`dns::restore_for_uninstall`), which is
+/// up to two full restore rounds back to back — the exact restore, then the automatic (DHCP)
+/// fallback — plus their read-backs. Reusing [`DNS_RESTORE_TIMEOUT`] would cut the ladder off
+/// somewhere inside rung 2 on a merely slow machine and report "no evidence" for work that was
+/// still making progress, which is the one input that lands on the blocking rung. It stays well
+/// under the installer's `/TIMEOUT=180000` for the whole helper (`installer.nsi`,
+/// `RemoveVergeService`), which also has to cover stopping the service.
+const UNINSTALL_DNS_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(100);
+
+/// Environment variable by which the uninstaller opts *its own process* into the DNS escalation
+/// ladder (`dns::restore_for_uninstall`).
+///
+/// The ladder trades exact DNS fidelity for a machine that can actually be uninstalled. That
+/// trade is only correct when the product is being removed, so it must not be reachable from
+/// anything else that calls this entry point — in particular not from
+/// `tono-service.exe --emergency-disarm`, the Start-Menu "Restore Network" recovery, whose job
+/// is to put the user's *own* servers back on a machine that is staying installed.
+///
+/// An in-process environment variable rather than a parameter because the uninstaller is a
+/// separate binary linking this library and this is the exported entry point it has; the
+/// variable is set by `uninstall_service.rs` in its own process image immediately before the
+/// call, so it can never leak into a service or App process.
+pub(crate) const UNINSTALL_LADDER_ENV: &str = "TONO_UNINSTALL_DNS_LADDER";
+
+/// Whether the calling process asked for the uninstall ladder. Absent, empty or anything other
+/// than `1` means no: an unrecognised value must fall back to the strict path.
+fn uninstall_ladder_requested() -> bool {
+    std::env::var_os(UNINSTALL_LADDER_ENV).is_some_and(|value| value == "1")
+}
 
 fn note_verify(ok: bool) {
     *LAST_VERIFY
@@ -183,6 +235,16 @@ fn last_verify_guard() -> std::sync::MutexGuard<'static, Option<(std::time::Inst
     LAST_VERIFY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How `status()` turns the cached verify into `live`, as a pure function of the cache.
+///
+/// Two things it deliberately does *not* do: it never reports a verify that actually failed as
+/// live (`ok` is a conjunct, not a fallback), and it never reports "no verify has ever run" as
+/// live. The only thing [`VERIFY_CACHE_TTL`] buys is that a **successful but slow** tick does
+/// not read as dead in the gap before it lands.
+fn verify_reads_live(last_verify: Option<(std::time::Instant, bool)>) -> bool {
+    last_verify.is_some_and(|(at, ok)| ok && at.elapsed() < VERIFY_CACHE_TTL)
 }
 
 fn intent_path() -> PathBuf {
@@ -318,8 +380,30 @@ fn rule_config_for(armed: &Armed, current_core: Option<CoreInstance>) -> RuleCon
 /// outcome of this rule that needs evidence in the service log.
 static TUNNEL_PERMIT_ORPHANED: AtomicBool = AtomicBool::new(false);
 
-async fn rule_config(armed: &Armed) -> RuleConfig {
-    let config = rule_config_for(armed, current_core_instance().await);
+/// Whether the **last render** actually put the tunnel permit in the expected set.
+///
+/// Reported as `KillSwitchStatus::tunnel_permit_rendered`. `mode: Locked` alone cannot say
+/// this: a locked session whose permit was retracted (a core respawn, or a `core_instance` that
+/// could not be identified at lock time) is byte-for-byte identical on the wire to a locked
+/// session that is carrying traffic, while every application on the machine has its traffic
+/// dropped leaving the TUN. This is what makes the two distinguishable to the app.
+static TUNNEL_PERMIT_RENDERED: AtomicBool = AtomicBool::new(false);
+
+/// The rule model's view of an armed session for a core identity the caller has **already
+/// read**.
+///
+/// Threading the value in is the point: `lock` records `armed.core_instance` and then renders
+/// from it in the same breath, and the two must be the same read. `current_core_instance` goes
+/// through `status_snapshot_nonblocking`, which falls back to a cache whenever the core manager
+/// is busy, so two reads a few microseconds apart can legitimately disagree. When they did, the
+/// recorded instance was the stale one (typically `None`) and the rendered one was the truth:
+/// `tunnel_permit_luid` then refused the permit for ever — an unidentified grant is
+/// unrevivable by design — and the machine sat at `mode: Locked, live: true, verified: true`
+/// with no tunnel permit at all, dropping every application's traffic while every health check
+/// passed. One read, threaded through, cannot disagree with itself.
+fn rule_config_rendering(armed: &Armed, current_core: Option<CoreInstance>) -> RuleConfig {
+    let config = rule_config_for(armed, current_core);
+    TUNNEL_PERMIT_RENDERED.store(config.tun_luid.is_some(), Ordering::Relaxed);
     let orphaned = armed.tun_luid.is_some() && config.tun_luid.is_none();
     if orphaned != TUNNEL_PERMIT_ORPHANED.swap(orphaned, Ordering::Relaxed) {
         if orphaned {
@@ -610,7 +694,14 @@ async fn engine_call<T: Send + 'static>(
 }
 
 async fn install_unlocked(armed: &Armed) -> Result<()> {
-    let expected = wfp_model::expected_filters(&rule_config(armed).await);
+    install_unlocked_for(armed, current_core_instance().await).await
+}
+
+/// [`install_unlocked`] for a caller that has already read the core identity and must render
+/// from *that* read — see [`rule_config_rendering`]. `lock` is the only such caller, and it is
+/// the one where a second, disagreeing read is terminal.
+async fn install_unlocked_for(armed: &Armed, current_core: Option<CoreInstance>) -> Result<()> {
+    let expected = wfp_model::expected_filters(&rule_config_rendering(armed, current_core));
     #[cfg(all(windows, not(feature = "test")))]
     {
         let app_path = armed.intent.app_path.clone();
@@ -630,7 +721,8 @@ async fn install_unlocked(armed: &Armed) -> Result<()> {
 }
 
 async fn verify_live_unlocked(armed: &Armed) -> Result<()> {
-    let expected = wfp_model::expected_filters(&rule_config(armed).await);
+    let expected =
+        wfp_model::expected_filters(&rule_config_rendering(armed, current_core_instance().await));
     #[cfg(all(windows, not(feature = "test")))]
     {
         engine_call("verify", move || crate::core::wfp::verify(&expected)).await
@@ -859,16 +951,30 @@ pub(crate) async fn lock(tunnel_interface: Option<&str>) -> Result<()> {
     // Read the core identity *before* resolving the LUID: a core replaced in between makes the
     // recorded instance stale rather than falsely current, so the next render retracts the
     // permit instead of handing it to an adapter the new core did not create.
+    //
+    // Read it exactly **once**. This value is both persisted into `armed.core_instance` and
+    // handed to the render below; a second read for the render could disagree with it (the
+    // snapshot behind `current_core_instance` falls back to a cache while the core manager is
+    // busy), and a disagreement here is terminal — see `rule_config_rendering`.
     let core_instance = current_core_instance().await;
     let luid = resolve_luid(&recorded).await?;
     armed.tun_luid = Some(luid);
     armed.core_instance = core_instance;
+    if core_instance.is_none() {
+        // Not fatal — the permit is simply not rendered and the tunnel stays blocked until the
+        // app locks again — but it is invisible in `mode` alone, so it has to be in the log as
+        // well as in `tunnel_permit_rendered`.
+        tracing::warn!(
+            "wfp: locking without an identifiable core instance; the tunnel permit will not be \
+             rendered and tunnel traffic stays blocked until the app locks again"
+        );
+    }
     armed.intent.mode = KillSwitchStatusMode::Locked;
     armed.intent.updated_at = now_unix();
     // Update live WFP first (the macOS helper's add_tunnel ordering): if this fails, the
     // previous bootstrap rules remain effective and the persisted intent restores them after
-    // a crash.
-    install_unlocked(&armed).await?;
+    // a crash. Rendered from the same `core_instance` that was just recorded, never a re-read.
+    install_unlocked_for(&armed, core_instance).await?;
     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?).await?;
     *armed_guard() = Some(armed);
     *last_error_guard() = None;
@@ -1003,6 +1109,7 @@ async fn disarm_unlocked() -> Result<()> {
     }
     *armed_guard() = None;
     *last_error_guard() = None;
+    TUNNEL_PERMIT_RENDERED.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1155,6 +1262,7 @@ pub async fn restore_on_service_start() -> Result<()> {
                     Err(error) => return Err(error.into()),
                 }
                 *armed_guard() = None;
+                TUNNEL_PERMIT_RENDERED.store(false, Ordering::Relaxed);
                 if let Err(error) = bounded_dns_call(
                     "service start (unwanted intent)",
                     crate::core::dns::ensure_restored(),
@@ -1342,7 +1450,7 @@ pub fn spawn_windows_kill_switch_watchdog() {
         // reports liveness from.
         let mut last_error_log: Option<std::time::Instant> = None;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(WATCHDOG_PERIOD).await;
             let _operation = WFP_OPERATION.lock().await;
             let armed = { armed_guard().clone() };
             if let Some(armed) = armed {
@@ -1373,6 +1481,14 @@ pub fn spawn_windows_kill_switch_watchdog() {
 /// object whose provider key is Tono's (filters → legacy sublayers → sublayer → provider),
 /// and remove the intent record. It touches no other provider, sublayer, or Windows Defender
 /// Firewall setting.
+///
+/// **The invariant this function exists to hold, and the one the uninstall exit codes rest on:**
+/// the WFP objects are removed before any DNS outcome is reported, and every `?` above the
+/// removal fails *without* reporting a DNS outcome. So a returned
+/// `dns::DNS_RESTORED_AUTOMATIC_PREFIX` (the ladder's rung 2) is proof that the filters are
+/// gone, and every error that does not carry it is treated by the uninstaller as "the barrier
+/// may still be installed" and blocks. Removing WFP and continuing is acceptable; removing the
+/// app and leaving WFP is not.
 pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     let _operation = WFP_OPERATION.lock().await;
     // This is still the fail-open escape hatch: WFP objects are removed even if protected DNS
@@ -1385,8 +1501,29 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     // removes WFP whether or not DNS could be restored, so a timeout only changes *how* the
     // uninstaller reports an unrestored resolver — never whether it proved one before opening.
     // An unbounded hang here would instead wedge the uninstaller while holding `WFP_OPERATION`.
-    let dns_restore =
-        bounded_dns_call("emergency disarm", crate::core::dns::restore_protected()).await;
+    //
+    // Two DNS strategies, chosen by the *calling process*, never by the machine's condition:
+    //
+    // * The uninstaller opts into `dns::restore_for_uninstall`, the escalation ladder. Its
+    //   rung 2 resets the adapters Tono redirected to automatic (DHCP) rather than refusing —
+    //   because the alternative, which is what this code used to do, was an application the
+    //   user could not remove. See the block comment above `dns::uninstall_restore_rung`.
+    // * Everyone else — `tono-service.exe --emergency-disarm`, the Start-Menu "Restore Network"
+    //   entry — keeps `dns::restore_protected` verbatim. That path's promise is to put the
+    //   user's *own* servers back on a machine that is staying installed, and a machine that is
+    //   staying installed can retry. Nothing about it is made more permissive here.
+    let dns_restore = if uninstall_ladder_requested() {
+        bounded_dns_call_within(
+            UNINSTALL_DNS_RESTORE_TIMEOUT,
+            "uninstall disarm",
+            crate::core::dns::restore_for_uninstall(),
+        )
+        .await
+    } else {
+        bounded_dns_call("emergency disarm", crate::core::dns::restore_protected())
+            .await
+            .map(|_| crate::core::dns::UninstallDnsRestore::Exact)
+    };
 
     // Persist fail-open intent *before* removing WFP. If deleting the intent file later fails,
     // service-start recovery sees this tombstone and completes cleanup instead of re-arming the
@@ -1424,21 +1561,53 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     engine_call("emergency disarm", crate::core::wfp::emergency_disarm).await?;
     *armed_guard() = None;
     *last_verify_guard() = None;
+    TUNNEL_PERMIT_RENDERED.store(false, Ordering::Relaxed);
     match tokio::fs::remove_file(intent_path()).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    dns_restore.map(|_| ()).map_err(|error| {
-        let snapshot = crate::service_paths()
-            .persistent_state_dir()
-            .join("protected-dns.json");
-        anyhow::anyhow!(
-            "WFP was removed, but DNS restore could not be proven: {error:#}. \
-             Recovery snapshot: {snapshot:?}. Restore the affected adapter DNS (usually DHCP), \
-             then rerun the uninstaller; if the snapshot is corrupt, delete it only after DNS is verified."
-        )
-    })
+    // Everything below runs only once the WFP objects are provably gone: the two `?` above
+    // return before it. That is what makes the marker in the rung-2 error trustworthy as
+    // "the barrier is removed" and not merely "DNS is inexact".
+    match dns_restore {
+        // Rung 1: the snapshot was restored and proven. Nothing to report.
+        Ok(crate::core::dns::UninstallDnsRestore::Exact) => Ok(()),
+        // Rung 2: reported through the error channel on purpose. This entry point's contract has
+        // always been "return the DNS deviation *after* the WFP cleanup so a caller cannot
+        // report unqualified success", and rung 2 is a deviation — the user's own servers were
+        // not restored. The marker is what turns it into a *continue*-with-warning at the
+        // uninstaller instead of a refusal; a caller that does not know the marker keeps the old,
+        // conservative reading, which is the correct default for anything that is not an
+        // uninstall. Reachable only when this process opted into the ladder.
+        Ok(crate::core::dns::UninstallDnsRestore::Automatic { adapters }) => {
+            let snapshot = crate::service_paths()
+                .persistent_state_dir()
+                .join("protected-dns.json");
+            Err(anyhow::anyhow!(
+                "{}: WFP was removed and {} adapter(s) were set back to automatic (DHCP) DNS \
+                 because the saved servers could not be proven restored. The machine resolves \
+                 through the network's own DNS again; this is not the exact previous \
+                 configuration. The saved servers were kept next to {snapshot:?} under a \
+                 `protected-dns.superseded-*.json` name if they are needed. Uninstall may \
+                 continue: nothing of Tono's is left blocking or redirecting this machine.",
+                crate::core::dns::DNS_RESTORED_AUTOMATIC_PREFIX,
+                adapters.len(),
+            ))
+        }
+        // Rung 3, or a DNS failure on the non-uninstall path: unchanged in shape and in
+        // consequence.
+        Err(error) => {
+            let snapshot = crate::service_paths()
+                .persistent_state_dir()
+                .join("protected-dns.json");
+            Err(anyhow::anyhow!(
+                "WFP was removed, but DNS restore could not be proven: {error:#}. \
+                 Recovery snapshot: {snapshot:?}. Restore the affected adapter DNS (usually DHCP), \
+                 then rerun the uninstaller; if the snapshot is corrupt, delete it only after DNS is verified."
+            ))
+        }
+    }
 }
 
 pub(crate) async fn status() -> KillSwitchStatus {
@@ -1452,14 +1621,13 @@ pub(crate) async fn status() -> KillSwitchStatus {
             verified: false,
             live: false,
             mode: KillSwitchStatusMode::Blocked,
+            tunnel_permit_rendered: false,
             endpoints: Vec::new(),
             last_error: last_error_guard().clone(),
         };
     };
     let live = if ENGINE_LIVE {
-        last_verify_guard()
-            .as_ref()
-            .is_some_and(|(at, ok)| *ok && at.elapsed() < VERIFY_CACHE_TTL)
+        verify_reads_live(*last_verify_guard())
     } else {
         // No engine behind this build: report the recorded intent without claiming liveness.
         false
@@ -1469,6 +1637,10 @@ pub(crate) async fn status() -> KillSwitchStatus {
         verified: armed.intent.is_verified(),
         live,
         mode: armed.intent.mode,
+        // What the last render decided, not what a render right now would decide: this is a
+        // report on the policy that is installed, and it must not run a fresh core-manager read
+        // on the status path.
+        tunnel_permit_rendered: TUNNEL_PERMIT_RENDERED.load(Ordering::Relaxed),
         endpoints: armed.intent.endpoints.clone(),
         last_error: last_error_guard().clone(),
     }
@@ -1519,6 +1691,11 @@ mod tests {
             ],
             ..test_config()
         }
+    }
+
+    /// What a watchdog tick renders for this session right now.
+    async fn render(armed: &Armed) -> RuleConfig {
+        rule_config_rendering(armed, current_core_instance().await)
     }
 
     fn dns_snapshot_path() -> PathBuf {
@@ -2031,8 +2208,258 @@ mod tests {
             tokio::fs::metadata(dns_snapshot_path()).await.is_ok(),
             "failed DNS proof must remain available for retry"
         );
+        assert!(
+            !message.contains(crate::core::dns::DNS_RESTORED_AUTOMATIC_PREFIX),
+            "without the uninstaller's opt-in the DNS ladder must not run — the Start-Menu \
+             \"Restore Network\" entry exists to put the user's own servers back on a machine \
+             that is staying installed, and must not silently flatten them to DHCP: {message}"
+        );
         cleanup().await;
         Ok(())
+    }
+
+    // --- The uninstall-only escalation ladder ---
+
+    /// Opts the *process* into `dns::restore_for_uninstall`, exactly as `uninstall_service.rs`
+    /// does, and takes it back out again so no other test inherits it.
+    struct UninstallLadderOptIn;
+
+    impl UninstallLadderOptIn {
+        fn enter() -> Self {
+            // SAFETY: every test that uses this is `#[serial]`, so no other thread in this
+            // binary is reading or writing the environment while it is set.
+            unsafe { std::env::set_var(UNINSTALL_LADDER_ENV, "1") };
+            Self
+        }
+    }
+
+    impl Drop for UninstallLadderOptIn {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(UNINSTALL_LADDER_ENV) };
+        }
+    }
+
+    /// A snapshot whose originals are ordinary public resolvers, so every adapter in it is one
+    /// Tono redirected and is therefore a legitimate target for the DHCP reset.
+    fn redirected_snapshot() -> crate::core::dns::DnsSnapshot {
+        crate::core::dns::DnsSnapshot {
+            version: 1,
+            taken_at: 1,
+            adapters: vec![
+                crate::core::dns::AdapterDnsSnapshot {
+                    interface_guid: "{ETHERNET}".to_owned(),
+                    ipv4_name_server: Some("1.1.1.1".to_owned()),
+                    ..Default::default()
+                },
+                crate::core::dns::AdapterDnsSnapshot {
+                    interface_guid: "{WIFI}".to_owned(),
+                    ipv4_name_server: Some("8.8.8.8".to_owned()),
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    /// Whether the ladder set the live snapshot aside under its `superseded` name instead of
+    /// deleting the user's only record of their original resolvers.
+    async fn superseded_snapshot_exists() -> bool {
+        let paths = crate::service_paths();
+        let directory = paths.persistent_state_dir();
+        let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
+            return false;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("protected-dns.superseded-") {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn remove_superseded_snapshots() {
+        let paths = crate::service_paths();
+        let directory = paths.persistent_state_dir();
+        let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("protected-dns.superseded-") {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+
+    /// Rung 1: nothing changes for a machine whose exact restore is provable. The ladder is an
+    /// escalation, not a shortcut — it must never reach for DHCP while the saved servers can be
+    /// put back.
+    #[tokio::test]
+    #[serial]
+    async fn uninstall_ladder_prefers_the_exact_restore() -> Result<()> {
+        cleanup().await;
+        remove_superseded_snapshots().await;
+        let _opt_in = UninstallLadderOptIn::enter();
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        atomic_write(
+            &dns_snapshot_path(),
+            &serde_json::to_vec_pretty(&crate::core::dns::DnsSnapshot {
+                version: 1,
+                taken_at: 1,
+                adapters: Vec::new(),
+            })?,
+        )
+        .await?;
+
+        emergency_disarm_windows_kill_switch()
+            .await
+            .expect("a provable restore reports plain success");
+
+        assert!(ARMED.lock().unwrap().is_none());
+        assert!(tokio::fs::metadata(dns_snapshot_path()).await.is_err());
+        assert!(
+            !superseded_snapshot_exists().await,
+            "rung 1 must not leave a superseded snapshot behind"
+        );
+        cleanup().await;
+        Ok(())
+    }
+
+    /// Rung 2 — the regression this ladder exists for. The machine is still resolving through
+    /// the loopback core when the exact restore is attempted, so the old code returned an
+    /// unqualified failure, `uninstall_service.rs` exited 3 and `installer.nsi` aborted: the
+    /// application could not be uninstalled at all. Now the adapters are reset to automatic
+    /// (DHCP), verified off the loopback resolver, and the failure carries the marker that lets
+    /// the uninstall continue.
+    #[tokio::test]
+    #[serial]
+    async fn uninstall_ladder_falls_back_to_automatic_dns_instead_of_becoming_unremovable()
+    -> Result<()> {
+        cleanup().await;
+        remove_superseded_snapshots().await;
+        let _opt_in = UninstallLadderOptIn::enter();
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        atomic_write(
+            &dns_snapshot_path(),
+            &serde_json::to_vec_pretty(&redirected_snapshot())?,
+        )
+        .await?;
+        // The reported machine: the exact restore cannot be proven because adapters still read
+        // as the loopback redirect. The DHCP reset is what clears that.
+        simulate_machine_still_on_loopback_dns();
+
+        let error = emergency_disarm_windows_kill_switch()
+            .await
+            .expect_err("an inexact restore is still reported, but as a continuable one");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains(crate::core::dns::DNS_RESTORED_AUTOMATIC_PREFIX),
+            "the fallback must be reported with the marker the uninstaller keys its \
+             continue-with-warning exit code off: {message}"
+        );
+        assert!(
+            !message.contains(crate::core::dns::DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX),
+            "{message}"
+        );
+        // The invariant: the marker may only ever be produced once the barrier is gone.
+        assert!(
+            ARMED.lock().unwrap().is_none(),
+            "the continuing outcome must never be reported while the kill switch is armed"
+        );
+        assert!(
+            tokio::fs::metadata(intent_path()).await.is_err(),
+            "a continuing uninstall must not leave an intent record that re-arms on reboot"
+        );
+        assert!(
+            tokio::fs::metadata(dns_snapshot_path()).await.is_err(),
+            "the redirect is gone, so the live snapshot must not survive to be replayed"
+        );
+        assert!(
+            superseded_snapshot_exists().await,
+            "the user's original servers must be retained under the superseded name, not deleted"
+        );
+
+        remove_superseded_snapshots().await;
+        cleanup().await;
+        Ok(())
+    }
+
+    /// Rung 3: the refusal survives, but only for a machine that provably cannot be taken off
+    /// the loopback resolver — and even then the WFP objects are gone, so the user is online and
+    /// one DNS change away from an uninstall that completes. Every recovery file is preserved.
+    #[tokio::test]
+    #[serial]
+    async fn uninstall_ladder_still_refuses_when_the_machine_cannot_leave_the_loopback_resolver()
+    -> Result<()> {
+        cleanup().await;
+        remove_superseded_snapshots().await;
+        let _opt_in = UninstallLadderOptIn::enter();
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        atomic_write(
+            &dns_snapshot_path(),
+            &serde_json::to_vec_pretty(&redirected_snapshot())?,
+        )
+        .await?;
+        simulate_machine_still_on_loopback_dns();
+        // Neither the exact restore nor the DHCP reset lands, so nothing takes the machine off
+        // the loopback resolver.
+        crate::core::dns::test_hooks::set_live_apply_fails(true);
+
+        let error = emergency_disarm_windows_kill_switch()
+            .await
+            .expect_err("a machine that is provably still redirected must not be walked away from");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains(crate::core::dns::DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX),
+            "{message}"
+        );
+        assert!(
+            !message.contains(crate::core::dns::DNS_RESTORED_AUTOMATIC_PREFIX),
+            "the blocking rung must never carry the marker that lets an uninstall continue: \
+             {message}"
+        );
+        assert!(
+            message.contains("Automatic (DHCP)"),
+            "the refusal has to tell the user what to do about it: {message}"
+        );
+        // Even here the barrier is removed: being unable to remove the app *and* being blocked
+        // offline is the worse end state, and the barrier is the half that makes them offline.
+        assert!(ARMED.lock().unwrap().is_none());
+        assert!(tokio::fs::metadata(intent_path()).await.is_err());
+        assert!(
+            tokio::fs::metadata(dns_snapshot_path()).await.is_ok(),
+            "a refused uninstall preserves every recovery file for the retry"
+        );
+        assert!(!superseded_snapshot_exists().await);
+
+        crate::core::dns::test_hooks::set_live_apply_fails(false);
+        remove_superseded_snapshots().await;
+        cleanup().await;
+        Ok(())
+    }
+
+    /// The opt-in is the whole boundary between the two behaviours: an unset or unrecognised
+    /// value must leave the strict path in force, because everything that is not an uninstall
+    /// still wants the user's exact servers back.
+    #[test]
+    #[serial]
+    fn only_an_explicit_opt_in_enables_the_uninstall_ladder() {
+        // SAFETY: `#[serial]` peers; this test touches the variable alone.
+        unsafe { std::env::remove_var(UNINSTALL_LADDER_ENV) };
+        assert!(!uninstall_ladder_requested());
+        for value in ["", "0", "true", "yes", "2"] {
+            unsafe { std::env::set_var(UNINSTALL_LADDER_ENV, value) };
+            assert!(
+                !uninstall_ladder_requested(),
+                "{value:?} must not be read as an opt-in"
+            );
+        }
+        unsafe { std::env::set_var(UNINSTALL_LADDER_ENV, "1") };
+        assert!(uninstall_ladder_requested());
+        unsafe { std::env::remove_var(UNINSTALL_LADDER_ENV) };
     }
 
     #[tokio::test]
@@ -2216,6 +2643,122 @@ mod tests {
         assert_eq!(rule_config_for(&armed, None).tun_luid, None);
     }
 
+    /// P2: `lock` records the core instance and renders the permit from it. Reading the core
+    /// twice let the two disagree — `status_snapshot_nonblocking` serves a cache whenever the
+    /// core manager is busy — and a disagreement is permanent, because `tunnel_permit_luid`
+    /// refuses to revive an unidentified grant. One read, threaded through, cannot disagree.
+    #[test]
+    fn locking_renders_the_permit_from_the_very_instance_it_recorded() {
+        let running = CoreInstance {
+            pid: 4242,
+            restarts: 3,
+        };
+        for recorded in [
+            None,
+            Some(running),
+            Some(CoreInstance {
+                pid: 1,
+                restarts: 0,
+            }),
+        ] {
+            let armed = Armed {
+                intent: valid_intent(KillSwitchStatusMode::Locked, true),
+                tun_luid: Some(0x7777),
+                core_instance: recorded,
+                direct_endpoints: Vec::new(),
+            };
+            // This is exactly what `lock` now does: `armed.core_instance` and the render's
+            // `current_core` are the same value.
+            assert_eq!(
+                rule_config_for(&armed, armed.core_instance).tun_luid,
+                recorded.map(|_| 0x7777),
+                "a render from the recorded instance agrees with it by construction"
+            );
+        }
+
+        // The defect this replaces: read #1 missed the core, read #2 saw it. The permit is
+        // retracted at the instant it is granted — and `None` can never match again, so the
+        // machine stays Locked, verified and live with every application's traffic dropped
+        // leaving the TUN.
+        let stale = Armed {
+            intent: valid_intent(KillSwitchStatusMode::Locked, true),
+            tun_luid: Some(0x7777),
+            core_instance: None,
+            direct_endpoints: Vec::new(),
+        };
+        assert_eq!(rule_config_for(&stale, Some(running)).tun_luid, None);
+        assert_eq!(
+            rule_config_for(&stale, None).tun_luid,
+            None,
+            "and no later tick can revive it"
+        );
+    }
+
+    /// The observability half: `mode` alone cannot tell "Locked and carrying traffic" from
+    /// "Locked with the permit retracted". `tunnel_permit_rendered` reports what the last
+    /// render actually installed.
+    #[test]
+    fn the_status_flag_tracks_what_the_last_render_installed() {
+        let running = CoreInstance {
+            pid: 90,
+            restarts: 0,
+        };
+        let armed = Armed {
+            intent: valid_intent(KillSwitchStatusMode::Locked, true),
+            tun_luid: Some(0x99),
+            core_instance: Some(running),
+            direct_endpoints: Vec::new(),
+        };
+
+        let config = rule_config_rendering(&armed, Some(running));
+        assert!(config.tun_luid.is_some());
+        assert!(TUNNEL_PERMIT_RENDERED.load(Ordering::Relaxed));
+
+        // Same mode, same `wanted`/`verified`/`live` — only this flag changes.
+        let config = rule_config_rendering(&armed, None);
+        assert_eq!(config.mode, KillSwitchStatusMode::Locked);
+        assert!(config.tun_luid.is_none());
+        assert!(!TUNNEL_PERMIT_RENDERED.load(Ordering::Relaxed));
+    }
+
+    /// P1: `live` is a staleness cache, and its budget has to cover a **successful** but slow
+    /// watchdog tick. At 1.5 s it did not: one sleep (1 s) plus a verify that this module
+    /// itself calls merely "pathological but reportable" at `WFP_SLOW_CALL` (2 s) already
+    /// exceeds it, so a healthy machine reported `live: false` and the app read it as unhealthy.
+    #[test]
+    fn the_verify_cache_survives_a_slow_but_successful_watchdog_tick() {
+        assert!(
+            VERIFY_CACHE_TTL > WATCHDOG_PERIOD + WFP_SLOW_CALL,
+            "the budget must cover a whole slow-but-successful refresh interval"
+        );
+        assert!(
+            VERIFY_CACHE_TTL <= std::time::Duration::from_secs(10),
+            "and stay far below the 25 s call timeout, so a wedged engine still reads dead"
+        );
+
+        let slow_tick = std::time::Instant::now()
+            .checked_sub(WATCHDOG_PERIOD + WFP_SLOW_CALL)
+            .expect("the test host has been up for more than three seconds");
+        assert!(
+            verify_reads_live(Some((slow_tick, true))),
+            "a successful verify that merely took a long time is still alive"
+        );
+
+        // What the TTL must never soften.
+        assert!(
+            !verify_reads_live(Some((std::time::Instant::now(), false))),
+            "a verify that actually failed is dead immediately, TTL or no TTL"
+        );
+        assert!(!verify_reads_live(None), "no verify has ever run");
+        let expired = std::time::Instant::now()
+            .checked_sub(VERIFY_CACHE_TTL + std::time::Duration::from_millis(1))
+            .expect("the test host has been up for more than the TTL");
+        assert!(
+            !verify_reads_live(Some((expired, true))),
+            "an answer older than the budget is stale, not live"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn lock_grants_the_tunnel_permit_against_the_running_core_and_restrict_revokes_it()
@@ -2235,7 +2778,7 @@ mod tests {
         // No core runs behind a test build, so the grant is unidentified — and an unidentified
         // grant renders no tunnel permit, which is the fail-closed direction.
         assert!(armed.core_instance.is_none());
-        assert!(rule_config(&armed).await.tun_luid.is_none());
+        assert!(render(&armed).await.tun_luid.is_none());
 
         restrict_bootstrap().await?;
         let armed = armed_guard().clone().expect("still armed");
@@ -2475,7 +3018,7 @@ mod tests {
         mark_verified("owner-alice").await?;
         let armed = armed_guard().clone().expect("still armed");
         assert_eq!(
-            wfp_model::expected_filters(&rule_config(&armed).await)
+            wfp_model::expected_filters(&render(&armed).await)
                 .iter()
                 .filter(|filter| filter.name.contains("DIRECT"))
                 .count(),
@@ -2486,7 +3029,7 @@ mod tests {
         let armed = armed_guard().clone().expect("still armed");
         assert_eq!(armed.direct_endpoints.len(), 2);
         assert!(
-            !wfp_model::expected_filters(&rule_config(&armed).await)
+            !wfp_model::expected_filters(&render(&armed).await)
                 .iter()
                 .any(|filter| filter.name.contains("DIRECT")),
             "Protected Offline must not keep DIRECT permits installed"
