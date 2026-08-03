@@ -12,7 +12,7 @@ import {
   tonoSignInVerify,
 } from '@/services/tono'
 import { GlassCard } from '@/tono-ui/GlassCard'
-import { TONO_COLORS, tonoText } from '@/tono-ui/theme'
+import { TONO_COLORS, TONO_PAGE_LAYOUT, tonoText } from '@/tono-ui/theme'
 
 const RESEND_COUNTDOWN = 60
 
@@ -227,7 +227,11 @@ const LoginPage = () => {
     return (
       <div
         className="tono-page"
-        style={{ alignItems: 'center', justifyContent: 'center' }}
+        style={{
+          ...TONO_PAGE_LAYOUT,
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
       >
         <GlassCard
           style={{
@@ -269,7 +273,11 @@ const LoginPage = () => {
   return (
     <div
       className="tono-page"
-      style={{ alignItems: 'center', justifyContent: 'center' }}
+      style={{
+        ...TONO_PAGE_LAYOUT,
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
     >
       <GlassCard
         style={{

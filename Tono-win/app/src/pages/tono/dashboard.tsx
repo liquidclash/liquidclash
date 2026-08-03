@@ -17,6 +17,7 @@ import { GlassCard } from '@/tono-ui/GlassCard'
 import {
   TONO_COLORS,
   TONO_MONO_STACK,
+  TONO_PAGE_LAYOUT,
   TONO_SPRING,
   tonoText,
 } from '@/tono-ui/theme'
@@ -289,15 +290,7 @@ const DashboardPage = () => {
     // card jammed into the window's left edge.
     <div
       className="tono-page tono-dashboard"
-      style={{
-        minHeight: '100%',
-        boxSizing: 'border-box',
-        display: 'flex',
-        flexDirection: 'column',
-        padding: '48px 40px 36px',
-        height: '100vh',
-        paddingTop: 42,
-      }}
+      style={{ ...TONO_PAGE_LAYOUT, height: '100vh', paddingTop: 42 }}
     >
       {status?.catalogRequiresChoice && (
         <div

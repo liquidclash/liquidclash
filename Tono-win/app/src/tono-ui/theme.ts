@@ -28,6 +28,22 @@ export const TONO_FONT_STACK =
 export const TONO_MONO_STACK =
   'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace'
 
+/**
+ * `.tono-page`'s structural rules, for pages to also set inline.
+ *
+ * A customer machine was found rendering with no layout stylesheet applied,
+ * which left every page as an unstyled top-left column — and a page that
+ * relies on the class for `display: flex` cannot centre itself with inline
+ * `alignItems` alone. Inline structure keeps the layout under that failure.
+ */
+export const TONO_PAGE_LAYOUT = {
+  minHeight: '100%',
+  boxSizing: 'border-box',
+  display: 'flex',
+  flexDirection: 'column',
+  padding: '48px 40px 36px',
+} as const
+
 /** Text/foreground ramps. macOS resolves these from semantic colors. */
 export const tonoText = (dark: boolean) => ({
   primary: dark ? 'rgba(255,255,255,0.96)' : 'rgba(20,22,30,0.94)',
