@@ -87,6 +87,17 @@ const VERIFY_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1
 #[cfg(all(windows, not(feature = "test")))]
 const API_HOST_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Stable, App-mappable marker for "the WFP engine stopped answering". The App keys its i18n
+/// off prefixes like `TONO_SERVICE_BUSY` by substring, and every handler wraps this message in
+/// its own context ("Failed to arm Windows kill switch: …"), so the marker has to survive
+/// anywhere inside the string rather than only at its start.
+#[cfg_attr(not(any(all(windows, not(feature = "test")), test)), allow(dead_code))]
+pub(crate) const WFP_ENGINE_WEDGED_PREFIX: &str = "TONO_WFP_ENGINE_WEDGED";
+/// Stable, App-mappable marker for "the Base Filtering Engine is not running". Separate from
+/// the wedge marker because the user action differs: start BFE versus reboot the machine.
+#[cfg_attr(not(all(windows, not(feature = "test"))), allow(dead_code))]
+pub(crate) const BFE_NOT_RUNNING_PREFIX: &str = "TONO_BFE_NOT_RUNNING";
+
 fn note_verify(ok: bool) {
     *LAST_VERIFY
         .lock()
@@ -235,15 +246,278 @@ fn rule_config(armed: &Armed) -> RuleConfig {
     }
 }
 
-/// Engine calls are synchronous WFP RPCs; run them off the (possibly single-threaded) IPC
-/// runtime so a slow BFE cannot freeze request handling (the DNS engine does the same).
+/// Budget for one WFP call. A healthy transaction is milliseconds and the surrounding IPC
+/// handler budget is `IPC_HANDLER_TIMEOUT` = 60 s, so 25 s is three orders of magnitude beyond
+/// "slow but alive" while still leaving the handler more than half its budget to answer the
+/// client. Because the first expiry latches the in-flight claim (see below), every later call
+/// in the same handler fails immediately — one handler can therefore stall for at most one
+/// budget, no matter how many engine calls its path makes.
+#[cfg(all(windows, not(feature = "test")))]
+const WFP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+/// Anything slower than this is already pathological: report it even for the once-a-second
+/// verify, so the log carries evidence of a degrading BFE before it wedges completely.
+#[cfg(any(all(windows, not(feature = "test")), test))]
+const WFP_SLOW_CALL: std::time::Duration = std::time::Duration::from_secs(2);
+/// The BFE probe is an SCM query, not a WFP RPC: it exists only to name the cause, so it gets
+/// a short budget and never delays an engine call for long.
+#[cfg(all(windows, not(feature = "test")))]
+const BFE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A WFP call that was handed to a blocking thread and has not come back yet.
+///
+/// Registered *before* the thread is spawned and released *only* by that thread — never by the
+/// caller. That asymmetry is the whole single-writer argument: a caller that hits its deadline
+/// gives up on the *answer*, not on the *ownership*.
+#[cfg(any(all(windows, not(feature = "test")), test))]
+#[derive(Debug, Clone, Copy)]
+struct EngineCallInFlight {
+    operation: &'static str,
+    started_at: std::time::Instant,
+    /// Epoch of this call. The releasing guard only clears its own epoch, so a call that
+    /// returns very late can never erase the claim of a call that started after it.
+    epoch: u64,
+    /// Its caller already timed out and reported failure; the result is discarded on arrival.
+    abandoned: bool,
+}
+
+#[cfg(any(all(windows, not(feature = "test")), test))]
+static ENGINE_CALL_IN_FLIGHT: Lazy<Mutex<Option<EngineCallInFlight>>> =
+    Lazy::new(|| Mutex::new(None));
+#[cfg(any(all(windows, not(feature = "test")), test))]
+static ENGINE_CALL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(all(windows, not(feature = "test")), test))]
+fn engine_call_slot() -> std::sync::MutexGuard<'static, Option<EngineCallInFlight>> {
+    ENGINE_CALL_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(any(all(windows, not(feature = "test")), test))]
+fn engine_call_in_flight() -> Option<EngineCallInFlight> {
+    *engine_call_slot()
+}
+
+/// Refusal for a caller that wants to start an engine call while an earlier one is still
+/// inside the kernel. Honest and fail-closed: nothing is installed, nothing is removed, and
+/// the machine keeps whatever policy the last completed call left behind.
+#[cfg(any(all(windows, not(feature = "test")), test))]
+fn wedged_engine_error(operation: &str, wedged: EngineCallInFlight) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{WFP_ENGINE_WEDGED_PREFIX}: the WFP engine has been inside {} for {:?} without \
+         returning, so {operation} is refused rather than started as a second concurrent \
+         writer. The Base Filtering Engine (BFE) is likely wedged or hooked by third-party \
+         security software; protection stays in its last known state until that call returns \
+         or the machine is restarted.",
+        wedged.operation,
+        wedged.started_at.elapsed(),
+    )
+}
+
+/// Dropped on the blocking thread the instant the kernel call returns — on time, or hours
+/// late. This is the *only* place an in-flight claim is released, and it releases only its own
+/// epoch.
+#[cfg(any(all(windows, not(feature = "test")), test))]
+struct EngineCallClaim(u64);
+
+#[cfg(any(all(windows, not(feature = "test")), test))]
+impl Drop for EngineCallClaim {
+    fn drop(&mut self) {
+        let mut slot = engine_call_slot();
+        let Some(current) = *slot else { return };
+        if current.epoch != self.0 {
+            return;
+        }
+        *slot = None;
+        if current.abandoned {
+            // The caller reported failure long ago; this is the log line that says the engine
+            // is alive again. The call's own result was dropped with its `JoinHandle`, so it
+            // cannot contradict what was already reported.
+            tracing::error!(
+                "wfp: {} finally returned after {:?}; its caller had already given up, the \
+                 result is discarded, and WFP operations are accepted again",
+                current.operation,
+                current.started_at.elapsed(),
+            );
+        }
+    }
+}
+
+/// The watchdog verifies once a second: only the rare, mutating operations may announce
+/// themselves at info, or the service log would carry a line per second forever.
+#[cfg(any(all(windows, not(feature = "test")), test))]
+fn engine_call_is_periodic(operation: &str) -> bool {
+    operation == "verify"
+}
+
+/// Run one engine operation on a blocking thread under a hard deadline, holding the
+/// single-writer claim described on [`EngineCallInFlight`].
+///
+/// Engine calls are synchronous WFP RPCs, so they run off the (possibly single-threaded) IPC
+/// runtime — a slow BFE must not freeze request handling (the DNS engine does the same). They
+/// are also bounded, because on a real machine a wedged or hooked Base Filtering Engine can
+/// make an `Fwpm*` call block forever and `spawn_blocking` cannot be cancelled: the thread
+/// keeps running whatever the caller does.
+///
+/// Single-writer argument for the timeout path:
+/// * the claim is registered *before* the thread is spawned and released only by that thread,
+///   in `EngineCallClaim::drop`, when the kernel call actually returns;
+/// * a caller that hits its deadline returns an error and leaves the claim standing, so every
+///   later engine call — this handler's, the next handler's, the watchdog's — fails fast here
+///   instead of opening a concurrent WFP transaction;
+/// * the abandoned task can publish nothing: it only calls pure `wfp::*` FFI, its return value
+///   dies with the `JoinHandle` the deadline dropped, and its claim release is keyed to its own
+///   epoch, so it cannot clear a claim taken by a later call.
+///
+/// The machinery is compiled off Windows too, so those ownership rules stay unit-testable;
+/// only the `Fwpm*` closures handed to it are Windows-only.
+#[cfg(any(all(windows, not(feature = "test")), test))]
+async fn bounded_engine_call<T: Send + 'static>(
+    budget: std::time::Duration,
+    operation: &'static str,
+    call: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let epoch = {
+        let mut slot = engine_call_slot();
+        if let Some(wedged) = *slot {
+            return Err(wedged_engine_error(operation, wedged));
+        }
+        let epoch = ENGINE_CALL_EPOCH.fetch_add(1, Ordering::AcqRel);
+        *slot = Some(EngineCallInFlight {
+            operation,
+            started_at: std::time::Instant::now(),
+            epoch,
+            abandoned: false,
+        });
+        epoch
+    };
+    let announce = !engine_call_is_periodic(operation);
+    if announce {
+        tracing::info!("wfp: {operation} starting");
+    } else {
+        tracing::debug!("wfp: {operation} starting");
+    }
+    let started_at = std::time::Instant::now();
+    let task = tokio::task::spawn_blocking(move || {
+        // Local, so it drops (releasing the claim) after `call` returns and before the result
+        // reaches the awaiting caller.
+        let _claim = EngineCallClaim(epoch);
+        call()
+    });
+    match tokio::time::timeout(budget, task).await {
+        Ok(joined) => {
+            let elapsed = started_at.elapsed();
+            if elapsed >= WFP_SLOW_CALL {
+                tracing::warn!(
+                    "wfp: {operation} finished in {}ms — the engine is answering, but far slower \
+                     than a healthy transaction",
+                    elapsed.as_millis()
+                );
+            } else if announce {
+                tracing::info!("wfp: {operation} finished in {}ms", elapsed.as_millis());
+            } else {
+                tracing::debug!("wfp: {operation} finished in {}ms", elapsed.as_millis());
+            }
+            joined.context("WFP engine task failed")?
+        }
+        Err(_) => {
+            // Claim the abandonment by epoch instead of writing the slot: the call may have
+            // returned in the instant between the deadline and this line, in which case its
+            // guard already cleared the slot and nothing is wedged.
+            let still_running = {
+                let mut slot = engine_call_slot();
+                match slot.as_mut() {
+                    Some(current) if current.epoch == epoch => {
+                        current.abandoned = true;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if still_running {
+                tracing::error!(
+                    "wfp: {operation} did not return within {budget:?} and is still inside the \
+                     kernel; every further WFP operation fails fast until it returns"
+                );
+            } else {
+                tracing::error!(
+                    "wfp: {operation} returned just after its {budget:?} deadline; its result was \
+                     discarded and the caller was told it failed"
+                );
+            }
+            bail!(
+                "{WFP_ENGINE_WEDGED_PREFIX}: WFP engine did not answer within {budget:?} during \
+                 {operation}; the Base Filtering Engine (BFE) may be wedged or blocked by \
+                 third-party security software. Protection was left in its last known state and \
+                 no further WFP operation starts until the pending call returns."
+            )
+        }
+    }
+}
+
+/// Whether the BFE probe still has anything to say. Set once it answered "Running" or proved
+/// unanswerable; a conclusive "not Running" leaves it clear so the next attempt re-probes.
+#[cfg(all(windows, not(feature = "test")))]
+static BFE_PROBE_SETTLED: AtomicBool = AtomicBool::new(false);
+
+/// Every `Fwpm*` call is an RPC to the Base Filtering Engine, which this service already
+/// declares as a start dependency (`install_service.rs`). Probe it once before the first
+/// engine open: a stopped BFE is the difference between "WFP is slow" and "WFP will never
+/// answer", and naming it turns an indefinite block into an actionable error.
+///
+/// Only a conclusive "not Running" is fatal, and that answer is deliberately not cached, so a
+/// BFE that starts late recovers on the watchdog's next tick. Everything inconclusive (SCM
+/// unreachable, probe itself too slow) is diagnostics we do not have: warn once, settle, and
+/// let the now-bounded engine call speak for itself.
+#[cfg(all(windows, not(feature = "test")))]
+async fn ensure_bfe_running() -> Result<()> {
+    if BFE_PROBE_SETTLED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let probe = tokio::time::timeout(
+        BFE_PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(crate::core::wfp::bfe_service_state),
+    )
+    .await;
+    let inconclusive = match probe {
+        Ok(Ok(Ok((true, state)))) => {
+            tracing::info!("wfp: Base Filtering Engine reports {state}");
+            BFE_PROBE_SETTLED.store(true, Ordering::Release);
+            return Ok(());
+        }
+        Ok(Ok(Ok((false, state)))) => {
+            bail!(
+                "{BFE_NOT_RUNNING_PREFIX}: the Base Filtering Engine (BFE) service is {state}, \
+                 not Running, so no WFP rule can be installed or removed. Start it from an \
+                 elevated prompt (`sc start BFE`) or restart the machine, then retry; \
+                 third-party security software is the usual reason it is stopped."
+            );
+        }
+        Ok(Ok(Err(error))) => format!("{error:#}"),
+        Ok(Err(error)) => format!("probe task failed: {error}"),
+        Err(_) => format!("probe exceeded {BFE_PROBE_TIMEOUT:?}"),
+    };
+    tracing::warn!(
+        "wfp: could not read the Base Filtering Engine service state ({inconclusive}); \
+         continuing with bounded engine calls"
+    );
+    BFE_PROBE_SETTLED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// The single door to the WFP engine: BFE diagnostics, then a bounded, single-writer call.
 #[cfg(all(windows, not(feature = "test")))]
 async fn engine_call<T: Send + 'static>(
-    operation: impl FnOnce() -> Result<T> + Send + 'static,
+    operation: &'static str,
+    call: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .context("WFP engine task failed")?
+    // The wedge check comes first: while an earlier call is still inside the kernel, nothing
+    // BFE reports about itself changes the answer, and the refusal must stay instant.
+    if let Some(wedged) = engine_call_in_flight() {
+        return Err(wedged_engine_error(operation, wedged));
+    }
+    ensure_bfe_running().await?;
+    bounded_engine_call(WFP_CALL_TIMEOUT, operation, call).await
 }
 
 async fn install_unlocked(armed: &Armed) -> Result<()> {
@@ -251,7 +525,10 @@ async fn install_unlocked(armed: &Armed) -> Result<()> {
     #[cfg(all(windows, not(feature = "test")))]
     {
         let app_path = armed.intent.app_path.clone();
-        let result = engine_call(move || crate::core::wfp::install(&expected, &app_path)).await;
+        let result = engine_call("install", move || {
+            crate::core::wfp::install(&expected, &app_path)
+        })
+        .await;
         // `install` ends with verify-by-key, so its outcome doubles as a verify result.
         note_verify(result.is_ok());
         result
@@ -267,7 +544,7 @@ async fn verify_live_unlocked(armed: &Armed) -> Result<()> {
     let expected = wfp_model::expected_filters(&rule_config(armed));
     #[cfg(all(windows, not(feature = "test")))]
     {
-        engine_call(move || crate::core::wfp::verify(&expected)).await
+        engine_call("verify", move || crate::core::wfp::verify(&expected)).await
     }
     #[cfg(not(all(windows, not(feature = "test"))))]
     {
@@ -279,7 +556,7 @@ async fn verify_live_unlocked(armed: &Armed) -> Result<()> {
 async fn remove_all_filters_unlocked() -> Result<()> {
     #[cfg(all(windows, not(feature = "test")))]
     {
-        engine_call(crate::core::wfp::remove_all_filters).await
+        engine_call("remove all filters", crate::core::wfp::remove_all_filters).await
     }
     #[cfg(not(all(windows, not(feature = "test"))))]
     {
@@ -294,7 +571,12 @@ async fn remove_all_filters_unlocked() -> Result<()> {
 /// open a zero-filter window. Best-effort — a failed sweep leaves extra blocking, never less.
 async fn sweep_legacy_sublayers_unlocked() {
     #[cfg(all(windows, not(feature = "test")))]
-    if let Err(error) = engine_call(crate::core::wfp::remove_legacy_sublayers).await {
+    if let Err(error) = engine_call(
+        "legacy sublayer sweep",
+        crate::core::wfp::remove_legacy_sublayers,
+    )
+    .await
+    {
         tracing::warn!("legacy WFP sublayer cleanup failed: {error:#}");
     }
 }
@@ -464,7 +746,10 @@ async fn resolve_luid(name: &str) -> Result<u64> {
     #[cfg(all(windows, not(feature = "test")))]
     {
         let name = name.to_owned();
-        engine_call(move || crate::core::wfp::luid_for_interface(&name)).await
+        engine_call("tunnel LUID lookup", move || {
+            crate::core::wfp::luid_for_interface(&name)
+        })
+        .await
     }
     #[cfg(not(all(windows, not(feature = "test"))))]
     {
@@ -749,7 +1034,7 @@ pub async fn restore_on_service_start() -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Missing intent but residual objects exist → treat as wanted (fail-closed).
             #[cfg(all(windows, not(feature = "test")))]
-            if engine_call(crate::core::wfp::any_filters_exist)
+            if engine_call("residual filter check", crate::core::wfp::any_filters_exist)
                 .await
                 .unwrap_or(true)
             {
@@ -941,8 +1226,11 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     *ARMED.lock().unwrap() = None;
     *LAST_VERIFY.lock().unwrap() = None;
 
+    // Bounded like every other engine call: an uninstaller that hangs forever on a wedged BFE
+    // is worse than one that reports why it could not finish. The `wanted: false` tombstone is
+    // already on disk, so the next service start completes the cleanup either way.
     #[cfg(all(windows, not(feature = "test")))]
-    crate::core::wfp::emergency_disarm()?;
+    engine_call("emergency disarm", crate::core::wfp::emergency_disarm).await?;
     match tokio::fs::remove_file(intent_path()).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1680,6 +1968,74 @@ mod tests {
             "accepted more than 256 direct endpoints"
         );
         cleanup().await;
+        Ok(())
+    }
+
+    /// The S1 residual risk in miniature: a WFP call that never returns must produce a
+    /// mappable error, and the abandoned blocking thread must keep the single-writer claim
+    /// until the kernel call really comes back. The FFI is mock-gated off Windows, so the
+    /// closure stands in for a wedged `Fwpm*` call — the ownership rules under test are the
+    /// engine-independent part.
+    #[tokio::test]
+    #[serial]
+    async fn a_wedged_engine_call_times_out_and_blocks_a_second_wfp_writer() -> Result<()> {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let wedged = move || -> Result<()> {
+            // Returns only when the test says so — the stand-in for a BFE that never answers.
+            let _ = blocked.recv_timeout(std::time::Duration::from_secs(30));
+            Ok(())
+        };
+
+        let timed_out =
+            bounded_engine_call(std::time::Duration::from_millis(50), "install", wedged)
+                .await
+                .expect_err("a call that never returns must not be awaited forever");
+        let message = format!("{timed_out:#}");
+        assert!(message.contains(WFP_ENGINE_WEDGED_PREFIX), "{message}");
+        assert!(message.contains("install"), "{message}");
+
+        // The claim is still held by the running thread, so nothing may start a second WFP
+        // transaction — the refusal names the operation that is stuck.
+        let refused = bounded_engine_call(std::time::Duration::from_secs(5), "verify", || Ok(()))
+            .await
+            .expect_err("a second writer must be refused while the first is inside the kernel");
+        let message = format!("{refused:#}");
+        assert!(message.contains(WFP_ENGINE_WEDGED_PREFIX), "{message}");
+        assert!(message.contains("install"), "{message}");
+
+        // Only the abandoned call itself releases the claim, and it does so on its own thread.
+        release.send(()).expect("the wedged call is still running");
+        for _ in 0..300 {
+            if engine_call_in_flight().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            engine_call_in_flight().is_none(),
+            "the blocking thread must release the claim when the call finally returns"
+        );
+        bounded_engine_call(std::time::Duration::from_secs(5), "install", || Ok(())).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_healthy_engine_call_leaves_no_claim_behind() -> Result<()> {
+        bounded_engine_call(std::time::Duration::from_secs(5), "install", || Ok(())).await?;
+        assert!(
+            engine_call_in_flight().is_none(),
+            "a completed call must not keep the next operation out"
+        );
+        let error = bounded_engine_call(
+            std::time::Duration::from_secs(5),
+            "verify",
+            || -> Result<()> { bail!("engine said no") },
+        )
+        .await
+        .expect_err("engine errors still propagate");
+        assert!(format!("{error:#}").contains("engine said no"));
+        assert!(engine_call_in_flight().is_none());
         Ok(())
     }
 

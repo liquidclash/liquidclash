@@ -209,6 +209,59 @@ mod app_init {
     }
 }
 
+/// Hard budget for the whole committed-exit cleanup, enforced from the Tauri main thread.
+///
+/// Sized to cover every inner budget the cleanup can legitimately consume
+/// (`QUIT_RELEASE_BUDGET` + the session-ending core stop + the audit flush) plus head-room.
+/// The unit test below keeps it above their sum, so a future change to one of them cannot
+/// silently make the outer wait the effective limit.
+const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Everything that must still happen once exit is *committed* (`RunEvent::Exit`).
+///
+/// Deliberately a plain async fn so it can be driven on the async runtime rather than on the
+/// main thread — see the call site for why that distinction is load-bearing.
+async fn run_committed_exit_cleanup(app_handle: AppHandle) {
+    // Windows session ending currently reaches Tao as WM_ENDSESSION and
+    // destroys the loop without a preventable ExitRequested event.
+    if !handle::Handle::global().is_exiting() {
+        handle::Handle::global().set_is_exiting();
+        // L1: Quit is one of the three releasing causes (§6) — restore
+        // DNS and disarm via the owner-gated route, best-effort.
+        match tokio::time::timeout(
+            tono::commands::QUIT_RELEASE_BUDGET,
+            tono::commands::quit_release(app_handle.clone()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => logging!(
+                error,
+                Type::Service,
+                "Tono: session-ending release failed; protection remains fail-closed: {error}"
+            ),
+            Err(_) => logging!(
+                error,
+                Type::Service,
+                "Tono: session-ending release exceeded {:?}; Service reconciliation may still be running",
+                tono::commands::QUIT_RELEASE_BUDGET
+            ),
+        }
+        let cleanup_result = feat::clean_session_ending_best_effort().await;
+        logging!(
+            info,
+            Type::System,
+            "Unpreventable session-ending best-effort cleanup returned - core stopped: {}, all cleanup successful: {}",
+            cleanup_result.core_stopped,
+            cleanup_result.all_success
+        );
+    }
+    // M3: exit is committed here (and only here) — flush the audit
+    // writer. Runs on every exit path, guarded or not.
+    tono::commands::flush_audit_for_exit(&app_handle).await;
+    logging!(info, Type::System, "Application exited");
+}
+
 pub fn run() {
     #[cfg(all(target_os = "macos", not(debug_assertions), not(test), not(feature = "verge-dev")))]
     if utils::macos_launch_guard::enforce_before_initialization() == utils::macos_launch_guard::LaunchDisposition::Exit
@@ -449,45 +502,24 @@ pub fn run() {
         }
         tauri::RunEvent::Exit => {
             let app_handle = app_handle.clone();
+            // This runs ON the Tauri main thread, so the native message pump is stopped for
+            // exactly as long as this handler runs: anything that parks this thread makes the
+            // window "Not Responding" and unclosable. Service IPC can park whichever thread
+            // polls it (a Service wedged inside a WFP/BFE kernel call never yields), so the
+            // cleanup is driven on the async runtime and the main thread only ever awaits a
+            // JoinHandle — a wait that is always enforceable — under one hard budget.
+            //
+            // Abandoning the cleanup is fail-closed by construction: nothing here opens the
+            // network, so an unfinished release leaves WFP armed rather than dropping it.
+            let cleanup = AsyncHandler::spawn(move || run_committed_exit_cleanup(app_handle));
             AsyncHandler::block_on(async move {
-                // Windows session ending currently reaches Tao as WM_ENDSESSION and
-                // destroys the loop without a preventable ExitRequested event.
-                if !handle::Handle::global().is_exiting() {
-                    handle::Handle::global().set_is_exiting();
-                    // L1: Quit is one of the three releasing causes (§6) — restore
-                    // DNS and disarm via the owner-gated route, best-effort.
-                    match tokio::time::timeout(
-                        tono::commands::QUIT_RELEASE_BUDGET,
-                        tono::commands::quit_release(app_handle.clone()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => logging!(
-                            error,
-                            Type::Service,
-                            "Tono: session-ending release failed; protection remains fail-closed: {error}"
-                        ),
-                        Err(_) => logging!(
-                            error,
-                            Type::Service,
-                            "Tono: session-ending release exceeded {:?}; Service reconciliation may still be running",
-                            tono::commands::QUIT_RELEASE_BUDGET
-                        ),
-                    }
-                    let cleanup_result = feat::clean_session_ending_best_effort().await;
+                if tokio::time::timeout(EXIT_CLEANUP_BUDGET, cleanup).await.is_err() {
                     logging!(
-                        info,
+                        error,
                         Type::System,
-                        "Unpreventable session-ending best-effort cleanup returned - core stopped: {}, all cleanup successful: {}",
-                        cleanup_result.core_stopped,
-                        cleanup_result.all_success
+                        "Exit cleanup exceeded {EXIT_CLEANUP_BUDGET:?}; abandoning it so the process can close. Protection stays armed and the Service reconciles on its own"
                     );
                 }
-                // M3: exit is committed here (and only here) — flush the audit
-                // writer. Runs on every exit path, guarded or not.
-                tono::commands::flush_audit_for_exit(&app_handle).await;
-                logging!(info, Type::System, "Application exited");
             })
         }
         #[allow(unused_variables)]
@@ -534,4 +566,24 @@ pub fn run() {
         },
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod exit_budget_tests {
+    use super::EXIT_CLEANUP_BUDGET;
+    use crate::feat::SESSION_ENDING_STOP_BUDGET;
+    use crate::tono::commands::{AUDIT_FLUSH_BUDGET, QUIT_RELEASE_BUDGET};
+
+    /// The committed-exit wait runs on the Tauri main thread, so it is the message pump's
+    /// hard ceiling. It must stay strictly above everything the cleanup can legitimately
+    /// spend, otherwise the outer wait — not the inner budgets — becomes the real limit and
+    /// every normal exit would look like an abandoned one.
+    #[test]
+    fn committed_exit_budget_covers_every_inner_budget() {
+        let inner = QUIT_RELEASE_BUDGET + SESSION_ENDING_STOP_BUDGET + AUDIT_FLUSH_BUDGET;
+        assert!(
+            EXIT_CLEANUP_BUDGET > inner,
+            "EXIT_CLEANUP_BUDGET ({EXIT_CLEANUP_BUDGET:?}) must exceed the inner budgets it covers ({inner:?})"
+        );
+    }
 }

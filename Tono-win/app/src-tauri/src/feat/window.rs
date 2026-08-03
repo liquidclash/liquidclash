@@ -8,6 +8,16 @@ use tokio::time::Duration;
 #[cfg(target_os = "macos")]
 use tokio::time::timeout;
 
+/// Bounded core-stop wait for the unpreventable session-ending path.
+///
+/// Named so the committed-exit budget in `lib.rs` can be checked against it: that outer budget
+/// runs on the Tauri main thread, so it must stay strictly larger than everything it covers.
+pub const SESSION_ENDING_STOP_BUDGET: Duration = if cfg!(target_os = "windows") {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(3)
+};
+
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupResult {
     pub all_success: bool,
@@ -109,6 +119,19 @@ pub async fn open_or_close_dashboard() {
     logging!(info, Type::Window, "Window toggle result: {result:?}");
 }
 
+/// Make a refused Quit visible: the exit flag is already cleared, so this restores (or
+/// recreates) the main window that the close button hid. Best-effort by design — the window
+/// operation debouncer may swallow it right after another window action, and that is still
+/// better than the previous silent refusal.
+async fn surface_cancelled_quit() {
+    let result = WindowManager::show_main_window().await;
+    logging!(
+        info,
+        Type::Window,
+        "Quit was cancelled; restoring the main window so the reason is visible: {result:?}"
+    );
+}
+
 pub async fn quit() -> clash_verge_signal::ShutdownOutcome {
     logging!(debug, Type::System, "启动退出流程");
     // 设置退出标志
@@ -123,6 +146,11 @@ pub async fn quit() -> clash_verge_signal::ShutdownOutcome {
             "Tono: 无法证明退出前已恢复网络保护，取消退出: {error}"
         );
         handle::Handle::global().clear_is_exiting();
+        // A refused Quit is the only outcome that leaves the app running against the user's
+        // intent, and by then the window is usually hidden (the X only hides) or already gone.
+        // Without this the app just silently ignores Quit — the "it will not close" report.
+        // Bringing the window back is what makes the notice below, and Disconnect, reachable.
+        surface_cancelled_quit().await;
         handle::Handle::notice_message("app_quit::core_stop_failed", "");
         return clash_verge_signal::ShutdownOutcome::Canceled;
     }
@@ -141,6 +169,7 @@ pub async fn quit() -> clash_verge_signal::ShutdownOutcome {
 
     if should_abort_exit_after_cleanup(cleanup_result.core_stopped) {
         handle::Handle::global().clear_is_exiting();
+        surface_cancelled_quit().await;
         handle::Handle::notice_message("app_quit::core_stop_failed", "");
         return clash_verge_signal::ShutdownOutcome::Canceled;
     }
@@ -192,10 +221,7 @@ pub async fn clean_async() -> CleanupResult {
 }
 
 pub async fn clean_session_ending_best_effort() -> CleanupResult {
-    #[cfg(target_os = "windows")]
-    let stop_timeout = Duration::from_secs(2);
-    #[cfg(not(target_os = "windows"))]
-    let stop_timeout = Duration::from_secs(3);
+    let stop_timeout = SESSION_ENDING_STOP_BUDGET;
 
     logging!(
         info,

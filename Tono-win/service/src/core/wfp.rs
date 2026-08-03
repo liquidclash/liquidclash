@@ -49,6 +49,30 @@ const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
 /// `RPC_C_AUTHN_WINNT`: negotiate the machine's own authentication for the local BFE RPC.
 const RPC_C_AUTHN_WINNT: u32 = 10;
 
+/// What the SCM says about the Base Filtering Engine: `(is_running, state_name)`.
+///
+/// Every `Fwpm*` call in this file is an RPC to that service — it is the declared start
+/// dependency of this one (`install_service.rs`) — so its state is the single most useful
+/// thing to log before the first `FwpmEngineOpen0`. This is an SCM query, not WFP: it does not
+/// touch the engine and cannot itself be blocked by a wedged filtering transaction.
+pub(crate) fn bfe_service_state() -> Result<(bool, String)> {
+    use platform_lib::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("connecting to the service control manager")?;
+    let service = manager
+        .open_service("BFE", ServiceAccess::QUERY_STATUS)
+        .context("opening the Base Filtering Engine (BFE) service")?;
+    let state = service
+        .query_status()
+        .context("querying the Base Filtering Engine (BFE) service status")?
+        .current_state;
+    Ok((state == ServiceState::Running, format!("{state:?}")))
+}
+
 fn to_sys(guid: Guid) -> GUID {
     let bytes = guid.into_u128().to_be_bytes();
     GUID {

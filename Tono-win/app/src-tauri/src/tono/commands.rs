@@ -30,6 +30,9 @@ use crate::{
 /// L2: only the unpreventable WM_ENDSESSION path uses this short outer budget. Interactive Quit
 /// joins the ordinary release operation and cancels the exit when disarm cannot be proven.
 pub(crate) const QUIT_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
+/// M3: bounded wait for the audit writer to drain once exit is committed. Named for the same
+/// reason as `QUIT_RELEASE_BUDGET`: the committed-exit budget in `lib.rs` covers it.
+pub(crate) const AUDIT_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 /// Absolute budget for startup authentication restore and its two cloud refreshes. Credential
 /// hydration has its own three-second budget before this function starts. Read-only API work can
 /// be cancelled safely; protection release keeps its separate reconciliation semantics.
@@ -995,7 +998,7 @@ pub async fn flush_audit_for_exit(app: &AppHandle) {
     };
     state.audit().close_sender();
     if let Some(writer) = state.audit().take_writer() {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
+        let _ = tokio::time::timeout(AUDIT_FLUSH_BUDGET, writer).await;
     }
 }
 

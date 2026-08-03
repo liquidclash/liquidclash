@@ -1,6 +1,8 @@
 #[cfg(not(feature = "test"))]
 use anyhow::{Context as _, Result, bail};
 use std::ffi::OsStr;
+#[cfg(not(feature = "test"))]
+use std::time::Duration;
 
 #[cfg(not(feature = "test"))]
 use platform_lib::service::ServiceAccess;
@@ -55,9 +57,29 @@ fn verify_registered_service_process_id_inner(pipe_process_id: u32) -> Result<()
     Ok(())
 }
 
+/// The Service Control Manager answers about the very process that owns the pipe. When that
+/// LocalSystem process is parked inside a WFP/BFE kernel call, its SCM queries can block for as
+/// long as the wedge lasts — and `kode-bridge` calls this verifier synchronously, so an
+/// unbounded query here is an unbounded park. Healthy SCM queries are sub-millisecond, so this
+/// deadline is three orders of magnitude of head-room and only ever expires on a real wedge.
+#[cfg(not(feature = "test"))]
+const SCM_QUERY_DEADLINE: Duration = Duration::from_secs(3);
+
 #[cfg(not(feature = "test"))]
 pub(super) fn verify_registered_service_process_id(pipe_process_id: u32) -> std::io::Result<()> {
-    verify_registered_service_process_id_inner(pipe_process_id).map_err(std::io::Error::other)
+    match super::run_with_deadline(SCM_QUERY_DEADLINE, move || {
+        verify_registered_service_process_id_inner(pipe_process_id)
+    }) {
+        Some(verification) => verification.map_err(std::io::Error::other),
+        // Fail closed. An unanswered verification is treated exactly like a failed one: the
+        // caller (`connect_verified_server`) drops the pipe handle and the connection is
+        // refused. Never accept a pipe whose server was not proven to be the registered
+        // LocalSystem service.
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the Tono Service is not answering the Service Control Manager",
+        )),
+    }
 }
 
 #[cfg(test)]

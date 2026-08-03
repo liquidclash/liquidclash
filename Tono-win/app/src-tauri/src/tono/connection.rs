@@ -154,8 +154,11 @@ enum StageFailure {
 }
 
 impl StageFailure {
+    /// Every stage funnels its errors through here, so the Service's stable WFP markers are
+    /// translated once — whichever stage (arm, lock, release) surfaced them.
     fn error(err: impl std::fmt::Display) -> Self {
-        StageFailure::Error(err.to_string())
+        let text = err.to_string();
+        StageFailure::Error(map_wfp_engine_error(&text).unwrap_or(text))
     }
 }
 
@@ -372,6 +375,30 @@ pub const SERVICE_BUSY_PREFIX: &str = "TONO_SERVICE_BUSY";
 pub const RELEASE_RECONCILING_PREFIX: &str = "TONO_RELEASE_RECONCILING";
 /// Installed Service is below protocol revision 9 (Test 5 or older).
 pub const SERVICE_TOO_OLD_PREFIX: &str = "TONO_SERVICE_TOO_OLD";
+/// The Service's WFP engine call did not return inside its budget — the Base Filtering Engine
+/// is wedged, typically behind a third-party security product's filter hooks. Distinct from
+/// [`BFE_NOT_RUNNING_PREFIX`] because the user action differs (reboot / remove the hook versus
+/// simply starting the service). The Service nests these inside its own context string, so
+/// they are matched by `contains`, not `starts_with`.
+pub const WFP_ENGINE_WEDGED_PREFIX: &str = "TONO_WFP_ENGINE_WEDGED";
+/// Windows' Base Filtering Engine service is not running, so no kill switch can be installed.
+pub const BFE_NOT_RUNNING_PREFIX: &str = "TONO_BFE_NOT_RUNNING";
+
+/// Translate the Service's stable WFP markers into an actionable message. Returns `None` for
+/// every other error so callers keep the original diagnostic text.
+pub fn map_wfp_engine_error(text: &str) -> Option<String> {
+    if text.contains(BFE_NOT_RUNNING_PREFIX) {
+        return Some(format!(
+            "{BFE_NOT_RUNNING_PREFIX}: Windows 基础筛选引擎 (BFE) 未运行，无法安装网络保护；请以管理员身份运行 `sc start BFE` 后重试"
+        ));
+    }
+    if text.contains(WFP_ENGINE_WEDGED_PREFIX) {
+        return Some(format!(
+            "{WFP_ENGINE_WEDGED_PREFIX}: Windows 防火墙引擎无响应（常见于第三方安全软件挂钩 WFP）；请重启电脑，若仍然如此请暂时退出杀毒/防火墙软件后重试"
+        ));
+    }
+    None
+}
 
 /// Layer the Run State's raw English onto a stable, actionable message.
 /// Everything else keeps the original detail for diagnostics.
@@ -2207,7 +2234,8 @@ mod tests {
         FailurePlan, MAX_DIRECT_ENDPOINTS, RELEASE_RECONCILING_PREFIX, SERVICE_BUSY_PREFIX,
         SERVICE_TOO_OLD_PREFIX, SelectAction, build_direct_plan, collect_ipv4_literals,
         health_threshold_reached, is_fake_ip, is_retryable_lock_error, kill_switch_unhealthy,
-        map_service_ready_error, plan_failure, protected_dns_unhealthy, proxy_endpoint_of,
+        BFE_NOT_RUNNING_PREFIX, WFP_ENGINE_WEDGED_PREFIX, map_service_ready_error,
+        map_wfp_engine_error, plan_failure, protected_dns_unhealthy, proxy_endpoint_of,
         reconnect_allowed, retry_now_is_noop, select_action, sign_out_needs_release,
         single_flight_begin, stale_exit_needs_release, stop_core_before_release,
     };
@@ -2226,6 +2254,27 @@ mod tests {
             reality_public_key: "0123456789abcdef0123456789abcdef0123456789a".to_string(),
             reality_short_id: "0123456789abcdef".to_string(),
         }
+    }
+
+    #[test]
+    fn wfp_engine_markers_map_to_actionable_messages() {
+        // The Service nests its marker inside its own context string, so matching must be
+        // by `contains`, and BFE-not-running must win over the generic wedge message.
+        let wedged = map_wfp_engine_error(&format!(
+            "Failed to arm Windows kill switch: {WFP_ENGINE_WEDGED_PREFIX}: install did not answer"
+        ))
+        .expect("wedged engine is mapped");
+        assert!(wedged.starts_with(WFP_ENGINE_WEDGED_PREFIX));
+        assert!(wedged.contains("重启"));
+
+        let bfe = map_wfp_engine_error(&format!(
+            "Failed to arm Windows kill switch: {BFE_NOT_RUNNING_PREFIX}: state Stopped"
+        ))
+        .expect("stopped BFE is mapped");
+        assert!(bfe.starts_with(BFE_NOT_RUNNING_PREFIX));
+        assert!(bfe.contains("sc start BFE"));
+
+        assert!(map_wfp_engine_error("kill switch lock failed: owner mismatch").is_none());
     }
 
     #[test]
