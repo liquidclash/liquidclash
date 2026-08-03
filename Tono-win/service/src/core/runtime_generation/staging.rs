@@ -21,11 +21,12 @@
 //! staging was supposed to save. The manifest records what each copy was made from instead.
 
 use super::assets::{
-    destination_key, invalid_asset, resolve_in_generation, runtime_cleanup_retry_delay,
-    validate_core_path, validate_destination,
+    destination_key, invalid_asset, resolve_in_generation, resolve_recorded_in_generation,
+    runtime_cleanup_retry_delay, validate_core_path, validate_destination,
 };
+use crate::core::ClashConfig;
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
-use crate::core::manager::CORE_MANAGER;
+use crate::core::manager::{CORE_MANAGER, CoreInstanceId};
 use crate::{RemoteProvider, RuntimeAsset, RuntimeBundle, StageRejection, StageRuntimeOutcome};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -205,6 +206,24 @@ pub(super) fn declared_remote_providers(
         .collect())
 }
 
+/// Which core instance is running, and what it was started with.
+///
+/// One acquisition of `CORE_MANAGER`, sealed inside one function, is the whole point of this
+/// existing. `stage_runtime` samples the running core twice and the manager lock is a
+/// non-reentrant `tokio::sync::Mutex`, so the two samples are only safe while no guard from the
+/// first is still standing at the second. Spelled inline that safety is incidental — it rests on
+/// where the compiler drops a scrutinee's temporary, which edition 2024 already moved once (an
+/// `if let` now keeps its guard for the whole then-block and drops it only before the `else`), so
+/// rewriting either sample into an `if let` would silently reintroduce a self-deadlock. A guard
+/// that cannot escape this function cannot be alive at the second sample, whatever the caller is
+/// rewritten into.
+///
+/// The caller must not already hold `CORE_MANAGER`; no route does. Staging runs under
+/// `OWNER_LIFECYCLE_LOCK` only, and the handler that invokes it takes the manager lock nowhere.
+async fn running_core_instance() -> Option<(CoreInstanceId, ClashConfig)> {
+    CORE_MANAGER.lock().await.running_core_config().await
+}
+
 /// Make the generation the core is running in match `bundle`, or decline and change nothing.
 ///
 /// The order below is the whole safety argument, so it is worth stating plainly. Stale caches go
@@ -219,7 +238,7 @@ pub(crate) async fn stage_runtime(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
 ) -> Result<StageRuntimeOutcome, ServiceError> {
-    let Some((core_pid, running)) = CORE_MANAGER.lock().await.running_core_config().await else {
+    let Some((core_instance, running)) = running_core_instance().await else {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CoreNotRunning,
         });
@@ -247,7 +266,7 @@ pub(crate) async fn stage_runtime(
     let plan = plan_stage(&previous, &sources, &remote);
 
     for destination in &plan.required_deletes {
-        let target = resolve_in_generation(&generation, destination)?;
+        let target = resolve_recorded_in_generation(&generation, destination)?;
         if let Err(error) = remove_staged_file(&target).await {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
@@ -291,15 +310,10 @@ pub(crate) async fn stage_runtime(
     // built against: it may have re-fetched a cache the plan just deleted, and committing would
     // record a provenance that never happened — which no later staging could ever detect, because
     // the record would look correct. Declining sends the caller down the path that rebuilds the
-    // generation from nothing.
-    if CORE_MANAGER
-        .lock()
-        .await
-        .running_core_config()
-        .await
-        .map(|(pid, _)| pid)
-        != Some(core_pid)
-    {
+    // generation from nothing. The comparison is on the whole instance rather than its pid: a
+    // Windows pid can be handed back out inside this window, and a restart that came back wearing
+    // the sampled pid is exactly the case that must not pass.
+    if running_core_instance().await.map(|(instance, _)| instance) != Some(core_instance) {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CoreRestarted,
         });
@@ -327,7 +341,7 @@ pub(crate) async fn stage_runtime(
     }
 
     for destination in &plan.hygiene_deletes {
-        match resolve_in_generation(&generation, destination) {
+        match resolve_recorded_in_generation(&generation, destination) {
             Ok(target) => {
                 if let Err(error) = remove_staged_file(&target).await {
                     tracing::warn!(

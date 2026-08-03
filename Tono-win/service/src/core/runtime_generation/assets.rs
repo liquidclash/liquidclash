@@ -347,7 +347,7 @@ async fn materialize_plan(
     // under it loses its entry rather than the whole start losing.
     let mut manifest = plan.manifest.clone();
     for destination in &plan.required_deletes {
-        let target = resolve_in_generation(runtime, destination)?;
+        let target = resolve_recorded_in_generation(runtime, destination)?;
         super::staging::remove_staged_file(&target)
             .await
             .map_err(|error| {
@@ -413,7 +413,7 @@ async fn materialize_plan(
     // changes nothing the core observes, so it is logged rather than returned — the configuration
     // is already committed and the core is about to be started against it.
     for destination in &plan.hygiene_deletes {
-        match resolve_in_generation(runtime, destination) {
+        match resolve_recorded_in_generation(runtime, destination) {
             Ok(target) => {
                 if let Err(error) = super::staging::remove_staged_file(&target).await {
                     tracing::warn!(
@@ -450,6 +450,15 @@ pub(super) struct GatheredBundle {
     pub remote: Vec<crate::RemoteProvider>,
 }
 
+/// The largest file the service will copy into a generation on a bundle's say-so.
+///
+/// A bundle names its own sources, so without a bound the client decides how many bytes LocalSystem
+/// writes into the state directory — filling the system volume is a denial of service an
+/// unprivileged caller should not be able to spell. The largest thing a real bundle carries is a
+/// geo database, tens of megabytes, so this leaves an order of magnitude of headroom and still
+/// refuses "point the service at a 40 GB file".
+const MAX_RUNTIME_ASSET_BYTES: u64 = 1 << 30;
+
 pub(super) async fn gather_bundle(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
@@ -466,6 +475,12 @@ pub(super) async fn gather_bundle(
                 "failed to inspect runtime asset {source:?}: {error}"
             ))
         })?;
+        if metadata.len() > MAX_RUNTIME_ASSET_BYTES {
+            return Err(invalid_asset(format!(
+                "runtime asset {source:?} is {} bytes, above the {MAX_RUNTIME_ASSET_BYTES}-byte limit",
+                metadata.len()
+            )));
+        }
         if !asset_keys.insert(destination.clone()) {
             return Err(invalid_asset(format!(
                 "runtime destination {destination:?} is declared as a copied asset twice"
@@ -511,7 +526,6 @@ pub(super) fn validate_core_path(
 
     #[cfg(windows)]
     {
-        // phase 4 将加 Authenticode 签名验证：届时除路径白名单外还要求签名匹配。
         let _ = owner;
         let allowed = cfg!(feature = "test") || is_permitted_windows_core_location(&canonical);
         if !allowed {
@@ -519,6 +533,22 @@ pub(super) fn validate_core_path(
                 ServiceErrorCode::InvalidInstallLocation,
                 "Windows core path is outside an allowed install location; reinstall Tono under Program Files",
             ));
+        }
+        // The location rule says where the file is; this says what it is, which is the half
+        // `SECURITY.md` has been promising ("staged with SHA-256 verification ... before every
+        // start"). Both halves are needed and neither replaces the other: a location check cannot
+        // notice a swapped file inside an allowed directory, and a digest check cannot notice that
+        // the path itself is somewhere a client chose.
+        //
+        // Hashing tens of megabytes on the start path is the cost, paid synchronously like every
+        // other check here. It is once per start of a file the installer has just written, so it is
+        // warm in the page cache; a core that fails it must not start at all, which is the only
+        // budget that matters.
+        //
+        // Same `test` escape hatch the location rule uses, and for the same reason: the integration
+        // suite starts mock cores it builds per run, which no release pin can name.
+        if !cfg!(feature = "test") {
+            super::core_integrity::verify_core_binary(&canonical)?;
         }
     }
 
@@ -531,10 +561,13 @@ pub(super) fn validate_core_path(
 /// How a Windows core path fares against the install-location allowlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WindowsCorePathClass {
-    /// Inside the service persistent directory, or under %ProgramFiles%* in a "tono" directory.
+    /// The service's own install directory, or under %ProgramFiles%* in a "tono" directory.
     Allowed,
     /// Not an `.exe`.
     NotExe,
+    /// Inside the part of the service state directory the service fills in *on a client's behalf*
+    /// — `users\<owner>\**`, every byte of which arrived as a declared runtime asset.
+    ClientStaged,
     /// Under a user-writable root (%TEMP%/%TMP%, %LOCALAPPDATA%\Temp, Downloads, Desktop).
     UserWritable,
     /// Nowhere the service trusts.
@@ -543,11 +576,24 @@ pub(super) enum WindowsCorePathClass {
 
 /// The Windows core-path rule, pure so it is testable off-Windows: the app-id permit binds
 /// whatever path the client declares, so that path must live somewhere an unprivileged user
-/// cannot swap. phase 4 adds Authenticode verification on top of this location rule.
+/// cannot swap.
+///
+/// "Cannot swap" is about content, not only about ACLs. `users\<owner>\runtime` is a directory only
+/// SYSTEM and Administrators can write — and the service writes into it, as SYSTEM, whatever the
+/// owner declared as a runtime asset. Treating that as a trusted location meant an unprivileged
+/// owner could have their own bytes copied in and then, on the next call, name them as the core:
+/// two IPC calls to a LocalSystem process of their choosing, relaunched from desired state at every
+/// boot. So the client-staged roots are classified *before* any allow branch and can never reach
+/// one, and the allowed root under the state directory is the installer's own program directory
+/// rather than the whole tree.
+///
+/// The remaining half of "cannot swap" is [`super::core_integrity`], which checks what the file at
+/// that path actually is.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 pub(super) fn classify_windows_core_path(
     path: &str,
-    service_dirs: &[String],
+    install_dirs: &[String],
+    client_staged_roots: &[String],
     program_files_roots: &[String],
     user_writable_roots: &[String],
 ) -> WindowsCorePathClass {
@@ -573,13 +619,21 @@ pub(super) fn classify_windows_core_path(
     if !normalized.ends_with(".exe") {
         return WindowsCorePathClass::NotExe;
     }
+    // First, and deliberately: these roots sit *inside* the service state directory, so a rule that
+    // matched an allowed root first would never reach them.
+    if client_staged_roots
+        .iter()
+        .any(|root| is_within(&normalized, root))
+    {
+        return WindowsCorePathClass::ClientStaged;
+    }
     if user_writable_roots
         .iter()
         .any(|root| is_within(&normalized, root))
     {
         return WindowsCorePathClass::UserWritable;
     }
-    if service_dirs.iter().any(|dir| is_within(&normalized, dir)) {
+    if install_dirs.iter().any(|dir| is_within(&normalized, dir)) {
         return WindowsCorePathClass::Allowed;
     }
     let in_program_files = program_files_roots
@@ -606,9 +660,17 @@ pub(super) fn classify_windows_core_path(
 
 #[cfg(windows)]
 fn is_permitted_windows_core_location(canonical: &Path) -> bool {
-    let service_dirs = vec![
-        crate::service_paths()
+    let paths = crate::service_paths();
+    // The installer's own program directory, not the whole state directory. The state directory
+    // also holds `users\<owner>\runtime`, which `materialize_plan` fills in from whatever a client
+    // declared — see `classify_windows_core_path`.
+    let install_dirs = vec![paths.install_dir().to_string_lossy().into_owned()];
+    // Everything the service writes for an owner hangs off here, so naming the root covers the
+    // runtime generation, the logs directory and anything a later layout adds beside them.
+    let client_staged_roots = vec![
+        paths
             .persistent_state_dir()
+            .join("users")
             .to_string_lossy()
             .into_owned(),
     ];
@@ -616,6 +678,11 @@ fn is_permitted_windows_core_location(canonical: &Path) -> bool {
         .into_iter()
         .filter_map(|key| std::env::var(key).ok())
         .collect::<Vec<_>>();
+    // Not a security boundary, and must not be read as one. This process is LocalSystem, so `TEMP`,
+    // `LOCALAPPDATA` and `USERPROFILE` here name the *service account's* directories and can never
+    // match the attacking user's. What actually refuses an attacker's path is that everything
+    // outside the two allowed roots above is refused; these entries only make a machine-wide `TMP`
+    // an explicit rejection rather than an implicit one.
     let mut user_writable_roots = Vec::new();
     for key in ["TEMP", "TMP"] {
         if let Ok(value) = std::env::var(key) {
@@ -632,7 +699,8 @@ fn is_permitted_windows_core_location(canonical: &Path) -> bool {
     matches!(
         classify_windows_core_path(
             &canonical.to_string_lossy(),
-            &service_dirs,
+            &install_dirs,
+            &client_staged_roots,
             &program_files_roots,
             &user_writable_roots,
         ),
@@ -710,6 +778,81 @@ pub(super) const RUNTIME_CONFIG_FILE_NAME: &str = "config.yaml";
 /// The infix every file staging writes as a temporary carries.
 pub(super) const STAGING_TEMP_INFIX: &str = ".staging-";
 
+/// File types a runtime asset may never be.
+///
+/// A generation holds geo databases, provider files and a configuration: data the core *reads*.
+/// Nothing declared here is ever meant to be run, and every runnable type is a second copy of the
+/// escalation the core-path rule closes — the service writes these files as LocalSystem, into a
+/// directory an unprivileged owner names by proxy, and Windows will happily execute, load or
+/// interpret any of them afterwards. Refusing them costs a legitimate bundle nothing: the app
+/// declares geo databases and the provider paths from the user's own configuration, and mihomo
+/// reads neither an `.exe` nor a `.ps1`.
+///
+/// A denylist rather than an allowlist because provider filenames belong to the user and an
+/// unusual-but-harmless extension must not cost them their configuration. The entries are the
+/// types Windows treats as more than bytes; the two Unix ones are here because a destination is
+/// validated the same way on every platform.
+const REFUSED_DESTINATION_EXTENSIONS: &[&str] = &[
+    "appx", "bat", "chm", "cmd", "com", "cpl", "dll", "drv", "efi", "exe", "gadget", "hta", "jar",
+    "js", "jse", "lnk", "msc", "msi", "msix", "msp", "ocx", "pif", "ps1", "ps1xml", "psd1", "psm1",
+    "py", "reg", "scf", "scr", "sh", "sys", "url", "vb", "vbe", "vbs", "wsf", "wsh",
+];
+
+/// Why a destination is being reduced to a key, which decides how much of it has to still be true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DestinationUse {
+    /// The service is about to write this file. Every rule applies.
+    Written,
+    /// The key came out of a manifest and the service is only going to *remove* what it names.
+    ///
+    /// The path rules still apply — a recorded key may not traverse, and may not name a file the
+    /// generation owns. The executable-type refusal does not, and must not: a generation written
+    /// before that refusal existed may hold a `.exe` some manifest recorded, and a resolver that
+    /// declined to name it would disarm the one sweep that can still delete it.
+    Recorded,
+}
+
+/// Refuse a destination component that names something Windows would treat as more than data.
+///
+/// A colon is refused first. On NTFS `provider.yaml:payload.exe` names an alternate data stream of
+/// `provider.yaml` — a second file, carrying a second extension, that a check reading the name's
+/// extension would never inspect. On Unix a colon is an ordinary character in a name, so this only
+/// ever costs an odd filename there.
+///
+/// A trailing dot or space is refused rather than trimmed. Windows drops both when it creates the
+/// file, so `payload.exe.` and `payload.exe ` land on disk as `payload.exe` while presenting an
+/// extension of `""` and `"exe "` to anything reading the declared name — and, for the same reason,
+/// two destinations that differ only in a trailing dot are one file with two manifest keys, which
+/// is the hazard the case-insensitive reserved-name comparison below already exists for.
+///
+/// What is left is a name whose extension is the file's extension, and that is what is matched.
+fn refuse_unrunnable_destination(part: &str) -> Result<(), ServiceError> {
+    if part.contains(':') {
+        return Err(invalid_asset(format!(
+            "runtime asset destination {part:?} names an alternate data stream"
+        )));
+    }
+    if part.ends_with(['.', ' ']) {
+        return Err(invalid_asset(format!(
+            "runtime asset destination {part:?} ends in a dot or a space, which Windows would \
+             strip; declare the name the file will actually have"
+        )));
+    }
+    let Some((_, extension)) = part.rsplit_once('.') else {
+        return Ok(());
+    };
+    if REFUSED_DESTINATION_EXTENSIONS
+        .iter()
+        .any(|refused| extension.eq_ignore_ascii_case(refused))
+    {
+        return Err(invalid_asset(format!(
+            "runtime asset destination {part:?} is an executable file type; a runtime generation \
+             only ever holds data the core reads"
+        )));
+    }
+    Ok(())
+}
+
 /// Reduce a validated destination to the single string form used as its key everywhere.
 ///
 /// Built by reassembling the validated components, never by rewriting separators in the client's
@@ -722,7 +865,18 @@ pub(super) const STAGING_TEMP_INFIX: &str = ".staging-";
 /// could have its configuration deleted by the next staging's housekeeping sweep; one that could
 /// claim the manifest could rewrite the record staging trusts; one that could claim a staging
 /// temporary could be clobbered mid-write.
+///
+/// And it refuses names that describe something runnable, which is the rule that does not follow
+/// from any of the above: see [`refuse_unrunnable_destination`].
 pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError> {
+    destination_key_for(destination, DestinationUse::Written)
+}
+
+/// The same reduction, told what the key is for. See [`DestinationUse`] for what that changes.
+pub(super) fn destination_key_for(
+    destination: &Path,
+    usage: DestinationUse,
+) -> Result<String, ServiceError> {
     let mut parts = Vec::new();
     for component in destination.components() {
         let Component::Normal(part) = component else {
@@ -735,6 +889,12 @@ pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError
             return Err(invalid_asset(format!(
                 "runtime asset destination {part:?} is reserved for staging temporaries"
             )));
+        }
+        // Every component, not only the last: a directory called `payload.exe` is harmless, but a
+        // rule that only looked at the leaf would have to be re-derived every time the shape of a
+        // destination changed, and this one is cheap.
+        if usage == DestinationUse::Written {
+            refuse_unrunnable_destination(&part)?;
         }
         parts.push(part.into_owned());
     }
@@ -784,6 +944,23 @@ pub(super) fn resolve_in_generation(
     destination: &str,
 ) -> Result<PathBuf, ServiceError> {
     let key = destination_key(&validate_destination(destination)?)?;
+    Ok(generation.join(key))
+}
+
+/// The same resolution for a destination the service is only going to *delete*.
+///
+/// Deleting inside the generation is something the owner's own bundle can already ask for by
+/// declaring one fewer asset, so nothing is granted by resolving a name here that
+/// [`resolve_in_generation`] would refuse to write. What it buys is that a `.exe` a previous
+/// service version was willing to stage is still swept by the version that no longer is.
+pub(super) fn resolve_recorded_in_generation(
+    generation: &Path,
+    destination: &str,
+) -> Result<PathBuf, ServiceError> {
+    let key = destination_key_for(
+        &validate_destination(destination)?,
+        DestinationUse::Recorded,
+    )?;
     Ok(generation.join(key))
 }
 
@@ -1020,13 +1197,17 @@ mod owner_ipc_directory_tests {
 mod windows_core_location_tests {
     use super::{WindowsCorePathClass, classify_windows_core_path};
 
-    const SERVICE_DIR: &str = r"C:\ProgramData\Tono";
+    /// What the installer writes: `<state>\bin`, not the whole state directory.
+    const INSTALL_DIR: &str = r"C:\ProgramData\Tono\bin";
+    /// What the service writes on a client's behalf, inside that same state directory.
+    const CLIENT_STAGED_ROOT: &str = r"C:\ProgramData\Tono\users";
     const PROGRAM_FILES: &str = r"C:\Program Files";
 
     fn classify(path: &str) -> WindowsCorePathClass {
         classify_windows_core_path(
             path,
-            &[SERVICE_DIR.to_owned()],
+            &[INSTALL_DIR.to_owned()],
+            &[CLIENT_STAGED_ROOT.to_owned()],
             &[
                 PROGRAM_FILES.to_owned(),
                 r"C:\Program Files (x86)".to_owned(),
@@ -1047,9 +1228,53 @@ mod windows_core_location_tests {
         );
         // Case- and separator-insensitive.
         assert_eq!(
-            classify(r"C:/PROGRAMDATA/tono/bin/MIHOMO.EXE"),
+            classify(r"C:/PROGRAMDATA/tono/BIN/MIHOMO.EXE"),
             WindowsCorePathClass::Allowed
         );
+    }
+
+    #[test]
+    fn refuses_a_binary_staged_into_an_owners_own_directory() {
+        // This assertion used to say the opposite, and saying the opposite is what made the whole
+        // service escalatable. The rule was "anything under the state directory ending in `.exe`
+        // is Allowed", and `users\<owner>\runtime` is under the state directory — but it is filled
+        // in by `materialize_plan`, as LocalSystem, from whatever the client declared as a runtime
+        // asset. So an unprivileged owner could have their own bytes copied in on one call and
+        // name them as `core_path` on the next, getting a LocalSystem process of their choosing
+        // that the desired-state restore then relaunches at every boot.
+        //
+        // The directory's ACLs were never the problem and are not the fix: SYSTEM and
+        // Administrators are still the only writers. What changed is that a directory the service
+        // fills in on a client's behalf is no longer a place the service will execute from.
+        for path in [
+            r"C:\ProgramData\Tono\users\8f14e45f\runtime\payload.exe",
+            r"C:\ProgramData\Tono\users\8f14e45f\runtime\providers\payload.exe",
+            r"C:\ProgramData\Tono\users\8f14e45f\payload.exe",
+            r"C:/programdata/TONO/Users/8f14e45f/runtime/PAYLOAD.EXE",
+        ] {
+            assert_eq!(
+                classify(path),
+                WindowsCorePathClass::ClientStaged,
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_the_rest_of_the_service_state_directory() {
+        // Only the installer's own program directory is allowed under the state root; nothing
+        // grandfathers in a sibling a later layout might add.
+        for path in [
+            r"C:\ProgramData\Tono\mihomo.exe",
+            r"C:\ProgramData\Tono\runtime\mihomo.exe",
+            r"C:\ProgramData\Tono\logs\mihomo.exe",
+        ] {
+            assert_eq!(
+                classify(path),
+                WindowsCorePathClass::OutsideAllowlist,
+                "accepted {path}"
+            );
+        }
     }
 
     #[test]
@@ -1075,25 +1300,21 @@ mod windows_core_location_tests {
             r"\\?\C:\Program Files\Tono\verge-mihomo.exe",
         ] {
             assert_eq!(
-                classify_windows_core_path(
-                    path,
-                    &[r"C:\ProgramData\Tono".to_owned()],
-                    &[r"C:\Program Files".to_owned()],
-                    &[r"C:\Users\a\AppData\Local\Temp".to_owned()],
-                ),
+                classify(path),
                 WindowsCorePathClass::Allowed,
                 "rejected {path}"
             );
         }
 
         assert_eq!(
-            classify_windows_core_path(
-                r"\\?\C:\Users\a\AppData\Local\Temp\mihomo.exe",
-                &[r"C:\ProgramData\Tono".to_owned()],
-                &[r"C:\Program Files".to_owned()],
-                &[r"C:\Users\a\AppData\Local\Temp".to_owned()],
-            ),
+            classify(r"\\?\C:\Users\a\AppData\Local\Temp\mihomo.exe"),
             WindowsCorePathClass::UserWritable
+        );
+        // `std::fs::canonicalize` hands the rule this spelling, so the staged-runtime refusal has
+        // to survive it too — this is the exact string the escalation would have arrived as.
+        assert_eq!(
+            classify(r"\\?\C:\ProgramData\Tono\users\8f14e45f\runtime\payload.exe"),
+            WindowsCorePathClass::ClientStaged
         );
     }
 
@@ -1156,6 +1377,113 @@ mod windows_core_location_tests {
             classify(r"C:\Program Files\Tono\mihomo"),
             WindowsCorePathClass::NotExe
         );
+    }
+}
+
+#[cfg(test)]
+mod destination_type_tests {
+    use super::{DestinationUse, destination_key, destination_key_for};
+    use std::path::Path;
+
+    #[test]
+    fn an_executable_destination_is_refused() {
+        // Defence in depth for the core-path rule, not a substitute for it: this is the step that
+        // gets the attacker's bytes onto a SYSTEM-written disk in the first place. A generation
+        // holds data the core reads; there is no bundle in this product that ships code.
+        for destination in [
+            "payload.exe",
+            "payload.dll",
+            "payload.sys",
+            "payload.scr",
+            "payload.com",
+            "payload.bat",
+            "payload.cmd",
+            "payload.ps1",
+            "payload.msi",
+            "payload.lnk",
+            "PAYLOAD.EXE",
+            "PayLoad.Dll",
+            "providers/payload.exe",
+            "payload.exe/inner.yaml",
+        ] {
+            assert!(
+                destination_key(Path::new(destination)).is_err(),
+                "accepted {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_name_trimming_cannot_smuggle_an_executable_past_the_check() {
+        // Windows drops trailing dots and spaces when it creates a file, so the first three land
+        // on disk as `payload.exe` while presenting an extension of `""` or `"exe "` to anyone
+        // reading the declared name. The last one is the same trick without a payload, and is
+        // refused for the same reason: the name on disk is not the name that was declared.
+        for destination in ["payload.exe.", "payload.exe ", "payload.exe. .", "payload."] {
+            assert!(
+                destination_key(Path::new(destination)).is_err(),
+                "accepted {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alternate_data_stream_is_refused() {
+        // `provider.yaml:payload.exe` writes a stream *of* `provider.yaml` on NTFS: a second file,
+        // with a second extension, that the component-wise check would otherwise never inspect.
+        for destination in [
+            "provider.yaml:payload.exe",
+            "providers/list.yaml:hidden",
+            "C:payload.exe",
+        ] {
+            assert!(
+                destination_key(Path::new(destination)).is_err(),
+                "accepted {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_files_a_real_bundle_carries_are_still_accepted() {
+        // The whole legitimate surface: the geo databases the app copies by name, and provider
+        // paths taken from the user's own configuration. Breaking any of these would break a
+        // first install, which is why the refusal is a list of runnable types rather than an
+        // allowlist of the five extensions seen so far.
+        for destination in [
+            "geoip.metadb",
+            "Country.mmdb",
+            "geosite.dat",
+            "GeoSite.dat",
+            "geoip.dat",
+            "providers/my-nodes.yaml",
+            "rules/ads.txt",
+            "rules/direct.mrs",
+            "providers/no-extension",
+            "providers/company.staging-prod.yaml",
+        ] {
+            assert!(
+                destination_key(Path::new(destination)).is_ok(),
+                "rejected {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recorded_executable_can_still_be_swept() {
+        // A generation written before this refusal existed may hold a `.exe` its manifest records.
+        // Resolving it for *removal* is what deletes it; refusing to resolve it would leave the
+        // payload on disk forever, which is the opposite of the point.
+        assert!(
+            destination_key_for(Path::new("payload.exe"), DestinationUse::Recorded).is_ok(),
+            "a recorded executable must still be nameable for deletion"
+        );
+        // Everything that keeps a deletion inside the generation still holds for a recorded key.
+        for dangerous in ["../escape.exe", "config.yaml", ".runtime-manifest.json"] {
+            assert!(
+                destination_key_for(Path::new(dangerous), DestinationUse::Recorded).is_err(),
+                "accepted {dangerous}"
+            );
+        }
     }
 }
 
@@ -1276,6 +1604,61 @@ mod tests {
                     .join("providers/copied.yaml")
             )?,
             b"proxies: []\n"
+        );
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_executable_asset_is_refused_before_anything_is_written() -> anyhow::Result<()> {
+        // The first half of the escalation this rule closes, end to end: a bundle that asks the
+        // service to write a binary into the owner's generation as SYSTEM. Nothing about the
+        // source is unusual — it is an ordinary file under the owner's own application root, which
+        // is all `validate_source` has ever been able to check. The destination is what is refused,
+        // and it is refused during planning, so the running configuration is untouched.
+        let app_root =
+            std::env::temp_dir().join(format!("service-runtime-exe-asset-{}", std::process::id()));
+        std::fs::create_dir_all(&app_root)?;
+        std::fs::write(app_root.join("payload"), b"MZ...")?;
+        std::fs::write(app_root.join("mihomo"), b"mock core")?;
+        let owner = test_owner(std::fs::canonicalize(&app_root)?);
+        let core_path = app_root.join("mihomo").to_string_lossy().into_owned();
+        let running = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![],
+            remote_providers: Vec::new(),
+            core_path: core_path.clone(),
+        };
+        let prepared = prepare_and_materialize(&owner, &running).await?;
+
+        let payload = RuntimeBundle {
+            yaml: "mode: global\n".to_string(),
+            assets: vec![RuntimeAsset {
+                source: owner
+                    .app_data_root
+                    .join("payload")
+                    .to_string_lossy()
+                    .into_owned(),
+                destination: "providers/payload.exe".to_string(),
+            }],
+            remote_providers: Vec::new(),
+            core_path,
+        };
+
+        let error = prepare_runtime(&owner, &payload)
+            .await
+            .expect_err("an executable destination must be refused");
+
+        assert_eq!(error.code, ServiceErrorCode::InvalidRuntimeAsset);
+        let generation = PathBuf::from(&prepared.clash_config.core_config.config_dir);
+        assert!(
+            !generation.join("providers/payload.exe").exists(),
+            "a refused bundle must not have written its payload"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&prepared.clash_config.core_config.config_path)?,
+            "mode: rule\n"
         );
         std::fs::remove_dir_all(app_root)?;
         Ok(())

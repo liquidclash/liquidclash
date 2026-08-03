@@ -1,5 +1,5 @@
 use super::CmdResult;
-use crate::cmd::StringifyErr as _;
+use crate::cmd::{StringifyErr as _, blocking};
 use crate::core::sysopt::Sysopt;
 use clash_verge_logging::{Type, logging};
 use gethostname::gethostname;
@@ -80,26 +80,38 @@ pub fn get_system_hostname() -> String {
 }
 
 /// 获取网络接口列表
+///
+/// Async because the enumeration is `GetAdaptersAddresses` underneath: it walks every adapter,
+/// including ones a VPN or a flapping Wi-Fi driver is mid-transition on, and has no timeout of
+/// its own. A sync command would spend that time on the Tauri main thread.
 #[tauri::command]
-pub fn get_network_interfaces() -> Vec<String> {
-    tauri_plugin_clash_verge_sysinfo::list_network_interfaces()
+pub async fn get_network_interfaces() -> Vec<String> {
+    crate::process::AsyncHandler::spawn_blocking(tauri_plugin_clash_verge_sysinfo::list_network_interfaces)
+        .await
+        .unwrap_or_default()
 }
 
 /// 获取网络接口详细信息
+///
+/// Both halves run in one hop: two `GetAdaptersAddresses` walks that must agree with each other
+/// are better taken back to back than split across two trips to the blocking pool.
 #[tauri::command]
-pub fn get_network_interfaces_info() -> CmdResult<Vec<NetworkInterface>> {
-    use network_interface::{NetworkInterface, NetworkInterfaceConfig as _};
+pub async fn get_network_interfaces_info() -> CmdResult<Vec<NetworkInterface>> {
+    blocking(|| {
+        use network_interface::{NetworkInterface, NetworkInterfaceConfig as _};
 
-    let names = get_network_interfaces();
-    let interfaces = NetworkInterface::show().stringify_err()?;
+        let names = tauri_plugin_clash_verge_sysinfo::list_network_interfaces();
+        let interfaces = NetworkInterface::show().stringify_err()?;
 
-    let mut result = Vec::new();
+        let mut result = Vec::new();
 
-    for interface in interfaces {
-        if names.contains(&interface.name) {
-            result.push(interface);
+        for interface in interfaces {
+            if names.contains(&interface.name) {
+                result.push(interface);
+            }
         }
-    }
 
-    Ok(result)
+        Ok(result)
+    })
+    .await
 }

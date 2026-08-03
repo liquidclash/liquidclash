@@ -67,15 +67,25 @@ pub(crate) fn open_or_create_private_current_user_file(path: &Path) -> Result<st
     windows_owner::open_or_create_private_file(path)
 }
 
+/// The current process's user SID in string form.
+///
+/// Authoritative where `%USERDOMAIN%\%USERNAME%` is a guess: the scheduled-task principal needs
+/// an identity the Task Scheduler can resolve for AzureAD and Microsoft-account logons too.
+#[cfg(windows)]
+pub(crate) fn current_sid() -> Result<String> {
+    windows_owner::current_sid()
+}
+
 #[cfg(windows)]
 pub(crate) fn current_user_pipe_sddl() -> Result<String> {
-    let sid = windows_owner::current_sid()?;
+    let sid = current_sid()?;
     Ok(format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)"))
 }
 
 #[cfg(windows)]
 mod windows_owner {
     use anyhow::{Context as _, Result, bail};
+    use clash_verge_logging::{Type, logging};
     use clash_verge_service_ipc::OWNER_TOKEN_FILE_NAME;
     use std::ffi::c_void;
     use std::io::{Read as _, Write as _};
@@ -128,15 +138,44 @@ mod windows_owner {
         sid_to_string(token_user.User.Sid)
     }
 
+    /// The one validation failure that is safe to repair automatically.
+    ///
+    /// A token file of the wrong size can never have been a working owner identity, so
+    /// regenerating it cannot invalidate one that something is still using. Every other failure
+    /// (wrong owner, wrong DACL, cannot open) is left alone: replacing the token there could
+    /// orphan a live owner session and with it the only route that releases the barrier.
+    const UNUSABLE_TOKEN_MARKER: &str = "owner token is not an ordinary 32-byte file";
+
     pub(super) fn load_or_create_token(app_data_root: &Path, sid: &str) -> Result<String> {
         let token_path = app_data_root.join(OWNER_TOKEN_FILE_NAME);
+        match try_load_or_create_token(&token_path, sid) {
+            Ok(token) => Ok(token),
+            Err(error) if format!("{error:#}").contains(UNUSABLE_TOKEN_MARKER) => {
+                // Debris from an interrupted first run — see the write path below. Before this,
+                // a single short file made every later launch fail the size check, and nothing
+                // in the tree deleted or repaired it: all privileged Service calls failed
+                // forever until the user found and removed a hidden file by hand.
+                logging!(
+                    warn,
+                    Type::Service,
+                    "owner token file is unusable ({error:#}); regenerating it"
+                );
+                std::fs::remove_file(&token_path)
+                    .with_context(|| format!("failed to remove unusable owner token {}", token_path.display()))?;
+                try_load_or_create_token(&token_path, sid).context("failed to regenerate the owner token")
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_load_or_create_token(token_path: &Path, sid: &str) -> Result<String> {
         let descriptor = LocalSecurityDescriptor::from_sid(sid)?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
         };
-        let wide = wide_path(&token_path)?;
+        let wide = wide_path(token_path)?;
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
@@ -151,11 +190,24 @@ mod windows_owner {
 
         if handle != INVALID_HANDLE_VALUE {
             let mut file = unsafe { std::fs::File::from_raw_handle(handle) };
-            let mut token = [0_u8; TOKEN_BYTES];
-            getrandom::fill(&mut token).context("failed to generate owner token")?;
-            file.write_all(&token).context("failed to write owner token")?;
-            file.sync_all().context("failed to flush owner token")?;
-            return Ok(encode_token(&token));
+            // `CREATE_NEW` publishes the file *before* it has any content. If the random bytes,
+            // the write or the flush fail, the file must not survive: a zero- or short-length
+            // token fails validation on every later launch and bricks privileged IPC for good.
+            let generated = (|| -> Result<[u8; TOKEN_BYTES]> {
+                let mut token = [0_u8; TOKEN_BYTES];
+                getrandom::fill(&mut token).context("failed to generate owner token")?;
+                file.write_all(&token).context("failed to write owner token")?;
+                file.sync_all().context("failed to flush owner token")?;
+                Ok(token)
+            })();
+            return match generated {
+                Ok(token) => Ok(encode_token(&token)),
+                Err(error) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(token_path);
+                    Err(error)
+                }
+            };
         }
         if unsafe { GetLastError() } != ERROR_FILE_EXISTS {
             return Err(std::io::Error::last_os_error()).context("failed to create owner token");
@@ -346,7 +398,7 @@ mod windows_owner {
             || information.nFileSizeHigh != 0
             || information.nFileSizeLow != TOKEN_BYTES as u32
         {
-            bail!("owner token is not an ordinary 32-byte file");
+            bail!("{UNUSABLE_TOKEN_MARKER}");
         }
 
         let mut owner = std::ptr::null_mut();

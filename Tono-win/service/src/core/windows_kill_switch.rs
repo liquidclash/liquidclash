@@ -55,16 +55,65 @@ impl IntentRecord {
     }
 }
 
+/// The core process instance a tunnel permit was granted for.
+///
+/// A pid is not an identity — Windows recycles them — so the watchdog's monotonic restart
+/// counter rides along: a respawn changes at least one of the two, always.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoreInstance {
+    pid: u32,
+    restarts: u32,
+}
+
+/// The core running right now, or `None` when none is. Read from the manager's non-blocking
+/// snapshot: this is on the WFP writer path (including the once-a-second watchdog tick), which
+/// must never queue behind a core start or stop.
+async fn current_core_instance() -> Option<CoreInstance> {
+    let snapshot = crate::core::manager::status_snapshot_nonblocking().await;
+    snapshot.core_pid.map(|pid| CoreInstance {
+        pid,
+        restarts: snapshot.restart_count,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct Armed {
     intent: IntentRecord,
     tun_luid: Option<u64>,
+    /// The core instance `tun_luid` was resolved for, recorded by `lock`. `None` means no
+    /// tunnel permit may be rendered at all — see [`tunnel_permit_luid`].
+    core_instance: Option<CoreInstance>,
     /// Cloud-approved DIRECT endpoints for this armed session. **omission = clear**: kept
     /// only in memory, never written to `kill-switch.json`, never restored on service start,
-    /// never inherited by the next arm. While the switch stays armed (any mode), the permits
-    /// stay; every restore path rebuilds with an empty set (fail-closed until the app's next
-    /// connect transaction re-issues them).
+    /// never inherited by the next arm. The permits themselves are rendered only while
+    /// `Locked` (rule G); keeping the approved set here across a mode change is what lets a
+    /// re-lock re-render them without another round trip. Every restore path rebuilds with an
+    /// empty set (fail-closed until the app's next connect transaction re-issues them).
     direct_endpoints: Vec<ProxyEndpoint>,
+}
+
+/// The LUID the tunnel permit may name this tick, or `None` for the pre-lock policy (no tunnel
+/// permit at all — exactly the fail-closed set `lock` replaces).
+///
+/// The tunnel permit is the widest rule the service ever installs: weight-8, matching only
+/// `IP_LOCAL_INTERFACE == luid`, with no protocol, port, or app condition. It is safe only
+/// because that LUID belongs to the Wintun adapter of the core this session locked. Nothing in
+/// WFP notices when that adapter goes away: a `NET_LUID` is `{NetLuidIndex, IfType}` and
+/// `NetLuidIndex` is *reused*, so once the core it was granted for is gone, the next device
+/// handed that index would inherit an unconditional permit for everything it carries — and the
+/// verify-after-write watchdog would faithfully keep reinstalling it. So the permit lives
+/// exactly as long as that core instance: a watchdog respawn, an app-driven restart, or no core
+/// at all all fall back to the pre-lock policy and block tunnel traffic until the app locks
+/// again, which re-resolves the LUID against the live adapter.
+fn tunnel_permit_luid(armed: &Armed, current_core: Option<CoreInstance>) -> Option<u64> {
+    let luid = armed.tun_luid?;
+    // Fail closed on every ambiguity: an unidentified grant (`None` recorded) never matches,
+    // so it can never be revived by a later tick that also cannot identify a core.
+    if armed.core_instance.is_some() && armed.core_instance == current_core {
+        Some(luid)
+    } else {
+        None
+    }
 }
 
 static ARMED: Lazy<Mutex<Option<Armed>>> = Lazy::new(|| Mutex::new(None));
@@ -82,10 +131,6 @@ static LAST_VERIFY: Lazy<Mutex<Option<(std::time::Instant, bool)>>> =
 /// How long a status read may trust the cached verify: the watchdog re-verifies every
 /// second, so this keeps reads at most one tick stale while staying off the RPC path.
 const VERIFY_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1_500);
-/// Resolution is best-effort because the App also supplies pinned literal bootstrap addresses.
-/// A broken resolver must never occupy the Service lifecycle queue without a bound.
-#[cfg(all(windows, not(feature = "test")))]
-const API_HOST_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Stable, App-mappable marker for "the WFP engine stopped answering". The App keys its i18n
 /// off prefixes like `TONO_SERVICE_BUSY` by substring, and every handler wraps this message in
@@ -97,6 +142,15 @@ pub(crate) const WFP_ENGINE_WEDGED_PREFIX: &str = "TONO_WFP_ENGINE_WEDGED";
 /// the wedge marker because the user action differs: start BFE versus reboot the machine.
 #[cfg_attr(not(all(windows, not(feature = "test"))), allow(dead_code))]
 pub(crate) const BFE_NOT_RUNNING_PREFIX: &str = "TONO_BFE_NOT_RUNNING";
+/// Stable marker for "the DNS module did not come back", so a stalled resolver restore is
+/// distinguishable in the log and in `last_error` from a DNS restore that ran and failed.
+const DNS_RESTORE_STALLED_PREFIX: &str = "TONO_DNS_RESTORE_STALLED";
+
+/// Budget for the cross-module DNS awaits taken on the WFP writer path (`bounded_dns_call`).
+/// A DNS restore is two PowerShell batches (10 s each), a live read-back and a cache flush, so
+/// the module's own worst case fits inside this and the bound only fires on a genuine stall. It
+/// also stays under the IPC handler's 60 s budget, so the refusal still reaches the client.
+const DNS_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
 
 fn note_verify(ok: bool) {
     *LAST_VERIFY
@@ -104,9 +158,15 @@ fn note_verify(ok: bool) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((std::time::Instant::now(), ok));
 }
 
-/// Status and diagnostics must never turn a past panic into a permanent Service freeze.
-/// Recover the guard contents after poison so `/kill-switch/status` and startup restore keep
-/// answering while the next mutation re-serializes through `WFP_OPERATION`.
+/// Poison must never turn a past panic into a permanent Service freeze. These three accessors
+/// recover the guard contents so status, startup restore, every mutation *and the watchdog*
+/// keep working while `WFP_OPERATION` re-serializes the next write.
+///
+/// They are the only way this module takes these locks. A bare `.lock().unwrap()` on the
+/// watchdog path would be the worst of the lot: the tick would panic inside `tokio::spawn`,
+/// the task would die with its `JoinHandle` — nothing restarts it — and the verify-after-write
+/// reconciliation plus the `LAST_VERIFY` refresh that `status()` reports liveness from would be
+/// silently gone for the life of the process.
 fn armed_guard() -> std::sync::MutexGuard<'static, Option<Armed>> {
     ARMED
         .lock()
@@ -223,6 +283,11 @@ fn validate_direct_endpoints(config: &KillSwitchConfig) -> Result<()> {
 fn intent_is_valid(intent: &IntentRecord) -> bool {
     intent.wanted
         && !intent.tunnel_interface.is_empty()
+        // The app-scoped permit is resolved from this path, and the model emits an app-id rule
+        // whenever an endpoint permit exists. An empty path would therefore make every install
+        // from this record fall back to "block installed, endpoint permit missing" forever; a
+        // truncated record is instead an unusable *wanted* intent (emergency block below).
+        && !intent.app_path.is_empty()
         && !intent.endpoints.is_empty()
         && intent
             .endpoints
@@ -230,7 +295,9 @@ fn intent_is_valid(intent: &IntentRecord) -> bool {
             .all(|endpoint| wfp_model::parse_endpoint(endpoint).is_some())
 }
 
-fn rule_config(armed: &Armed) -> RuleConfig {
+/// The rule model's view of an armed session, given who the running core is. Pure, so the
+/// tunnel-permit lifetime rule is testable without a core.
+fn rule_config_for(armed: &Armed, current_core: Option<CoreInstance>) -> RuleConfig {
     RuleConfig {
         mode: armed.intent.mode,
         endpoints: armed.intent.endpoints.clone(),
@@ -240,10 +307,32 @@ fn rule_config(armed: &Armed) -> RuleConfig {
             .iter()
             .filter_map(|ip| ip.parse::<IpAddr>().ok())
             .collect(),
-        tun_luid: armed.tun_luid,
+        tun_luid: tunnel_permit_luid(armed, current_core),
         app_path: armed.intent.app_path.clone(),
         direct_endpoints: armed.direct_endpoints.clone(),
     }
+}
+
+/// Whether the last render had to drop an orphaned tunnel permit. Only the transitions are
+/// logged: the watchdog renders once a second, and a silently blocked tunnel is the one
+/// outcome of this rule that needs evidence in the service log.
+static TUNNEL_PERMIT_ORPHANED: AtomicBool = AtomicBool::new(false);
+
+async fn rule_config(armed: &Armed) -> RuleConfig {
+    let config = rule_config_for(armed, current_core_instance().await);
+    let orphaned = armed.tun_luid.is_some() && config.tun_luid.is_none();
+    if orphaned != TUNNEL_PERMIT_ORPHANED.swap(orphaned, Ordering::Relaxed) {
+        if orphaned {
+            tracing::warn!(
+                "wfp: the tunnel permit was granted for a core instance that is no longer \
+                 running; falling back to the pre-lock policy, so tunnel traffic stays blocked \
+                 until the app locks again"
+            );
+        } else {
+            tracing::info!("wfp: the tunnel permit matches the running core again");
+        }
+    }
+    config
 }
 
 /// Budget for one WFP call. A healthy transaction is milliseconds and the surrounding IPC
@@ -521,7 +610,7 @@ async fn engine_call<T: Send + 'static>(
 }
 
 async fn install_unlocked(armed: &Armed) -> Result<()> {
-    let expected = wfp_model::expected_filters(&rule_config(armed));
+    let expected = wfp_model::expected_filters(&rule_config(armed).await);
     #[cfg(all(windows, not(feature = "test")))]
     {
         let app_path = armed.intent.app_path.clone();
@@ -541,7 +630,7 @@ async fn install_unlocked(armed: &Armed) -> Result<()> {
 }
 
 async fn verify_live_unlocked(armed: &Armed) -> Result<()> {
-    let expected = wfp_model::expected_filters(&rule_config(armed));
+    let expected = wfp_model::expected_filters(&rule_config(armed).await);
     #[cfg(all(windows, not(feature = "test")))]
     {
         engine_call("verify", move || crate::core::wfp::verify(&expected)).await
@@ -584,70 +673,45 @@ async fn sweep_legacy_sublayers_unlocked() {
 fn record_outcome(result: Result<()>) -> Result<()> {
     match result {
         Ok(()) => {
-            *LAST_ERROR.lock().unwrap() = None;
+            *last_error_guard() = None;
             Ok(())
         }
         Err(error) => {
-            *LAST_ERROR.lock().unwrap() = Some(format!("{error:#}"));
+            *last_error_guard() = Some(format!("{error:#}"));
             Err(error)
         }
     }
 }
 
-/// Literal IPs are used directly; hostnames resolve once here, before the block exists.
-/// Lookups run concurrently — this sits on the connect critical path before WFP arms, and
-/// sequential per-host timeouts would stack — but results are collected in the caller's host
-/// order, so the sanitizer's first-wins dedup and cap keep favoring earlier hosts.
-/// Everything is then funnelled through the model's public-only, bounded sanitizer.
-async fn resolve_api_hosts(hosts: &[String]) -> Vec<IpAddr> {
-    let hosts = hosts
-        .iter()
-        .take(16)
-        .map(|host| host.trim().to_owned())
-        .filter(|host| !host.is_empty())
-        .collect::<Vec<_>>();
-    let mut ips_per_host: Vec<Vec<IpAddr>> = vec![Vec::new(); hosts.len()];
-    #[cfg(all(windows, not(feature = "test")))]
-    let mut lookups = Vec::new();
-    for (index, host) in hosts.iter().enumerate() {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            ips_per_host[index].push(ip);
+/// The bootstrap API channel's destinations, admitted from what the client supplied.
+///
+/// **Literal IPs only — the service never resolves a name here.** Resolving one would mean the
+/// answer picks the permit: the app looks the API host up through the system resolver *before*
+/// the barrier arms, so a hostile DHCP resolver, a captive portal or an on-path spoofer would
+/// choose up to [`wfp_model::MAX_API_HOST_IPS`] of the destinations this service then punches
+/// through its own block — and "public and unreserved" is the only thing that check could ever
+/// prove about the answer, because nothing here binds it to an expected host or a pin. The
+/// client already pins literals for exactly this reason (its own recovery path must survive a
+/// poisoned resolver), so nothing is lost: a non-literal entry is dropped, never looked up.
+///
+/// Order is the caller's, so the sanitizer's first-wins dedup and cap keep favouring earlier
+/// hosts; everything is funnelled through the model's public-only, bounded sanitizer.
+fn admit_api_host_ips(hosts: &[String]) -> Vec<IpAddr> {
+    let mut literals = Vec::new();
+    for host in hosts.iter().take(16) {
+        let host = host.trim();
+        if host.is_empty() {
             continue;
         }
-        #[cfg(all(windows, not(feature = "test")))]
-        {
-            let host = host.clone();
-            lookups.push((
-                index,
-                host.clone(),
-                tokio::spawn(async move {
-                    tokio::time::timeout(
-                        API_HOST_LOOKUP_TIMEOUT,
-                        tokio::net::lookup_host(format!("{host}:443")),
-                    )
-                    .await
-                }),
-            ));
-        }
-    }
-    #[cfg(all(windows, not(feature = "test")))]
-    for (index, host, lookup) in lookups {
-        match lookup.await {
-            Ok(Ok(Ok(resolved))) => {
-                ips_per_host[index].extend(resolved.map(|address| address.ip()))
-            }
-            Ok(Ok(Err(error))) => {
-                tracing::warn!("kill-switch API host {host:?} did not resolve: {error}")
-            }
-            Ok(Err(_)) => tracing::warn!(
-                "kill-switch API host {host:?} resolution exceeded {API_HOST_LOOKUP_TIMEOUT:?}"
+        match host.parse::<IpAddr>() {
+            Ok(ip) => literals.push(ip),
+            Err(_) => tracing::warn!(
+                "kill-switch API host {host:?} is not a literal IP and is dropped; the service \
+                 does not resolve names into WFP permits"
             ),
-            Err(error) => {
-                tracing::warn!("kill-switch API host {host:?} lookup task failed: {error}")
-            }
         }
     }
-    wfp_model::sanitize_api_host_ips(ips_per_host.into_iter().flatten())
+    wfp_model::sanitize_api_host_ips(literals)
 }
 
 /// First phase of the two-phase arm: floor + session rules up, API channel open, tunnel not
@@ -667,9 +731,9 @@ pub(crate) async fn arm_bootstrap(
     if owner_key.is_empty() {
         bail!("enabled kill switch requires the authenticated owner key");
     }
-    let api_host_ips = resolve_api_hosts(&config.bootstrap_api_hosts).await;
+    let api_host_ips = admit_api_host_ips(&config.bootstrap_api_hosts);
     let _operation = WFP_OPERATION.lock().await;
-    let inherited_verified = ARMED.lock().unwrap().as_ref().is_some_and(|armed| {
+    let inherited_verified = armed_guard().as_ref().is_some_and(|armed| {
         armed.intent.owner_key.as_deref() == Some(owner_key) && armed.intent.is_verified()
     });
     let armed = Armed {
@@ -685,13 +749,14 @@ pub(crate) async fn arm_bootstrap(
             owner_key: Some(owner_key.to_owned()),
         },
         tun_luid: None,
+        core_instance: None,
         // In memory only — the intent file deliberately never carries these (omission = clear).
         direct_endpoints: config.direct_endpoints.clone(),
     };
     // Persist fail-closed intent before touching WFP: a daemon restart installs at least the
     // floor if this process dies during the following transaction.
     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?).await?;
-    *ARMED.lock().unwrap() = Some(armed.clone());
+    *armed_guard() = Some(armed.clone());
     record_outcome(install_unlocked(&armed).await)
 }
 
@@ -716,7 +781,7 @@ pub(crate) async fn mark_verified(owner_key: &str) -> Result<()> {
     armed.intent.verified = Some(true);
     armed.intent.updated_at = now_unix();
     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?).await?;
-    *ARMED.lock().unwrap() = Some(armed);
+    *armed_guard() = Some(armed);
     Ok(())
 }
 
@@ -731,7 +796,7 @@ pub(crate) async fn mark_verified(owner_key: &str) -> Result<()> {
 pub(crate) fn authorize_write_for(
     caller_key: &str,
 ) -> std::result::Result<(), crate::core::auth::ServiceError> {
-    let recorded = { ARMED.lock().unwrap().clone() }.and_then(|armed| armed.intent.owner_key);
+    let recorded = { armed_guard().clone() }.and_then(|armed| armed.intent.owner_key);
     let Some(recorded) = recorded else {
         return Ok(());
     };
@@ -766,6 +831,10 @@ async fn resolve_luid(name: &str) -> Result<u64> {
 /// client-supplied name like "Ethernet" would otherwise install a weight-8 permit for a
 /// physical adapter — a fail-open primitive for every process on the machine. Rejecting a
 /// mismatch has zero side effects; it guards against client bugs and same-user process abuse.
+///
+/// The grant is recorded against the core instance running when it is made: a LUID names an
+/// adapter that belongs to that core, and [`tunnel_permit_luid`] retracts the permit the moment
+/// that core is replaced or gone. Locking again — the app's job — is what re-grants it.
 pub(crate) async fn lock(tunnel_interface: Option<&str>) -> Result<()> {
     ensure_supported()?;
     let _operation = WFP_OPERATION.lock().await;
@@ -787,8 +856,13 @@ pub(crate) async fn lock(tunnel_interface: Option<&str>) -> Result<()> {
             "lock interface {supplied:?} does not match the interface recorded at arm time {recorded:?}"
         );
     }
+    // Read the core identity *before* resolving the LUID: a core replaced in between makes the
+    // recorded instance stale rather than falsely current, so the next render retracts the
+    // permit instead of handing it to an adapter the new core did not create.
+    let core_instance = current_core_instance().await;
     let luid = resolve_luid(&recorded).await?;
     armed.tun_luid = Some(luid);
+    armed.core_instance = core_instance;
     armed.intent.mode = KillSwitchStatusMode::Locked;
     armed.intent.updated_at = now_unix();
     // Update live WFP first (the macOS helper's add_tunnel ordering): if this fails, the
@@ -796,8 +870,8 @@ pub(crate) async fn lock(tunnel_interface: Option<&str>) -> Result<()> {
     // a crash.
     install_unlocked(&armed).await?;
     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?).await?;
-    *ARMED.lock().unwrap() = Some(armed);
-    *LAST_ERROR.lock().unwrap() = None;
+    *armed_guard() = Some(armed);
+    *last_error_guard() = None;
     Ok(())
 }
 
@@ -811,10 +885,12 @@ async fn restrict_bootstrap_unlocked() -> Result<()> {
         .context("kill switch is not armed")?;
     armed.intent.mode = KillSwitchStatusMode::Blocked;
     armed.tun_luid = None;
+    // The grant goes with the LUID: a later lock must re-establish both.
+    armed.core_instance = None;
     armed.intent.updated_at = now_unix();
     // Persist first so a crash at any later point restores the stricter block (macOS parity).
     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?).await?;
-    *ARMED.lock().unwrap() = Some(armed.clone());
+    *armed_guard() = Some(armed.clone());
     record_outcome(install_unlocked(&armed).await)
 }
 
@@ -824,9 +900,58 @@ pub(crate) async fn restrict_bootstrap() -> Result<()> {
     restrict_bootstrap_unlocked().await
 }
 
+/// Bound a cross-module DNS await taken while `WFP_OPERATION` is held.
+///
+/// `dns::ensure_restored` / `dns::restore_protected` are the only awaits on the WFP writer path
+/// that leave this module, and the operation lock is held across them. Without a bound here a
+/// stalled DNS engine holds `WFP_OPERATION` forever, so *every* WFP operation — arm, lock,
+/// restrict, verify, release, emergency disarm — queues behind it and the machine stays
+/// fail-closed with no way to open it short of a reboot. `dns.rs` bounds itself as well; this is
+/// the defensive half, because the liveness of this module's writer lock must not depend on
+/// another module's discipline.
+///
+/// The bound may only convert an infinite hang into a clean failure; it is never a way to skip
+/// the DNS proof. Callers treat the timeout exactly like any other unprovable restore, so on the
+/// disarm/release path the filters stay installed and the barrier stays armed — a timeout can
+/// never open the network while DNS may still point at a dead loopback resolver. Cancelling the
+/// restore (the timeout drops the future) is safe for the same reason: `restore_protected`
+/// deletes its snapshot only *after* the restore is proven, so a cancelled attempt leaves the
+/// evidence — and the block — exactly where a failed attempt would, ready for the next retry.
+async fn bounded_dns_call<T>(
+    operation: &str,
+    call: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    bounded_dns_call_within(DNS_RESTORE_TIMEOUT, operation, call).await
+}
+
+/// The budget is a parameter for the same reason `bounded_engine_call` takes one: the ownership
+/// and refusal rules are what matter and they must stay unit-testable without waiting out the
+/// production budget.
+async fn bounded_dns_call_within<T>(
+    budget: std::time::Duration,
+    operation: &str,
+    call: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(budget, call).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                "dns: restore did not return within {budget:?} during {operation} while the WFP \
+                 operation lock was held; the attempt is dropped so the lock is released, and \
+                 {operation} is refused"
+            );
+            bail!(
+                "{DNS_RESTORE_STALLED_PREFIX}: DNS restore did not answer within {budget:?} \
+                 during {operation}, so it could not be proven. Protection stays in its last \
+                 known state; retry once the resolver settles."
+            )
+        }
+    }
+}
+
 /// Normal release — only on explicit user request. See the DNS-before-disarm invariant.
 async fn disarm_unlocked() -> Result<()> {
-    let previous = ARMED.lock().unwrap().clone();
+    let previous = armed_guard().clone();
     let Some(previous) = previous else {
         // Not armed: still sweep possible residuals so a half-failed earlier run cannot
         // linger, then clear any stale intent file.
@@ -839,8 +964,13 @@ async fn disarm_unlocked() -> Result<()> {
         // A leftover DNS snapshot must not be skipped just because nothing is armed: the
         // filters are already gone, so refusing would buy no blocking — but the resolver
         // must not stay on a dead loopback. Best-effort, surfaced via last_error.
-        if let Err(error) = crate::core::dns::ensure_restored().await {
-            *LAST_ERROR.lock().unwrap() = Some(format!(
+        if let Err(error) = bounded_dns_call(
+            "release without an armed switch",
+            crate::core::dns::ensure_restored(),
+        )
+        .await
+        {
+            *last_error_guard() = Some(format!(
                 "leftover DNS snapshot could not be restored: {error:#}"
             ));
         }
@@ -851,7 +981,12 @@ async fn disarm_unlocked() -> Result<()> {
     // proven, the disarm is refused and the block stays armed — opening the network while DNS
     // still points at a dead loopback resolver would blackhole the user, and restoring after
     // opening would race leaked traffic.
-    crate::core::dns::ensure_restored().await?;
+    //
+    // The bound below does not weaken that: a timeout is an *unproven* restore, and `?` fails
+    // the disarm on it exactly like a restore that ran and failed, so the filters below are
+    // never reached and the barrier stays armed. It only stops another module's stall from
+    // holding `WFP_OPERATION` — and therefore every future arm/lock/release — forever.
+    bounded_dns_call("disarm", crate::core::dns::ensure_restored()).await?;
     if let Err(error) = remove_all_filters_unlocked().await {
         let _ = install_unlocked(&previous).await;
         return Err(error.context("failed to remove kill-switch filters; protection restored"));
@@ -866,8 +1001,8 @@ async fn disarm_unlocked() -> Result<()> {
             return Err(error).context("network opened but persisted-state cleanup failed");
         }
     }
-    *ARMED.lock().unwrap() = None;
-    *LAST_ERROR.lock().unwrap() = None;
+    *armed_guard() = None;
+    *last_error_guard() = None;
     Ok(())
 }
 
@@ -892,7 +1027,7 @@ pub(crate) async fn transition_after_stop(release_requested: bool) -> Result<()>
         return Ok(());
     }
     let _operation = WFP_OPERATION.lock().await;
-    if ARMED.lock().unwrap().is_none() {
+    if armed_guard().is_none() {
         return Ok(());
     }
     if release_requested {
@@ -919,6 +1054,7 @@ fn emergency_armed() -> Armed {
             owner_key: None,
         },
         tun_luid: None,
+        core_instance: None,
         direct_endpoints: Vec::new(),
     }
 }
@@ -951,13 +1087,14 @@ pub async fn restore_on_service_start() -> Result<()> {
                     let mut armed = Armed {
                         intent,
                         tun_luid: None,
+                        core_instance: None,
                         direct_endpoints: Vec::new(),
                     };
                     armed.intent.mode = KillSwitchStatusMode::Blocked;
                     armed.intent.updated_at = now_unix();
                     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&armed.intent)?)
                         .await?;
-                    *ARMED.lock().unwrap() = Some(armed.clone());
+                    *armed_guard() = Some(armed.clone());
                     let installed = record_outcome(install_unlocked(&armed).await);
                     if installed.is_ok() {
                         sweep_legacy_sublayers_unlocked().await;
@@ -967,6 +1104,9 @@ pub async fn restore_on_service_start() -> Result<()> {
                 let mut armed = Armed {
                     intent,
                     tun_luid: None,
+                    // A restored intent never inherits a tunnel grant: the adapter, and the core
+                    // that created it, belong to a process that is gone.
+                    core_instance: None,
                     // omission = clear: a restore never brings DIRECT endpoints back. The
                     // recovered session stays fail-closed for them until the app's next
                     // connect transaction re-issues the approved tuples.
@@ -986,19 +1126,25 @@ pub async fn restore_on_service_start() -> Result<()> {
                         .await?;
                     RESTORE_WAS_LOCKED.store(true, Ordering::Release);
                 }
-                *ARMED.lock().unwrap() = Some(armed.clone());
+                *armed_guard() = Some(armed.clone());
                 let installed = record_outcome(install_unlocked(&armed).await);
                 if installed.is_ok() {
                     sweep_legacy_sublayers_unlocked().await;
                 }
                 installed
             }
-            Ok(intent) => {
-                // wanted == false (or unwanted-but-parseable) with possible residual objects:
-                // clean up, exactly the design's third recovery rule. A leftover DNS snapshot
-                // (e.g. from an emergency disarm whose restore could not be proven) is swept
-                // here too — protection is off, so the machine must not stay on loopback DNS.
-                let _ = intent;
+            // `wanted == false` is the *only* parseable record that may disarm the machine. The
+            // guard above rejects a record for several reasons besides that one — an empty
+            // interface, no endpoints, an endpoint the model no longer parses after a
+            // validation tightening — and every one of those is a `wanted: true` intent whose
+            // details went stale, never a request to open the network. Testing `wanted`
+            // explicitly here keeps that case on the fail-closed side with the corrupt and
+            // unreadable records below.
+            Ok(intent) if !intent.wanted => {
+                // Unwanted-but-parseable, with possible residual objects: clean up, exactly the
+                // design's third recovery rule. A leftover DNS snapshot (e.g. from an emergency
+                // disarm whose restore could not be proven) is swept here too — protection is
+                // off, so the machine must not stay on loopback DNS.
                 // `remove_all_filters` is provider-scoped, so filters in legacy sublayers go
                 // with it; the sweep afterwards only clears the emptied sublayer objects.
                 remove_all_filters_unlocked().await?;
@@ -1008,20 +1154,40 @@ pub async fn restore_on_service_start() -> Result<()> {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
-                *ARMED.lock().unwrap() = None;
-                if let Err(error) = crate::core::dns::ensure_restored().await {
+                *armed_guard() = None;
+                if let Err(error) = bounded_dns_call(
+                    "service start (unwanted intent)",
+                    crate::core::dns::ensure_restored(),
+                )
+                .await
+                {
                     tracing::warn!(
                         "service start: leftover DNS snapshot could not be restored: {error:#}"
                     );
                 }
                 Ok(())
             }
+            Ok(_) => {
+                // A `wanted: true` record that no longer validates: the intent to stay blocked
+                // is intact, only its details are unusable. Treat it exactly like a corrupt
+                // record — emergency block, file left on disk as evidence — rather than
+                // disarming a machine that asked to stay closed.
+                let emergency = emergency_armed();
+                *armed_guard() = Some(emergency.clone());
+                let installed = install_unlocked(&emergency).await.context(
+                    "unusable wanted kill-switch intent: failed to install emergency block",
+                );
+                if installed.is_ok() {
+                    sweep_legacy_sublayers_unlocked().await;
+                }
+                installed
+            }
             Err(_) => {
                 // Corrupt intent = wanted (fail-closed), exactly the macOS helper's "damaged
                 // state file ⇒ install emergency block". The corrupt file is left on disk as
                 // evidence; the in-memory intent below is what the watchdog reconciles.
                 let emergency = emergency_armed();
-                *ARMED.lock().unwrap() = Some(emergency.clone());
+                *armed_guard() = Some(emergency.clone());
                 let installed = install_unlocked(&emergency)
                     .await
                     .context("corrupt kill-switch intent: failed to install emergency block");
@@ -1039,7 +1205,7 @@ pub async fn restore_on_service_start() -> Result<()> {
                 .unwrap_or(true)
             {
                 let emergency = emergency_armed();
-                *ARMED.lock().unwrap() = Some(emergency.clone());
+                *armed_guard() = Some(emergency.clone());
                 let installed = install_unlocked(&emergency)
                     .await
                     .context("missing intent with residual WFP objects: failed to reinstall block");
@@ -1054,7 +1220,12 @@ pub async fn restore_on_service_start() -> Result<()> {
             // Tono provider does not exist.
             sweep_legacy_sublayers_unlocked().await;
             // Not armed and nothing residual: still sweep a leftover DNS snapshot (see above).
-            if let Err(error) = crate::core::dns::ensure_restored().await {
+            if let Err(error) = bounded_dns_call(
+                "service start (no intent)",
+                crate::core::dns::ensure_restored(),
+            )
+            .await
+            {
                 tracing::warn!(
                     "service start: leftover DNS snapshot could not be restored: {error:#}"
                 );
@@ -1069,7 +1240,7 @@ pub async fn restore_on_service_start() -> Result<()> {
             // install stays a no-op.
             tracing::warn!("kill-switch intent could not be read: {error:#}");
             let emergency = emergency_armed();
-            *ARMED.lock().unwrap() = Some(emergency.clone());
+            *armed_guard() = Some(emergency.clone());
             let installed = install_unlocked(&emergency)
                 .await
                 .context("unreadable kill-switch intent: failed to install emergency block");
@@ -1096,7 +1267,7 @@ pub async fn retire_unverified_on_service_start() -> Result<bool> {
         return Ok(false);
     }
     let _operation = WFP_OPERATION.lock().await;
-    let Some(armed) = ARMED.lock().unwrap().clone() else {
+    let Some(armed) = armed_guard().clone() else {
         return Ok(false);
     };
     if armed.intent.is_verified() {
@@ -1125,7 +1296,7 @@ pub async fn retire_unverified_on_service_start() -> Result<bool> {
     match result {
         Ok(()) => Ok(true),
         Err(error) => {
-            *LAST_ERROR.lock().unwrap() = Some(format!(
+            *last_error_guard() = Some(format!(
                 "stale unverified session remains fail-closed: {error:#}"
             ));
             Err(error)
@@ -1145,12 +1316,12 @@ pub async fn relock_restored_tunnel() -> Result<()> {
     if !RESTORE_WAS_LOCKED.swap(false, Ordering::Acquire) {
         return Ok(());
     }
-    if ARMED.lock().unwrap().is_none() {
+    if armed_guard().is_none() {
         return Ok(());
     }
     lock(None).await.map_err(|error| {
         let message = format!("restored core could not be re-locked: {error:#}");
-        *LAST_ERROR.lock().unwrap() = Some(message.clone());
+        *last_error_guard() = Some(message.clone());
         error.context(message)
     })
 }
@@ -1160,12 +1331,20 @@ pub async fn relock_restored_tunnel() -> Result<()> {
 /// log-throttled — one error per minute, the rest at debug — so a broken engine cannot
 /// flood the service log.
 pub fn spawn_windows_kill_switch_watchdog() {
+    /// One error line per minute; the rest at debug.
+    const ERROR_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
     tokio::spawn(async {
-        let mut last_error_log = std::time::Instant::now() - std::time::Duration::from_secs(3_600);
+        // `None` = "never logged yet", *not* `Instant::now() - an hour`: `Instant` is
+        // boot-relative on Windows and this service is AutoStart, so subtracting an hour
+        // underflows and panics on a machine that has been up for less than that — killing the
+        // watchdog task on its first statement at every boot, which would silently disable both
+        // the verify-after-write reconciliation and the `LAST_VERIFY` refresh that `status()`
+        // reports liveness from.
+        let mut last_error_log: Option<std::time::Instant> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let _operation = WFP_OPERATION.lock().await;
-            let armed = { ARMED.lock().unwrap().clone() };
+            let armed = { armed_guard().clone() };
             if let Some(armed) = armed {
                 let healthy = if ENGINE_LIVE {
                     let healthy = verify_live_unlocked(&armed).await.is_ok();
@@ -1175,10 +1354,10 @@ pub fn spawn_windows_kill_switch_watchdog() {
                     true
                 };
                 if !healthy && let Err(error) = install_unlocked(&armed).await {
-                    *LAST_ERROR.lock().unwrap() = Some(format!("{error:#}"));
-                    if last_error_log.elapsed() >= std::time::Duration::from_secs(60) {
+                    *last_error_guard() = Some(format!("{error:#}"));
+                    if last_error_log.is_none_or(|at| at.elapsed() >= ERROR_LOG_INTERVAL) {
                         tracing::error!("Windows kill-switch reconciliation failed: {error:#}");
-                        last_error_log = std::time::Instant::now();
+                        last_error_log = Some(std::time::Instant::now());
                     } else {
                         tracing::debug!(
                             "Windows kill-switch reconciliation still failing: {error:#}"
@@ -1200,7 +1379,14 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     // cannot be restored. The DNS failure is nevertheless returned *after* WFP and intent
     // cleanup so an uninstaller cannot report success and delete the remaining recovery files.
     // `restore_protected` preserves its snapshot on failure, making a repair + retry possible.
-    let dns_restore = crate::core::dns::restore_protected().await;
+    //
+    // Bounded like every other cross-module await on this path, and here the bound cannot even
+    // touch the ordering invariant: this path is the documented fail-open escape hatch that
+    // removes WFP whether or not DNS could be restored, so a timeout only changes *how* the
+    // uninstaller reports an unrestored resolver — never whether it proved one before opening.
+    // An unbounded hang here would instead wedge the uninstaller while holding `WFP_OPERATION`.
+    let dns_restore =
+        bounded_dns_call("emergency disarm", crate::core::dns::restore_protected()).await;
 
     // Persist fail-open intent *before* removing WFP. If deleting the intent file later fails,
     // service-start recovery sees this tombstone and completes cleanup instead of re-arming the
@@ -1223,14 +1409,21 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     tombstone.wanted = false;
     tombstone.updated_at = now_unix();
     atomic_write(&intent_path(), &serde_json::to_vec_pretty(&tombstone)?).await?;
-    *ARMED.lock().unwrap() = None;
-    *LAST_VERIFY.lock().unwrap() = None;
 
     // Bounded like every other engine call: an uninstaller that hangs forever on a wedged BFE
     // is worse than one that reports why it could not finish. The `wanted: false` tombstone is
     // already on disk, so the next service start completes the cleanup either way.
+    //
+    // Ordering: the tombstone goes to disk *before* the engine call (a crash mid-removal must
+    // still complete cleanup at the next service start), but the in-memory disarmed state is
+    // published *after* it. Publishing first would make `status()` report an unprotected
+    // machine while the filters are demonstrably still installed — the exact inversion of what
+    // the product promises. On failure the reported state therefore stays "armed", which is
+    // what the engine still enforces; the tombstone finishes the job on the next start.
     #[cfg(all(windows, not(feature = "test")))]
     engine_call("emergency disarm", crate::core::wfp::emergency_disarm).await?;
+    *armed_guard() = None;
+    *last_verify_guard() = None;
     match tokio::fs::remove_file(intent_path()).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1393,7 +1586,15 @@ mod tests {
         Ok(())
     }
 
+    /// A corrupt snapshot only refuses a restore while the machine is still resolving through
+    /// the loopback core; off Windows that answer comes from a test hook, so tests that mean
+    /// "restore is unprovable" must say so explicitly.
+    fn simulate_machine_still_on_loopback_dns() {
+        crate::core::dns::test_hooks::set_live_dns_on_loopback(true);
+    }
+
     async fn cleanup() {
+        crate::core::dns::test_hooks::set_live_dns_on_loopback(false);
         *ARMED.lock().unwrap() = None;
         *LAST_ERROR.lock().unwrap() = None;
         RESTORE_WAS_LOCKED.store(false, Ordering::Release);
@@ -1461,6 +1662,7 @@ mod tests {
         let mut intent = valid_intent(KillSwitchStatusMode::Blocked, true);
         intent.verified = Some(false);
         atomic_write(&intent_path(), &serde_json::to_vec_pretty(&intent)?).await?;
+        simulate_machine_still_on_loopback_dns();
         atomic_write(&dns_snapshot_path(), b"{ corrupt").await?;
 
         restore_on_service_start().await?;
@@ -1566,6 +1768,85 @@ mod tests {
         Ok(())
     }
 
+    /// The disarm path is the one place a `wanted` record may open the machine, and only
+    /// `wanted == false` may do it. Every other way of failing `intent_is_valid` is a stale
+    /// *wanted* intent, and must land on the emergency block with the corrupt/unreadable cases.
+    #[tokio::test]
+    #[serial]
+    async fn a_wanted_intent_that_no_longer_validates_stays_fail_closed() -> Result<()> {
+        let stale_endpoint = {
+            let mut intent = valid_intent(KillSwitchStatusMode::Locked, true);
+            // Parses as JSON, still says `wanted`, but the endpoint no longer satisfies the
+            // model — the shape an endpoint-validation tightening leaves on disk.
+            intent.endpoints = vec![ProxyEndpoint {
+                ip: "not-an-ip".to_owned(),
+                port: 443,
+                protocol: ProxyProtocol::Tcp,
+            }];
+            intent
+        };
+        let no_app_path = {
+            // A truncated record: without the staged core path every install would fall back to
+            // "block installed, endpoint permit missing" forever.
+            let mut intent = valid_intent(KillSwitchStatusMode::Locked, true);
+            intent.app_path = String::new();
+            intent
+        };
+        for (what, intent) in [
+            ("unparseable endpoint", stale_endpoint),
+            ("missing app path", no_app_path),
+        ] {
+            cleanup().await;
+            atomic_write(&intent_path(), &serde_json::to_vec_pretty(&intent)?).await?;
+
+            restore_on_service_start().await?;
+
+            let armed = armed_guard().clone().expect(what);
+            assert_eq!(armed.intent.mode, KillSwitchStatusMode::Blocked, "{what}");
+            assert!(armed.intent.wanted, "{what}");
+            assert!(armed.intent.endpoints.is_empty(), "{what}");
+            assert!(status().await.wanted, "{what}");
+            assert!(
+                tokio::fs::metadata(intent_path()).await.is_ok(),
+                "{what}: the unusable record is left on disk as evidence"
+            );
+        }
+        cleanup().await;
+        Ok(())
+    }
+
+    /// S2 in miniature: a DNS restore that never returns must not hold `WFP_OPERATION` — and
+    /// the refusal must keep the disarm on the fail-closed side, never skip the proof.
+    #[tokio::test]
+    #[serial]
+    async fn a_stalled_dns_restore_is_bounded_and_refuses_the_operation() -> Result<()> {
+        let error = bounded_dns_call_within(
+            std::time::Duration::from_millis(50),
+            "disarm",
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("a DNS restore that never returns must not be awaited forever");
+        let message = format!("{error:#}");
+        assert!(message.contains(DNS_RESTORE_STALLED_PREFIX), "{message}");
+        assert!(message.contains("disarm"), "{message}");
+
+        // A healthy call is transparent in both directions: the bound adds no behavior of its
+        // own, so every caller keeps treating a DNS failure exactly as it did before.
+        let value = bounded_dns_call_within(std::time::Duration::from_secs(5), "disarm", async {
+            Result::<u8>::Ok(7)
+        })
+        .await?;
+        assert_eq!(value, 7);
+        let error = bounded_dns_call_within(std::time::Duration::from_secs(5), "disarm", async {
+            Result::<()>::Err(anyhow::anyhow!("snapshot is corrupt"))
+        })
+        .await
+        .expect_err("DNS errors still propagate");
+        assert!(format!("{error:#}").contains("corrupt"));
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial]
     async fn restore_with_corrupt_intent_arms_emergency_block_and_keeps_evidence() -> Result<()> {
@@ -1621,24 +1902,38 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn resolve_api_hosts_keeps_priority_order_and_dedups() {
-        // Test builds skip live DNS, so only the literal handling is exercised: order is the
-        // caller's, duplicates collapse first-wins, blanks and hostnames drop out.
-        let ips = resolve_api_hosts(&[
+    /// The bootstrap channel's destinations are whatever the *client* pinned, never whatever a
+    /// resolver answered: a hostname is dropped, not looked up, so no DHCP resolver, captive
+    /// portal or on-path spoofer can nominate a destination this service permits through its
+    /// own block. Order, dedup, the public-only table and the cap are unchanged.
+    #[test]
+    fn api_hosts_admit_public_literals_only_and_never_resolve_a_name() {
+        let ips = admit_api_host_ips(&[
             " 1.1.1.1 ".to_owned(),
             "api.example.invalid".to_owned(),
+            "localhost".to_owned(),
             String::new(),
             "8.8.8.8".to_owned(),
             "1.1.1.1".to_owned(),
-        ])
-        .await;
+            "10.0.0.1".to_owned(),
+            "127.0.0.1".to_owned(),
+        ]);
         assert_eq!(
             ips,
             vec![
                 "1.1.1.1".parse::<IpAddr>().unwrap(),
                 "8.8.8.8".parse::<IpAddr>().unwrap(),
             ]
+        );
+
+        // The count cap still bounds what a client can ask for, hostnames or not.
+        let many = (0..32)
+            .map(|index| format!("8.8.{}.{}", index / 256, index % 256 + 1))
+            .collect::<Vec<_>>();
+        assert!(admit_api_host_ips(&many).len() <= wfp_model::MAX_API_HOST_IPS);
+        assert!(
+            admit_api_host_ips(&["api.example.invalid".to_owned()]).is_empty(),
+            "a hostname must yield no permit at all"
         );
     }
 
@@ -1666,6 +1961,7 @@ mod tests {
         arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
         // A corrupt DNS snapshot makes the restore unprovable: the disarm must be refused and
         // the block must stay armed (the macOS DNS-before-disarm invariant).
+        simulate_machine_still_on_loopback_dns();
         atomic_write(&dns_snapshot_path(), b"{ corrupt").await?;
 
         let error = transition_after_stop(true)
@@ -1716,6 +2012,7 @@ mod tests {
     async fn emergency_disarm_removes_wfp_intent_but_reports_unrestored_dns() -> Result<()> {
         cleanup().await;
         arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        simulate_machine_still_on_loopback_dns();
         atomic_write(&dns_snapshot_path(), b"{ corrupt").await?;
 
         let error = emergency_disarm_windows_kill_switch()
@@ -1776,6 +2073,7 @@ mod tests {
         // Nothing armed, but a previous emergency left a corrupt DNS snapshot behind: the
         // release succeeds (the filters are already gone, refusing buys nothing) and the
         // failed restore is surfaced through last_error.
+        simulate_machine_still_on_loopback_dns();
         atomic_write(&dns_snapshot_path(), b"{ corrupt").await?;
 
         let status = release().await?;
@@ -1812,6 +2110,7 @@ mod tests {
         *ARMED.lock().unwrap() = Some(Armed {
             intent: valid_intent(KillSwitchStatusMode::Blocked, true),
             tun_luid: None,
+            core_instance: None,
             direct_endpoints: Vec::new(),
         });
         authorize_write_for("owner-bob")?;
@@ -1842,11 +2141,119 @@ mod tests {
         Ok(())
     }
 
+    /// The tunnel permit is the widest rule this service installs: weight 8, `LocalInterface`
+    /// only — no protocol, port, or app condition. WFP does not notice when the adapter behind
+    /// that LUID dies, and `NetLuidIndex` is reused, so a permit that outlives the core it was
+    /// granted for can end up naming whatever device receives that index next. It therefore
+    /// expires with that core instance, and expiring must fail closed.
+    #[test]
+    fn a_tunnel_permit_expires_with_the_core_instance_it_was_granted_for() {
+        let granted = CoreInstance {
+            pid: 4242,
+            restarts: 0,
+        };
+        let mut armed = Armed {
+            intent: valid_intent(KillSwitchStatusMode::Locked, true),
+            tun_luid: Some(0x1234_5678),
+            core_instance: Some(granted),
+            direct_endpoints: Vec::new(),
+        };
+
+        assert_eq!(
+            rule_config_for(&armed, Some(granted)).tun_luid,
+            Some(0x1234_5678),
+            "the core that locked is still running"
+        );
+
+        for (label, current) in [
+            (
+                "watchdog respawn onto a recycled pid",
+                Some(CoreInstance {
+                    pid: 4242,
+                    restarts: 1,
+                }),
+            ),
+            (
+                "watchdog respawn onto a new pid",
+                Some(CoreInstance {
+                    pid: 5150,
+                    restarts: 1,
+                }),
+            ),
+            (
+                "the core was replaced without the watchdog",
+                Some(CoreInstance {
+                    pid: 5150,
+                    restarts: 0,
+                }),
+            ),
+            ("no core at all", None),
+        ] {
+            let config = rule_config_for(&armed, current);
+            assert_eq!(config.tun_luid, None, "{label}");
+            // Closed, not open: the fallback is exactly the pre-lock policy. The mode, the
+            // app-scoped endpoint permit and the DNS block are untouched — only the tunnel
+            // permit is gone — so losing the grant widens nothing.
+            assert_eq!(config.mode, KillSwitchStatusMode::Locked, "{label}");
+            let filters = wfp_model::expected_filters(&config);
+            assert!(
+                !filters
+                    .iter()
+                    .flat_map(|filter| filter.conditions.iter())
+                    .any(|condition| matches!(condition, wfp_model::Condition::LocalInterface(_))),
+                "{label}: a stale LUID must not stay installed"
+            );
+            assert!(
+                filters
+                    .iter()
+                    .any(|filter| filter.conditions.contains(&wfp_model::Condition::AleAppId)),
+                "{label}: the rest of the locked policy still stands"
+            );
+        }
+
+        // An unidentified grant is never revived by a tick that also cannot identify a core.
+        armed.core_instance = None;
+        assert_eq!(rule_config_for(&armed, None).tun_luid, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lock_grants_the_tunnel_permit_against_the_running_core_and_restrict_revokes_it()
+    -> Result<()> {
+        cleanup().await;
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        assert!(armed_guard().as_ref().unwrap().core_instance.is_none());
+
+        lock(None).await?;
+        let armed = armed_guard().clone().expect("armed");
+        assert_eq!(armed.tun_luid, Some(0));
+        assert_eq!(
+            armed.core_instance,
+            current_core_instance().await,
+            "the grant names the core that was running when lock ran"
+        );
+        // No core runs behind a test build, so the grant is unidentified — and an unidentified
+        // grant renders no tunnel permit, which is the fail-closed direction.
+        assert!(armed.core_instance.is_none());
+        assert!(rule_config(&armed).await.tun_luid.is_none());
+
+        restrict_bootstrap().await?;
+        let armed = armed_guard().clone().expect("still armed");
+        assert!(armed.tun_luid.is_none());
+        assert!(
+            armed.core_instance.is_none(),
+            "the grant is given back with the LUID"
+        );
+        cleanup().await;
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial]
     async fn release_is_refused_until_dns_restore_is_proven() -> Result<()> {
         cleanup().await;
         arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+        simulate_machine_still_on_loopback_dns();
         atomic_write(&dns_snapshot_path(), b"{ corrupt").await?;
 
         let error = release()
@@ -2060,19 +2467,29 @@ mod tests {
             2
         );
 
-        // Establish the logical session; while it continues (any mode), the permits stay.
+        // Establish the logical session. The approved set survives a mode change in memory so
+        // a re-lock can re-render it, but the *permits* exist only while locked: dropping back
+        // to Blocked renders none, so the mode change removes them by key rather than leaving
+        // un-app-scoped holes open on a machine with no tunnel (see rule G).
         lock(None).await?;
         mark_verified("owner-alice").await?;
-        restrict_bootstrap().await?;
+        let armed = armed_guard().clone().expect("still armed");
         assert_eq!(
-            ARMED
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .direct_endpoints
-                .len(),
+            wfp_model::expected_filters(&rule_config(&armed).await)
+                .iter()
+                .filter(|filter| filter.name.contains("DIRECT"))
+                .count(),
             2
+        );
+
+        restrict_bootstrap().await?;
+        let armed = armed_guard().clone().expect("still armed");
+        assert_eq!(armed.direct_endpoints.len(), 2);
+        assert!(
+            !wfp_model::expected_filters(&rule_config(&armed).await)
+                .iter()
+                .any(|filter| filter.name.contains("DIRECT")),
+            "Protected Offline must not keep DIRECT permits installed"
         );
 
         // omission = clear: the intent file never carries them, so a service-start restore

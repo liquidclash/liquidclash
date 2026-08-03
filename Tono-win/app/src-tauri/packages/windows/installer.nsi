@@ -66,6 +66,9 @@ ${StrLoc}
 !define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
 !define ESTIMATEDSIZE "{{estimated_size}}"
 !define STARTMENUFOLDER "{{start_menu_folder}}"
+; One name for the emergency-disarm shortcut so creation and removal can never drift apart. The
+; wording matches what `service.rs` tells the user to right-click when the disarm is refused.
+!define RESTORENETWORKLINK "${PRODUCTNAME} — 恢复网络 (Restore Network).lnk"
 
 Var PassiveMode
 Var UpdateMode
@@ -76,6 +79,10 @@ Var VC_REDIST_URL
 Var VC_REDIST_EXE
 Var VC_RUNTIME_READY
 Var VC_RUNTIME_NEEDED
+; Set once this run has handed control to the Service installer, so `.onInstFailed` only tears
+; down a registration this install could have created and never an unrelated healthy Service.
+Var ServiceInstallAttempted
+Var ServiceInstallRetries
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -468,6 +475,10 @@ LangString legacyLocationAbort ${LANG_SIMPCHINESE} "检测到 ${PRODUCTNAME} 安
 LangString legacyLocationAbort ${LANG_ENGLISH} "${PRODUCTNAME} is installed in an unsupported location: $4$\r$\n$\r$\nThis version must be installed under Program Files. Uninstall the existing version first (do not select Delete application data), then run this installer again."
 LangString legacyLocationAbort ${LANG_RUSSIAN} "${PRODUCTNAME} установлен в неподдерживаемой папке: $4$\r$\n$\r$\nЭта версия должна быть установлена в Program Files. Сначала удалите текущую версию (не выбирайте удаление данных приложения), затем снова запустите этот установщик."
 
+LangString restoreNetworkTooltip ${LANG_SIMPCHINESE} "当 ${PRODUCTNAME} 无法恢复网络时，解除网络保护（需要管理员权限）。"
+LangString restoreNetworkTooltip ${LANG_ENGLISH} "Restores your network if ${PRODUCTNAME} cannot. Requires administrator approval."
+LangString restoreNetworkTooltip ${LANG_RUSSIAN} "Восстанавливает сеть, если ${PRODUCTNAME} не может. Требуются права администратора."
+
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
@@ -551,12 +562,14 @@ Function CheckVCRuntime64
   Push $R0
   Push $R1
   StrCpy $VC_RUNTIME_READY "0"
+  ; A 32-bit installer only reaches the native system directory through the Sysnative alias;
+  ; where that alias does not exist, System32 already is the native one. Use labels: the former
+  ; `+3` counted onto `Goto found` and both declared the runtime present without probing it and
+  ; made the System32 fallback unreachable.
   StrCpy $R1 "$WINDIR\Sysnative"
-  IfFileExists "$R1\kernel32.dll" 0 +3
-  IfFileExists "$R1\vcruntime140.dll" 0 missing
-  IfFileExists "$R1\msvcp140.dll" 0 missing
-  Goto found
+  IfFileExists "$R1\kernel32.dll" probe 0
   StrCpy $R1 "$WINDIR\System32"
+  probe:
   IfFileExists "$R1\vcruntime140.dll" 0 missing
   IfFileExists "$R1\msvcp140.dll" 0 missing
   found:
@@ -578,6 +591,13 @@ FunctionEnd
     Abort "Tono Service installer is missing. Installation cannot continue safely."
   ${EndIf}
   DetailPrint "Installing and verifying ${PRODUCTNAME} Service..."
+  ; Arm `.onInstFailed` for exactly this step: from here until the helper returns, a Service may
+  ; exist that this run registered but never proved ready. Cleared again on the way out — once a
+  ; verified Service is running, a later failure must leave it alone and let uninstall.exe (already
+  ; written above) be the removal path, rather than silently opening the user's network.
+  StrCpy $ServiceInstallAttempted 1
+  StrCpy $ServiceInstallRetries 0
+  serviceInstallAttempt:
   ; Bound output inactivity as well as the helper's own SCM/IPC waits. Without this, a wedged
   ; helper freezes the whole NSIS installer forever. "timeout" is handled as a failure below.
   nsExec::ExecToLog /TIMEOUT=180000 '"$INSTDIR\resources\tono-service-install.exe"'
@@ -586,9 +606,22 @@ FunctionEnd
   ${If} $0 == "3010"
     DetailPrint "${PRODUCTNAME} Service update will finish after a reboot."
     SetRebootFlag true
+  ${ElseIf} $0 == "75"
+    ; 75 = REPAIR_IN_PROGRESS_EXIT_CODE (service/src/core/repair.rs): another elevated repair
+    ; holds the gate. That is transient and retryable, so it must not dead-end a whole install.
+    ${If} $ServiceInstallRetries < 5
+      IntOp $ServiceInstallRetries $ServiceInstallRetries + 1
+      DetailPrint "Another ${PRODUCTNAME} Service repair is in progress; retrying ($ServiceInstallRetries/5)..."
+      Sleep 2000
+      Goto serviceInstallAttempt
+    ${EndIf}
+    Abort "A ${PRODUCTNAME} Service repair is still in progress. Wait for it to finish (or reboot Windows), then run this installer again."
   ${ElseIf} $0 != "0"
     Abort "Tono Service installation failed (exit $0). Installation was stopped."
   ${EndIf}
+  ; Only reachable when the helper reported success (every other path Aborts): the Service is
+  ; registered and verified, so it is no longer this install's to tear down.
+  StrCpy $ServiceInstallAttempted 0
 !macroend
 
 !macro RemoveVergeService
@@ -674,6 +707,10 @@ Section CheckAndInstallVSRuntime
   ${EndIf}
 
   ${If} $VC_RUNTIME_NEEDED != "1"
+    ; These probes need the native view, but they must hand the installer's own view back when
+    ; they are done: `.onInit`'s SetContext selected view 64 for this build, and every later
+    ; section (WebView2's literal WOW6432Node paths, the uninstall/ARP keys) is written for it.
+    ; Leaving view 32 behind double-redirects those reads into keys that can never exist.
     ${If} ${IsNativeARM64}
       SetRegView 64
       ClearErrors
@@ -681,7 +718,7 @@ Section CheckAndInstallVSRuntime
       ${If} ${Errors}
         StrCpy $R0 0
       ${EndIf}
-      SetRegView 32
+      !insertmacro SetContext
     ${ElseIf} ${RunningX64}
       SetRegView 64
       ClearErrors
@@ -689,7 +726,7 @@ Section CheckAndInstallVSRuntime
       ${If} ${Errors}
         StrCpy $R0 0
       ${EndIf}
-      SetRegView 32
+      !insertmacro SetContext
     ${Else}
       ClearErrors
       ReadRegDword $R0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86" "Installed"
@@ -716,6 +753,13 @@ Section CheckAndInstallVSRuntime
     ExecWait '"$TEMP\$VC_REDIST_EXE" /quiet /norestart' $0
     ${If} $0 == 0
       DetailPrint "Visual C++ Redistributable 安装成功"
+    ${ElseIf} $0 == 3010
+      ; 3010 is "installed, reboot required" — a success the old branch logged as a failure.
+      DetailPrint "Visual C++ Redistributable 安装成功，需要重启后生效"
+      SetRebootFlag true
+    ${ElseIf} $0 == 1638
+      ; 1638 means a same-or-newer runtime is already registered; nothing to install.
+      DetailPrint "已安装同版本或更新的 Visual C++ Redistributable，跳过安装"
     ${Else}
       DetailPrint "Visual C++ Redistributable 安装失败"
     ${EndIf}
@@ -728,6 +772,11 @@ Section CheckAndInstallVSRuntime
 SectionEnd
 
 Section WebView2
+  ; The literal WOW6432Node paths below are only correct in the native register view this build
+  ; installs under. Re-assert it rather than inheriting whatever an earlier section left set: a
+  ; misdetected WebView2 sends an offline install into the bootstrapper and Aborts it.
+  !insertmacro SetContext
+
   ; Check if Webview2 is already installed and skip this section
   ${If} ${RunningX64}
     ReadRegStr $4 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
@@ -778,8 +827,8 @@ Section WebView2
 
       install_webview2:
         DetailPrint "$(installingWebview2)"
-        ; $6 holds the path to the webview2 installer
-        ExecWait "$6 ${WEBVIEW2INSTALLERARGS} /install" $1
+        ; $6 holds the path to the webview2 installer; quote it, $TEMP routinely has a space.
+        ExecWait '"$6" ${WEBVIEW2INSTALLERARGS} /install' $1
         ${If} $1 = 0
           DetailPrint "$(webview2InstallSuccess)"
         ${Else}
@@ -828,9 +877,11 @@ Section Install
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
-  ; Ensure startup folders exist
-  CreateDirectory "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
-  DetailPrint "Ensured system startup folder exists"
+  ; Ensure startup folders exist. `$SMSTARTUP` follows the shell context and the machine's real
+  ; ProgramData location, which a hardcoded English C:-rooted path does not.
+  SetShellVarContext all
+  CreateDirectory "$SMSTARTUP"
+  DetailPrint "Ensured system startup folder exists: $SMSTARTUP"
 
   SetShellVarContext current
   StrCpy $0 "$SMPROGRAMS\Startup"
@@ -860,23 +911,11 @@ Section Install
     File /a "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
 
-  !insertmacro StartVergeService
-
-  ; Create file associations
-  {{#each file_associations as |association| ~}}
-    {{#each association.ext as |ext| ~}}
-       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$INSTDIR\${MAINBINARYNAME}.exe,0" "Open with ${PRODUCTNAME}" "$INSTDIR\${MAINBINARYNAME}.exe $\"%1$\""
-    {{/each}}
-  {{/each}}
-
-  ; Register deep links
-  {{#each deep_link_protocols as |protocol| ~}}
-    WriteRegStr SHCTX "Software\Classes\\{{protocol}}" "URL Protocol" ""
-    WriteRegStr SHCTX "Software\Classes\\{{protocol}}" "" "URL:${BUNDLEID} protocol"
-    WriteRegStr SHCTX "Software\Classes\\{{protocol}}\DefaultIcon" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\",0"
-    WriteRegStr SHCTX "Software\Classes\\{{protocol}}\shell\open\command" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
-  {{/each}}
-
+  ; Register the removal path BEFORE the Service is created and started. NSIS rolls back neither
+  ; `File` nor an SCM registration, and StartVergeService can Abort after create/start succeeded
+  ; (a failed readiness wait). Writing uninstall.exe and the Add/Remove entry first is what keeps
+  ; that failure from leaving an AutoStart Service arming the WFP floor with no way to remove it
+  ; — on upgrades the old uninstaller has already deleted the previous uninstall.exe and UNINSTKEY.
   ; Create uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -920,9 +959,29 @@ Section Install
     WriteRegStr SHCTX "${UNINSTKEY}" "HelpLink" "${HOMEPAGE}"
   !endif
 
+  !insertmacro StartVergeService
+
+  ; Create file associations
+  {{#each file_associations as |association| ~}}
+    {{#each association.ext as |ext| ~}}
+       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$INSTDIR\${MAINBINARYNAME}.exe,0" "Open with ${PRODUCTNAME}" "$INSTDIR\${MAINBINARYNAME}.exe $\"%1$\""
+    {{/each}}
+  {{/each}}
+
+  ; Register deep links
+  {{#each deep_link_protocols as |protocol| ~}}
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}" "URL Protocol" ""
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}" "" "URL:${BUNDLEID} protocol"
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}\DefaultIcon" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\",0"
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}\shell\open\command" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
+  {{/each}}
+
   ; Create start menu shortcut
   !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
     Call CreateOrUpdateStartMenuShortcut
+    ; Refreshed on every install, including updates and /NS: this is the recovery control the
+    ; Service points users at, not a convenience shortcut, and its target moves with $INSTDIR.
+    Call CreateOrUpdateRestoreNetworkShortcut
   !insertmacro MUI_STARTMENU_WRITE_END
 
   ; Create desktop shortcut for silent and passive installers
@@ -941,6 +1000,35 @@ Section Install
     SetAutoClose true
   ${EndIf}
 SectionEnd
+
+Function .onInstFailed
+  ; NSIS rolls back neither `File` nor an SCM registration, so a failed install can end with a
+  ; Service that this run registered but never proved ready: AutoStart, with SCM restart actions,
+  ; arming a persistent WFP floor. Undo that registration with the same helper the uninstaller
+  ; uses. The flag narrows this to the Service step itself, so an abort before it (a cancelled or
+  ; refused install) and a failure after it (a verified Service that is now the user's, removable
+  ; through Add/Remove Programs) both stay the no-op they have to be.
+  ${If} $ServiceInstallAttempted <> 1
+    Return
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\resources\tono-service-uninstall.exe"
+    DetailPrint "Installation failed and the Service uninstaller is missing; run uninstall.exe from Add/Remove Programs to remove the ${PRODUCTNAME} Service."
+    Return
+  ${EndIf}
+  DetailPrint "Installation failed; removing the ${PRODUCTNAME} Service registered by this install..."
+  nsExec::ExecToLog /TIMEOUT=180000 '"$INSTDIR\resources\tono-service-uninstall.exe"'
+  Pop $0
+  ; Same contract as RemoveVergeService. Nothing here may block or delete: uninstall.exe and the
+  ; Add/Remove entry were written before the Service was touched, so an unproven cleanup still
+  ; leaves the user a supported removal path instead of a dead end.
+  ${If} $0 == "0"
+    DetailPrint "${PRODUCTNAME} Service was removed and network protection was restored."
+  ${ElseIf} $0 == "2"
+    DetailPrint "${PRODUCTNAME} network protection was restored; some Service leftovers remain and will be cleaned up by a future install."
+  ${Else}
+    DetailPrint "${PRODUCTNAME} Service cleanup could not be verified (result $0); your connection is still protected by the kill switch. Reboot Windows, then run this installer again or uninstall ${PRODUCTNAME} from Add/Remove Programs."
+  ${EndIf}
+FunctionEnd
 
 Function .onInstSuccess
   ; Exit 3010 means the old Service is running and its replacement is queued for reboot. Do not
@@ -1042,6 +1130,12 @@ Section Uninstall
 
     ; Remove start menu shortcut
     !insertmacro MUI_STARTMENU_GETFOLDER Application $AppStartMenuFolder
+
+    ; The recovery shortcut targets powershell.exe, so IsShortcutTarget cannot recognise it.
+    ; Delete it before the RMDir below, or the leftover keeps the start menu folder alive.
+    Delete "$SMPROGRAMS\$AppStartMenuFolder\${RESTORENETWORKLINK}"
+    Delete "$SMPROGRAMS\${RESTORENETWORKLINK}"
+
     !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
     Pop $0
     ${If} $0 = 1
@@ -1169,6 +1263,36 @@ Function CreateOrUpdateStartMenuShortcut
     CreateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
     !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${PRODUCTNAME}.lnk"
   !endif
+FunctionEnd
+
+; The last way back onto the network when the App cannot release the WFP barrier. Today that
+; escape is an elevated `tono-service.exe --emergency-disarm` — a path and a flag nobody knows,
+; on a machine that by definition cannot look them up. A .lnk cannot request elevation by itself,
+; so the shortcut runs PowerShell's `Start-Process -Verb RunAs`, which is what raises UAC, over
+; `cmd /k`, which holds the window open long enough to read the bilingual result the disarm
+; prints. It is user-initiated only, and grants no authority the Add/Remove uninstaller lacks.
+Function CreateOrUpdateRestoreNetworkShortcut
+  Push $R0
+  Push $R1
+
+  ; System32 is resolved by the (64-bit) shell that launches the .lnk; either PowerShell bitness
+  ; runs `-Verb RunAs` identically, so WOW64 redirection of this string is harmless.
+  StrCpy $R0 "$WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+  ; `$\"` is how NSIS writes a quote; `\$\"` is the backslash-escaped quote CommandLineToArgvW
+  ; needs so the install path — which always contains a space — survives inside -Command.
+  StrCpy $R1 "-NoProfile -ExecutionPolicy Bypass -Command $\"Start-Process -FilePath 'cmd.exe' -ArgumentList '/k','\$\"$INSTDIR\resources\tono-service.exe\$\" --emergency-disarm' -Verb RunAs$\""
+
+  ; SW_SHOWMINIMIZED keeps the launcher window out of the way; the elevated console it starts is
+  ; the one the user reads.
+  !if "${STARTMENUFOLDER}" != ""
+    CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"
+    CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${RESTORENETWORKLINK}" "$R0" "$R1" "$INSTDIR\${MAINBINARYNAME}.exe" 0 SW_SHOWMINIMIZED "" "$(restoreNetworkTooltip)"
+  !else
+    CreateShortcut "$SMPROGRAMS\${RESTORENETWORKLINK}" "$R0" "$R1" "$INSTDIR\${MAINBINARYNAME}.exe" 0 SW_SHOWMINIMIZED "" "$(restoreNetworkTooltip)"
+  !endif
+
+  Pop $R1
+  Pop $R0
 FunctionEnd
 
 Function CreateOrUpdateDesktopShortcut

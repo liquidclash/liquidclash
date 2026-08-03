@@ -1202,11 +1202,18 @@ pub(crate) async fn tono_service_ready() -> Result<()> {
 /// a Test 5 Service already had those bits but still freezes status behind the lifecycle lock
 /// and uses the old DNS restore semantics. Pairing a new App with that Service after a failed
 /// installer replacement must fail closed here, not during a half-armed connect.
-pub(crate) async fn tono_probe_kill_switch_release_support() -> Result<bool> {
+/// Whether the installed Service speaks the kill-switch protocol this client needs.
+///
+/// Returns `None` when it does, and the *reason* when it does not. `supports_client` is false in
+/// both directions — an epoch newer than ours fails it exactly like an older one — so a caller
+/// holding only a bool can do nothing but guess, and guessing "too old" tells a user with a
+/// newer Service to reinstall the thing that is already ahead. The detail comes from
+/// `classify_service_version_reply`, which prints both sides' numbers.
+pub(crate) async fn tono_probe_kill_switch_release_support() -> Result<Option<String>> {
     let response = clash_verge_service_ipc::get_version()
         .await
         .context("无法连接到 Tono Service")?;
-    Ok(response.code == 0
+    let supported = response.code == 0
         && response.data.as_ref().is_some_and(|info| {
             info.supports_client(
                 clash_verge_service_ipc::ProtocolVersion::current(),
@@ -1214,7 +1221,25 @@ pub(crate) async fn tono_probe_kill_switch_release_support() -> Result<bool> {
             ) && clash_verge_service_ipc::ProtocolInfo::supports_windows_kill_switch(info)
                 && clash_verge_service_ipc::ProtocolInfo::supports_kill_switch_release(info)
                 && clash_verge_service_ipc::ProtocolInfo::supports_kill_switch_verification(info)
-        }))
+        });
+    if supported {
+        return Ok(None);
+    }
+    // Reuse Run State's classifier so the App has exactly one wording for a protocol mismatch.
+    let reply = crate::core::runstate::ServiceVersionReply {
+        code: response.code,
+        message: response.message,
+        protocol: response.data,
+    };
+    let detail = match crate::core::runstate::classify_service_version_reply(&reply) {
+        crate::core::runstate::ServiceVersionCheck::NeedsReinstall(detail) => detail,
+        // The version handshake is acceptable, so what failed is one of the kill-switch
+        // capability bits: an in-epoch Service that predates them.
+        crate::core::runstate::ServiceVersionCheck::Ready => {
+            "Service does not expose the Windows kill-switch arm/lock/release/verify operations".to_owned()
+        }
+    };
+    Ok(Some(detail))
 }
 
 /// Start the core with the Tono owned runtime and the WFP bootstrap kill switch.
@@ -1229,6 +1254,13 @@ pub(crate) async fn tono_start_core_with_kill_switch(
     kill_switch: KillSwitchConfig,
 ) -> Result<()> {
     logging!(info, Type::Service, "Tono: 通过服务启动核心并 arm Kill Switch");
+    // Cancel the previous start's owner monitor before the session is cleared, exactly as
+    // `tono_stop_core` does. Between this line and `adopt_tono_service_session` the Service
+    // truthfully answers "not your session", and a monitor still ticking in that window reads
+    // its own successor's handoff as displacement and runs the full owner-loss recovery —
+    // stopping the proxy guard and resetting the system proxy — while this StartClash is in
+    // flight. A connect with a cloud policy passes through this window twice.
+    cancel_owner_monitors();
     clear_active_service_session();
 
     let credentials = current_owner_credentials()?;

@@ -132,6 +132,44 @@ async fn surface_cancelled_quit() {
     );
 }
 
+/// Interactive Quit's own budget for *proving* the release.
+///
+/// The release operation keeps its own 30 s reconciliation deadline and this wait never cancels
+/// it — the worker is detached and single-flight. What this bounds is the click: waiting half a
+/// minute with no window and no feedback is indistinguishable from the freeze this whole review
+/// is about.
+const INTERACTIVE_QUIT_RELEASE_BUDGET: Duration = Duration::from_secs(8);
+
+/// Ask whether to exit while network protection is still armed.
+///
+/// The previous behaviour was to refuse, always. With the Service dead, uninstalled or wedged,
+/// `tono_release_kill_switch` fails on both the IPC and its idempotent read-back, so release can
+/// never succeed and every Quit click was rejected forever with nothing offered. The invariant
+/// is that we must not *silently* open the network — not that the app must be unclosable.
+/// Exiting here leaves the barrier armed, which is the fail-closed direction, and the dialog
+/// says exactly that plus the elevated command that restores connectivity.
+async fn ask_to_quit_without_release(error: &str) -> bool {
+    use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons, MessageDialogKind};
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle::Handle::app_handle()
+        .dialog()
+        .message(format!(
+            "Tono could not confirm that network protection was released.\n\n{error}\n\nThis machine stays protected: no traffic leaves it while protection is armed. If you quit now it stays that way — start Tono again and disconnect, or run `tono-service.exe --emergency-disarm` as Administrator from the Tono installation folder.\n\nQuit anyway?"
+        ))
+        .title("Network protection is still active")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Quit anyway".to_owned(),
+            "Stay open".to_owned(),
+        ))
+        .kind(MessageDialogKind::Warning)
+        .show(move |confirmed| {
+            let _ = tx.send(confirmed);
+        });
+    // A dialog that cannot be shown must not become an unconditional exit.
+    rx.await.unwrap_or(false)
+}
+
 pub async fn quit() -> clash_verge_signal::ShutdownOutcome {
     logging!(debug, Type::System, "启动退出流程");
     // 设置退出标志
@@ -139,20 +177,41 @@ pub async fn quit() -> clash_verge_signal::ShutdownOutcome {
 
     // Tono: this is the sole owner of the preventable explicit-Quit release (§6). Session-ending
     // exits use their separate best-effort path in `RunEvent::Exit`.
-    if let Err(error) = crate::tono::commands::quit_release(handle::Handle::app_handle().clone()).await {
+    let release = tokio::time::timeout(
+        INTERACTIVE_QUIT_RELEASE_BUDGET,
+        crate::tono::commands::quit_release(handle::Handle::app_handle().clone()),
+    )
+    .await;
+    let release_error = match release {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        // Abandoning the wait does not abandon the release: the operation is detached and
+        // single-flight, so it keeps reconciling while the user answers.
+        Err(_elapsed) => Some(format!(
+            "The release did not finish within {INTERACTIVE_QUIT_RELEASE_BUDGET:?}; the Tono Service may still be working on it."
+        )),
+    };
+    if let Some(error) = release_error {
         logging!(
             error,
             Type::Service,
-            "Tono: 无法证明退出前已恢复网络保护，取消退出: {error}"
+            "Tono: 无法证明退出前已恢复网络保护: {error}"
         );
-        handle::Handle::global().clear_is_exiting();
-        // A refused Quit is the only outcome that leaves the app running against the user's
-        // intent, and by then the window is usually hidden (the X only hides) or already gone.
-        // Without this the app just silently ignores Quit — the "it will not close" report.
-        // Bringing the window back is what makes the notice below, and Disconnect, reachable.
-        surface_cancelled_quit().await;
-        handle::Handle::notice_message("app_quit::core_stop_failed", "");
-        return clash_verge_signal::ShutdownOutcome::Canceled;
+        if !ask_to_quit_without_release(&error).await {
+            handle::Handle::global().clear_is_exiting();
+            // A refused Quit is the only outcome that leaves the app running against the user's
+            // intent, and by then the window is usually hidden (the X only hides) or already gone.
+            // Without this the app just silently ignores Quit — the "it will not close" report.
+            // Bringing the window back is what makes the notice below, and Disconnect, reachable.
+            surface_cancelled_quit().await;
+            handle::Handle::notice_message("app_quit::core_stop_failed", "");
+            return clash_verge_signal::ShutdownOutcome::Canceled;
+        }
+        logging!(
+            warn,
+            Type::Service,
+            "Tono: 用户选择在保护仍然生效的情况下退出；WFP 屏障保持封锁状态"
+        );
     }
 
     Config::apply_all_and_save_file().await;

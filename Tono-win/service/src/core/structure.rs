@@ -231,11 +231,17 @@ pub struct KillSwitchConfig {
     pub tunnel_interface: String,
     #[serde(default)]
     pub proxy_endpoints: Vec<ProxyEndpoint>,
+    /// Bootstrap API channel destinations, as **literal public IPs**. The service never
+    /// resolves a name here: a permit whose destination came out of the system resolver is a
+    /// permit a hostile DHCP resolver or captive portal chose, and the client already pins
+    /// literals for exactly that reason. Non-literals are dropped, not looked up.
     #[serde(default)]
     pub bootstrap_api_hosts: Vec<String>,
     /// Cloud-approved DIRECT endpoints (WeChat acceleration): exact `IP:port` tuples any
-    /// process may reach on the physical NIC while armed. **omission = clear**: never
-    /// persisted, never restored on service start, never inherited by the next arm.
+    /// process may reach on the physical NIC **while the tunnel is locked** — a DIRECT plan is
+    /// a bypass of the tunnel, so it exists only while there is a tunnel to bypass.
+    /// **omission = clear**: never persisted, never restored on service start, never inherited
+    /// by the next arm.
     #[serde(default)]
     pub direct_endpoints: Vec<ProxyEndpoint>,
 }
@@ -304,26 +310,22 @@ pub struct NetworkEventsStatus {
     pub last_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StopClashOptions {
-    #[serde(default = "default_release_kill_switch")]
+    /// Absent means **do not release**. Releasing runs the full disarm — DNS restore plus the
+    /// removal of every filter, the persistent block-all floor included — on protection that is
+    /// machine-wide, so only a caller that says so explicitly may ask for it. A payload that
+    /// omits the field (an older Clash-Verge-derived client sharing this service, a hand-rolled
+    /// caller, a serialization regression) therefore stops the core and leaves the block armed.
+    #[serde(default)]
     pub release_kill_switch: bool,
 }
 
-const fn default_release_kill_switch() -> bool {
-    true
-}
-
-impl Default for StopClashOptions {
-    fn default() -> Self {
-        Self {
-            release_kill_switch: true,
-        }
-    }
-}
-
-/// `null` was the v2.6.1 payload. Keeping it as a distinct untagged variant means old clients
-/// retain release-after-stop behavior while new clients can explicitly request a persistent block.
+/// `null` was the v2.6.1 payload. It stays a distinct untagged variant so the shape still
+/// parses, but it now means exactly what an options object with the field omitted means: keep
+/// the kill switch armed. Because both arms agree on the absent-field answer, the untagged
+/// variant *order* — which decides where an ambiguous payload lands — can no longer change what
+/// a payload means; only an explicit `"release_kill_switch": true` releases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StopClashPayload {
@@ -334,7 +336,7 @@ pub enum StopClashPayload {
 impl StopClashPayload {
     pub fn release_kill_switch(&self) -> bool {
         match self {
-            Self::Legacy(()) => true,
+            Self::Legacy(()) => false,
             Self::Options(value) => value.release_kill_switch,
         }
     }
@@ -522,6 +524,12 @@ pub struct ServiceStatusSnapshot {
     pub desired_core_should_be_running: bool,
     pub desired_generation: u64,
     pub desired_updated_at: u64,
+    /// `true` when this owner's durable desired state could not be read for this snapshot, so
+    /// the three fields above are placeholders rather than observations. A client must not read
+    /// an unknown desired state as "this owner lost its core": the read can fail transiently
+    /// while the tunnel is perfectly healthy.
+    #[serde(default)]
+    pub desired_state_unknown: bool,
     #[serde(default)]
     pub macos_kill_switch_wanted: bool,
     #[serde(default)]
@@ -640,11 +648,39 @@ mod tests {
         });
         let decoded: StartClashRequest = serde_json::from_value(old_start).unwrap();
         assert_eq!(decoded.kill_switch, None);
-        let stop: StopClashPayload = serde_json::from_str("null").unwrap();
-        assert!(stop.release_kill_switch());
+    }
+
+    /// Fail-closed wire default: disarming machine-wide protection needs an explicit request.
+    /// Every shape that merely *omits* the flag — the v2.6.1 `null` payload, an empty options
+    /// object, an options object that dropped the field — must keep the block armed, and the
+    /// two payloads the current app actually sends must keep meaning exactly what they say.
+    #[test]
+    fn only_an_explicit_request_releases_the_kill_switch_after_stop() {
+        for omitted in ["null", "{}"] {
+            let payload: StopClashPayload = serde_json::from_str(omitted).unwrap();
+            assert!(
+                !payload.release_kill_switch(),
+                "{omitted} must not disarm machine-wide protection"
+            );
+        }
         let keep: StopClashPayload =
             serde_json::from_str(r#"{"release_kill_switch":false}"#).unwrap();
         assert!(!keep.release_kill_switch());
+        let release: StopClashPayload =
+            serde_json::from_str(r#"{"release_kill_switch":true}"#).unwrap();
+        assert!(release.release_kill_switch());
+
+        // The untagged variant order decides which arm a payload lands in, so pin that both
+        // arms of the current app's two payloads survive a round trip unchanged.
+        for wanted in [false, true] {
+            let sent = StopClashPayload::Options(super::StopClashOptions {
+                release_kill_switch: wanted,
+            });
+            let encoded = serde_json::to_vec(&sent).unwrap();
+            let decoded: StopClashPayload = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, sent);
+            assert_eq!(decoded.release_kill_switch(), wanted);
+        }
     }
 
     #[test]

@@ -524,10 +524,15 @@ pub fn init_scheme() -> Result<()> {
     let (clash, _) = hkcu.create_subkey("Software\\Classes\\Clash")?;
     clash.set_value("", &"Tono")?;
     clash.set_value("URL Protocol", &"Tono URL Scheme Protocol")?;
+    // Both values must quote the executable. The shipped layout is perMachine under
+    // `C:\Program Files\Tono\Tono.exe`, and an unquoted path makes the shell split at the first
+    // space and try `C:\Program` — deep links never launched, and a planted `C:\Program.exe`
+    // would have been run instead, with the URL as its argument.
+    let quoted_exe = format!("\"{app_exe}\"");
     let (default_icon, _) = hkcu.create_subkey("Software\\Classes\\Clash\\DefaultIcon")?;
-    default_icon.set_value("", &app_exe)?;
+    default_icon.set_value("", &quoted_exe)?;
     let (command, _) = hkcu.create_subkey("Software\\Classes\\Clash\\Shell\\Open\\Command")?;
-    command.set_value("", &format!("{app_exe} \"%1\""))?;
+    command.set_value("", &format!("{quoted_exe} \"%1\""))?;
 
     Ok(())
 }

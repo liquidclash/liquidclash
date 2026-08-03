@@ -96,13 +96,43 @@ pub async fn persist_owner_writer_config(
 
 pub async fn load_active_owner() -> Result<Option<ActiveOwnerState>> {
     let path = service_paths().active_owner_path();
-    secure_state_file_if_exists(&path)?;
+    // Deliberately no `secure_state_file_if_exists` here. Hardening a descriptor is a write, and
+    // doing it on the read path made every reader — /status at a 2s cadence, StartClash, release
+    // — depend on being able to take `WRITE_DAC | WRITE_OWNER` and on the file's owner still
+    // being SYSTEM or Administrators. A backup/restore, a `takeown`, or an AV handle held without
+    // sharing therefore bricked release permanently. The write path still hardens every file it
+    // creates, which is where the guarantee actually comes from.
     match tokio::fs::read(&path).await {
-        Ok(content) => serde_json::from_slice(&content)
-            .map(Some)
-            .with_context(|| format!("failed to parse active owner {path:?}")),
+        Ok(content) => match serde_json::from_slice(&content) {
+            Ok(state) => Ok(Some(state)),
+            Err(error) => {
+                // A record that cannot be parsed will never parse: it names no provable owner,
+                // which is exactly the state in which an owner-gated release is allowed to
+                // proceed. Keep the bytes for diagnosis and continue as if there were none.
+                quarantine_unusable_state(&path, &format!("could not be parsed: {error}")).await;
+                Ok(None)
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read active owner {path:?}")),
+    }
+}
+
+/// Move a state file that can never be read again out of the way, best-effort.
+///
+/// Only permanent damage gets here — a file whose bytes do not parse. A transient read failure is
+/// still reported to the caller, because destroying a live owner record on a passing sharing
+/// violation would itself end a healthy session. Failure to quarantine is not fatal: the caller
+/// has already decided to continue without the record, and the next writer replaces it anyway.
+async fn quarantine_unusable_state(path: &std::path::Path, reason: &str) {
+    let quarantined = path.with_extension(format!("json.corrupt.{}", unix_timestamp_secs()));
+    match tokio::fs::rename(path, &quarantined).await {
+        Ok(()) => warn!(
+            "State file {path:?} {reason}; quarantined as {quarantined:?} and treated as absent"
+        ),
+        Err(error) => warn!(
+            "State file {path:?} {reason} and could not be quarantined ({error}); treated as absent"
+        ),
     }
 }
 
@@ -309,10 +339,18 @@ async fn read_json_or_default<T>(path: &std::path::Path) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Default,
 {
-    secure_state_file_if_exists(path)?;
+    // As in `load_active_owner`: reading must not require permission to rewrite the descriptor.
     match tokio::fs::read(path).await {
-        Ok(content) => serde_json::from_slice(&content)
-            .with_context(|| format!("failed to parse state {path:?}")),
+        Ok(content) => match serde_json::from_slice(&content) {
+            Ok(state) => Ok(state),
+            Err(error) => {
+                // Same treatment as a missing file, which is what unparseable bytes amount to.
+                // Left in place it made the first Disconnect report that the Core could not be
+                // retired — a failure the user cannot act on and that a second click hid.
+                quarantine_unusable_state(path, &format!("could not be parsed: {error}")).await;
+                Ok(T::default())
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(error) => Err(error).with_context(|| format!("failed to read state {path:?}")),
     }
@@ -329,9 +367,21 @@ where
 
     let temp_path = path.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(value)?;
-    tokio::fs::write(&temp_path, json)
+    // Flush the *data* before the rename. `MOVEFILE_WRITE_THROUGH` commits the directory entry,
+    // not the file contents, so power loss just after the rename could otherwise leave a
+    // zero-length ownership record — the corrupt file the read path now has to recover from.
+    // Same order as `core::runtime`: write_all, flush, sync_all, then replace.
+    let mut file = tokio::fs::File::create(&temp_path)
+        .await
+        .with_context(|| format!("failed to create state temp file {temp_path:?}"))?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &json)
         .await
         .with_context(|| format!("failed to write state temp file {temp_path:?}"))?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to flush state temp file {temp_path:?}"))?;
+    drop(file);
     secure_state_file_if_exists(&temp_path)?;
     crate::core::atomic_file::replace(&temp_path, path)
         .await
@@ -484,6 +534,39 @@ mod owner_tests {
             assert!(commit_active_owner_session(&owner, &invalid).await.is_err());
         }
         assert!(load_active_owner().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_corrupt_active_owner_record_is_quarantined_rather_than_refusing_forever()
+    -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner = test_owner(90_008);
+        commit_active_owner_session(&owner, &"77".repeat(32)).await?;
+        let path = crate::service_paths().active_owner_path();
+        tokio::fs::write(&path, b"{ not json at all").await?;
+
+        // No provable owner, rather than an error every retry reproduces.
+        assert!(load_active_owner().await?.is_none());
+        assert!(!path.exists());
+
+        let directory = path.parent().expect("state path has a parent");
+        let mut quarantined = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("active-owner.json.corrupt.")
+            {
+                quarantined.push(entry.path());
+            }
+        }
+        assert_eq!(quarantined.len(), 1, "the bytes must be kept for diagnosis");
+        for path in quarantined {
+            std::fs::remove_file(path)?;
+        }
         Ok(())
     }
 

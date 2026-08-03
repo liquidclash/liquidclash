@@ -6,7 +6,16 @@ use crate::{
 use kode_bridge::errors::KodeBridgeError;
 use kode_bridge::ipc_http_server::RequestContext;
 use sha2::{Digest as _, Sha256};
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, time::Duration};
+
+/// How long the runtime will wait for the pre-authentication filesystem probes.
+///
+/// Everything [`authenticate_owner`] does to `app_data_dir` — `CreateFileW`, `canonicalize`,
+/// `symlink_metadata`, `read_exact` — is a synchronous kernel call on a *client-supplied* path,
+/// and it runs before the token compare. On a path the kernel cannot reach quickly that wait is
+/// the redirector's, not ours. Local volumes answer in microseconds, so this only ever expires on
+/// a path that was never going to authenticate.
+const OWNER_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedOwner {
@@ -134,8 +143,108 @@ pub fn validate_unix_identity(
     Ok(())
 }
 
-pub fn authenticate_owner(
+/// The transport half of a credential check, taken from the request before the filesystem half
+/// leaves the runtime thread: `RequestContext` is borrowed and cannot cross into a blocking task.
+#[derive(Clone, Copy, Default)]
+pub struct PeerIdentity {
+    #[cfg(unix)]
+    credentials: Option<(u32, u32)>,
+}
+
+impl PeerIdentity {
+    fn from_context(context: &RequestContext) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                credentials: context
+                    .client_info
+                    .peer_credentials
+                    .uid
+                    .zip(context.client_info.peer_credentials.gid),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = context;
+            Self::default()
+        }
+    }
+}
+
+/// Authenticate without occupying a runtime worker, and without waiting forever.
+///
+/// This runs at the head of every protected route, before the token compare, on a path the
+/// caller chose. Left on a worker it is a pre-authentication denial of service: the service runs
+/// four workers, so four requests naming an unreachable path make status, release and service
+/// stop unschedulable while the machine stays armed. The probes therefore run on a blocking
+/// worker with a deadline.
+///
+/// Nothing about the decision is relaxed. The probes are the same probes, in the same order, and
+/// a request whose credentials could not be *proved* — task failure, deadline, or a path this
+/// service cannot verify at all — is refused exactly as a wrong token is. Abandoning the wait is
+/// safe because the probes only read.
+pub async fn authenticate_owner_off_runtime(
     context: &RequestContext,
+    credentials: &OwnerCredentials,
+) -> Result<AuthenticatedOwner, ServiceError> {
+    reject_unverifiable_app_data_root(&credentials.app_data_dir)?;
+
+    let peer = PeerIdentity::from_context(context);
+    let credentials = credentials.clone();
+    let probe = tokio::task::spawn_blocking(move || authenticate_owner(peer, &credentials));
+    match tokio::time::timeout(OWNER_AUTH_TIMEOUT, probe).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ServiceError::unauthorized(
+            "owner credentials could not be verified",
+        )),
+        Err(_) => Err(ServiceError::unauthorized(
+            "owner credentials could not be verified before the deadline",
+        )),
+    }
+}
+
+/// Refuse a root whose answers this service could not trust anyway, before opening anything.
+///
+/// A UNC or device path is served by a remote party that chooses every byte the checks below
+/// read — the owner SID and the DACL that are supposed to *be* the proof of ownership — so it
+/// could assert whatever it liked while holding the probe open for as long as it liked. Only a
+/// local drive-letter root can carry a trustworthy answer, so this tightens authentication
+/// rather than relaxing it.
+#[cfg(windows)]
+fn reject_unverifiable_app_data_root(path: &str) -> Result<(), ServiceError> {
+    if !is_local_drive_path(path) {
+        return Err(ServiceError::unauthorized(
+            "application data root must be a local drive-letter path",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_unverifiable_app_data_root(path: &str) -> Result<(), ServiceError> {
+    // Unix roots carry no syntactic marker for "answered by a remote server"; the deadline above
+    // is the whole bound there, and the uid check below is not delegated to the filesystem.
+    let _ = path;
+    Ok(())
+}
+
+/// Whether `path` is a plain local drive-letter path (`C:\...`, or its `\\?\C:\...` spelling).
+///
+/// Kept platform-independent so the classification stays unit-testable off Windows.
+#[cfg(any(windows, test))]
+fn is_local_drive_path(path: &str) -> bool {
+    let tail = path.strip_prefix(r"\\?\").unwrap_or(path).as_bytes();
+    tail.len() >= 3
+        && tail[0].is_ascii_alphabetic()
+        && tail[1] == b':'
+        && (tail[2] == b'\\' || tail[2] == b'/')
+}
+
+/// The decision itself, unchanged and still synchronous — it is all blocking filesystem work.
+/// [`authenticate_owner_off_runtime`] is the only production caller and it runs this on a
+/// blocking worker.
+fn authenticate_owner(
+    peer: PeerIdentity,
     credentials: &OwnerCredentials,
 ) -> Result<AuthenticatedOwner, ServiceError> {
     #[cfg(all(feature = "test", unix))]
@@ -147,12 +256,7 @@ pub fn authenticate_owner(
     {
         use std::os::unix::fs::MetadataExt as _;
 
-        let peer = context
-            .client_info
-            .peer_credentials
-            .uid
-            .zip(context.client_info.peer_credentials.gid);
-        validate_unix_identity(&credentials.identity, peer)?;
+        validate_unix_identity(&credentials.identity, peer.credentials)?;
 
         let app_data_root = std::fs::canonicalize(&credentials.app_data_dir)
             .map_err(|_| ServiceError::unauthorized("application data root is unavailable"))?;
@@ -179,7 +283,7 @@ pub fn authenticate_owner(
 
     #[cfg(windows)]
     {
-        let _ = context;
+        let _ = peer;
         windows_auth::authenticate(credentials)
     }
 }
@@ -314,8 +418,19 @@ mod windows_auth {
                 "application data root is not an ordinary directory",
             ));
         }
-        std::fs::canonicalize(path)
-            .map_err(|_| unauthorized("application data root could not be canonicalized"))
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|_| unauthorized("application data root could not be canonicalized"))?;
+        // The caller screened the string it was handed; screen what it actually resolved to as
+        // well. Everything below reads its identity evidence — the owner SID, the token DACL —
+        // from whatever answers this path, so a root that resolves off the local volume would
+        // let the answering party choose that evidence. Checked here so no resolution trick can
+        // slip between the two.
+        if !super::is_local_drive_path(&canonical.to_string_lossy()) {
+            return Err(unauthorized(
+                "application data root does not resolve to a local drive-letter path",
+            ));
+        }
+        Ok(canonical)
     }
 
     fn open_no_reparse(
@@ -564,9 +679,26 @@ mod windows_auth {
     }
 }
 
+#[cfg(test)]
+mod path_tests {
+    use super::is_local_drive_path;
+
+    #[test]
+    fn only_local_drive_letter_roots_are_accepted() {
+        assert!(is_local_drive_path(r"C:\Users\Alice\AppData\Roaming\app"));
+        assert!(is_local_drive_path(r"\\?\C:\Users\Alice\AppData\Roaming\app"));
+        // The parked-worker vector, plus the two other spellings of "somebody else answers".
+        assert!(!is_local_drive_path(r"\\10.255.255.1\share"));
+        assert!(!is_local_drive_path(r"\\?\UNC\10.255.255.1\share"));
+        assert!(!is_local_drive_path(r"\\.\pipe\anything"));
+        assert!(!is_local_drive_path(r"relative\app"));
+        assert!(!is_local_drive_path("C:"));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::authenticate_owner;
+    use super::authenticate_owner_off_runtime;
     use super::validate_unix_identity;
     use crate::{OwnerCredentials, OwnerIdentity, ServiceErrorCode};
     use http::{HeaderMap, Method};
@@ -583,8 +715,8 @@ mod tests {
         assert_eq!(error.code, ServiceErrorCode::UnauthorizedOwner);
     }
 
-    #[test]
-    fn authenticated_unix_owner_uses_canonical_owned_app_root()
+    #[tokio::test]
+    async fn authenticated_unix_owner_uses_canonical_owned_app_root()
     -> Result<(), Box<dyn std::error::Error>> {
         let uid = unsafe { platform_lib::geteuid() };
         let gid = unsafe { platform_lib::getegid() };
@@ -613,7 +745,7 @@ mod tests {
             token: None,
         };
 
-        let owner = authenticate_owner(&context, &credentials)?;
+        let owner = authenticate_owner_off_runtime(&context, &credentials).await?;
 
         assert_eq!(owner.key, uid.to_string());
         assert_eq!(owner.app_data_root, std::fs::canonicalize(&app_root)?);

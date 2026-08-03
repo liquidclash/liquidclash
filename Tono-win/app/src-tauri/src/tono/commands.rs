@@ -222,36 +222,45 @@ pub async fn load_credentials(state: &Arc<TonoState>) {
         inner.credentials_loaded = true;
         return;
     }
-    if let Ok((refresh, id)) = outcome {
-        match refresh {
-            Ok(Some(token)) => {
-                // Hydrate memory only — writing the same bytes back would
-                // risk another prompting vault call.
-                let _ = inner.credentials.set_local(CredentialKey::RefreshToken, &token);
-            }
-            Ok(None) => {}
-            Err(err) => inner.credential_error = Some(err.to_string()),
+    let Ok((refresh, id)) = outcome else {
+        // A timeout is not an answer. Reading it as "no credentials" turned a slow Credential
+        // Manager into a signed-out user, and latching the gate made that verdict stick until
+        // the process restarted — including through `tono_retry_restore`, which re-enters here
+        // and used to return immediately. Record it as a store error (the M1 branch, which
+        // preserves protection and offers Retry) and leave the gate closed so a retry re-reads.
+        inner.credential_error = Some(format!(
+            "credential store did not answer within {CREDENTIAL_LOAD_TIMEOUT:?}"
+        ));
+        return;
+    };
+    match refresh {
+        Ok(Some(token)) => {
+            // Hydrate memory only — writing the same bytes back would
+            // risk another prompting vault call.
+            let _ = inner.credentials.set_local(CredentialKey::RefreshToken, &token);
         }
-        match id {
-            Ok(Some(persisted)) => {
-                if let Ok(persisted) = normalize_installation_id(&persisted) {
-                    inner.installation_id = persisted;
-                }
+        Ok(None) => {}
+        Err(err) => inner.credential_error = Some(err.to_string()),
+    }
+    match id {
+        Ok(Some(persisted)) => {
+            if let Ok(persisted) = normalize_installation_id(&persisted) {
+                inner.installation_id = persisted;
             }
-            Ok(None) => {
-                // First run: persist the in-memory id off-thread (§2).
-                let installation_id = inner.installation_id.clone();
-                tokio::spawn(async move {
-                    let _ = TonoCredentialStore::set_async(CredentialKey::InstallationId, &installation_id).await;
-                });
-            }
-            Err(_) => {
-                // The id is not auth-critical: keep the ephemeral one.
-            }
+        }
+        Ok(None) => {
+            // First run: persist the in-memory id off-thread (§2).
+            let installation_id = inner.installation_id.clone();
+            tokio::spawn(async move {
+                let _ = TonoCredentialStore::set_async(CredentialKey::InstallationId, &installation_id).await;
+            });
+        }
+        Err(_) => {
+            // The id is not auth-critical: keep the ephemeral one.
         }
     }
-    // Timeout (or a completed load): either way the gate opens — "no
-    // credentials" semantics, never a stalled startup.
+    // The vault answered — including "there is nothing stored", which is a real answer. The
+    // gate opens only here; startup was never blocked, because the read itself is bounded.
     inner.credentials_loaded = true;
 }
 
@@ -532,6 +541,19 @@ pub async fn tono_select_server(
             logging!(warn, Type::Service, "Tono: 选中节点持久化失败: {err}");
         }
         emit_status(&app, &status_of(&inner));
+        // Spawned *and* registered under one guard. Registering after `drop(inner)` left a
+        // window in which a concurrent `disconnect()` ran `abort_connection_tasks()` against an
+        // empty switch slot and this line then installed a task nothing could abort — a node
+        // switch surviving the disconnect that was supposed to cancel it, re-arming WFP behind
+        // a completed release. The task's first act is to lock this same mutex, so it cannot
+        // make progress before the guard is dropped below.
+        if action == connection::SelectAction::Switch {
+            let task_state = state.inner().clone();
+            let task_app = app.clone();
+            inner.tasks.switch = Some(AsyncHandler::spawn(move || async move {
+                connection::switch_selected_node(task_state, task_app, generation).await;
+            }));
+        }
         drop(inner);
         if cleared_choice {
             state.audit().log(AuditEvent::RequiresChoiceCleared);
@@ -545,14 +567,8 @@ pub async fn tono_select_server(
     };
 
     match action {
-        connection::SelectAction::Switch => {
-            let task_state = state.inner().clone();
-            let handle = AsyncHandler::spawn(move || async move {
-                connection::switch_selected_node(task_state, app, generation).await;
-            });
-            let mut inner = state.lock().await;
-            inner.tasks.switch = Some(handle);
-        }
+        // Already spawned and registered above, under the guard.
+        connection::SelectAction::Switch => {}
         connection::SelectAction::Reconnect => {
             connection::schedule_reconnect(&state, &app).await;
         }
@@ -643,6 +659,93 @@ pub async fn tono_status(state: tauri::State<'_, Arc<TonoState>>) -> Result<Tono
     Ok(status_of(&inner))
 }
 
+/// How many times restore asks the Service about the stored barrier before giving up.
+///
+/// The Service restores WFP and reconciles its startup state *before* it begins serving IPC, so
+/// on a BFE-dependent auto-start the pipe simply does not exist yet — and the app spawns restore
+/// immediately at launch. One failed probe therefore means "not yet", not "no barrier".
+const PROTECTION_PROBE_ATTEMPTS: usize = 5;
+const PROTECTION_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What the Service could tell restore about a stored kill switch.
+///
+/// The third case is the whole point. Collapsing an IPC failure into "no barrier" makes every
+/// downstream branch treat it as *proven disarmed*: the signed-out path skipped the release and
+/// reported SignedOut + `killSwitch: null` + `protectionBlocked: false` over a live WFP block,
+/// Disconnect then became a silent success no-op, and Quit computed `protected == false` and
+/// exited — leaving the machine blocked with no owner and a UI insisting all was well.
+#[derive(Debug, Clone)]
+enum StoredProtection {
+    /// The Service answered and wants the barrier.
+    Armed(Box<KillSwitchStatus>),
+    /// The Service answered and wants no barrier. The only reading that proves absence.
+    ProvenAbsent,
+    /// The Service did not answer. Never treated as absence.
+    Unknown(String),
+}
+
+/// Ask the Service about the stored barrier, retrying inside the restore budget.
+async fn probe_stored_protection(deadline: tokio::time::Instant) -> StoredProtection {
+    let mut last_error = "the Tono Service did not answer".to_string();
+    for attempt in 0..PROTECTION_PROBE_ATTEMPTS {
+        match tokio::time::timeout_at(deadline, service::tono_service_status_snapshot()).await {
+            Ok(Ok(snapshot)) => {
+                return match snapshot.kill_switch {
+                    Some(status) if status.wanted => StoredProtection::Armed(Box::new(status)),
+                    _ => StoredProtection::ProvenAbsent,
+                };
+            }
+            Ok(Err(error)) => last_error = error.to_string(),
+            Err(_elapsed) => {
+                last_error = format!("status probe exceeded the {RESTORE_TRANSACTION_TIMEOUT:?} restore budget");
+                break;
+            }
+        }
+        if attempt + 1 < PROTECTION_PROBE_ATTEMPTS
+            && tokio::time::timeout_at(deadline, tokio::time::sleep(PROTECTION_PROBE_INTERVAL))
+                .await
+                .is_err()
+        {
+            break;
+        }
+    }
+    logging!(
+        warn,
+        Type::Service,
+        "Tono: 无法读取 Service 的保护状态，按“未知（仍可能已封锁）”处理: {last_error}"
+    );
+    StoredProtection::Unknown(last_error)
+}
+
+/// Fold a protection reading into the FSM.
+///
+/// `Unknown` is recorded as armed but *not* session-verified. Of the two possible mistakes,
+/// believing in a barrier that is already gone costs the user one Disconnect that succeeds
+/// immediately; believing a live barrier is gone costs them their network with no way back.
+/// Withholding `mark_session_verified` keeps auto-reconnect out of it — an unknown must unlock
+/// the release paths, not start driving the machine.
+fn apply_stored_protection(inner: &mut TonoInner, protection: &StoredProtection) {
+    match protection {
+        StoredProtection::Armed(status) => {
+            if status.verified {
+                inner.fsm.mark_session_verified();
+            }
+            inner.kill_switch = Some((**status).clone());
+            inner.fsm.mark_kill_switch_armed();
+        }
+        StoredProtection::Unknown(_) => inner.fsm.mark_kill_switch_armed(),
+        StoredProtection::ProvenAbsent => {}
+    }
+}
+
+/// The single wording for "we could not read the barrier". It has to name the consequence and
+/// the escape hatch, because the user may be looking at a machine with no network.
+fn unknown_protection_message(reason: &str) -> String {
+    format!(
+        "protection state unknown — the Tono Service is not answering ({reason}). Network protection may still be blocking this machine: use Disconnect to release it, or run `tono-service.exe --emergency-disarm` as Administrator"
+    )
+}
+
 /// Startup session restore (§2): load the persisted selection (L4), seed
 /// the catalog from the verified cache, then refresh + `me()`. A 401 means
 /// the session is dead (logout, disarm, clear); other errors keep the kill
@@ -665,12 +768,10 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
         inner.sign_in_generation
     };
 
-    let wanted_kill_switch = tokio::time::timeout_at(restore_deadline, service::tono_service_status_snapshot())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .and_then(|snapshot| snapshot.kill_switch)
-        .filter(|status| status.wanted);
+    // Three-valued on purpose: armed / proven absent / unknown. This used to be an
+    // `Option<KillSwitchStatus>` where every failure mode became `None`, and `None` reads as
+    // "there is no barrier" everywhere below.
+    let protection = probe_stored_protection(restore_deadline).await;
 
     let (client, probe) = {
         let inner = state.lock().await;
@@ -690,33 +791,46 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
             if inner.sign_in_generation != generation {
                 return;
             }
-            if let Some(status) = wanted_kill_switch {
-                if status.verified {
-                    inner.fsm.mark_session_verified();
-                }
-                inner.kill_switch = Some(status);
-                inner.fsm.mark_kill_switch_armed();
-            }
+            apply_stored_protection(&mut inner, &protection);
             let detail = inner
                 .credential_error
                 .clone()
                 .unwrap_or_else(|| "unknown credential error".to_string());
-            inner.account_state = AccountState::Error(format!("credential store unreadable: {detail}"));
+            inner.account_state = match &protection {
+                // Two unknowns at once (a slow vault and a Service that is not up yet) is the
+                // common boot case; report both rather than only the one we noticed first.
+                StoredProtection::Unknown(reason) => AccountState::Error(format!(
+                    "credential store unreadable: {detail}; {}",
+                    unknown_protection_message(reason)
+                )),
+                _ => AccountState::Error(format!("credential store unreadable: {detail}")),
+            };
             emit_status(&app, &status_of(&inner));
             return;
         }
         TokenProbe::NoToken => {
-            if let Some(status) = wanted_kill_switch {
+            if let StoredProtection::Unknown(reason) = &protection {
+                // Never the silent signed-out path. Unknown here was the worst of the lot: it
+                // skipped the release entirely and reported SignedOut over a possibly-live WFP
+                // block, after which Disconnect was a success no-op and Quit exited computing
+                // `protected == false`. Record it as armed so every release path stays
+                // reachable, and say plainly that we do not know.
+                let mut inner = state.lock().await;
+                if inner.sign_in_generation != generation {
+                    return;
+                }
+                apply_stored_protection(&mut inner, &protection);
+                inner.account_state = AccountState::Error(unknown_protection_message(reason));
+                emit_status(&app, &status_of(&inner));
+                return;
+            }
+            if matches!(protection, StoredProtection::Armed(_)) {
                 {
                     let mut inner = state.lock().await;
                     if inner.sign_in_generation != generation {
                         return;
                     }
-                    if status.verified {
-                        inner.fsm.mark_session_verified();
-                    }
-                    inner.kill_switch = Some(status);
-                    inner.fsm.mark_kill_switch_armed();
+                    apply_stored_protection(&mut inner, &protection);
                 }
                 if let Err(error) = connection::release_explicit(&state, &app).await {
                     let mut inner = state.lock().await;
@@ -766,13 +880,7 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
             if inner.sign_in_generation != generation {
                 return;
             }
-            if let Some(status) = wanted_kill_switch {
-                if status.verified {
-                    inner.fsm.mark_session_verified();
-                }
-                inner.kill_switch = Some(status);
-                inner.fsm.mark_kill_switch_armed();
-            }
+            apply_stored_protection(&mut inner, &protection);
             inner.account_state =
                 AccountState::Error(format!("session restore exceeded {RESTORE_TRANSACTION_TIMEOUT:?}"));
             emit_status(&app, &status_of(&inner));
@@ -794,13 +902,7 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
                 } else {
                     AccountState::Ready
                 };
-                if let Some(status) = wanted_kill_switch {
-                    if status.verified {
-                        inner.fsm.mark_session_verified();
-                    }
-                    inner.kill_switch = Some(status);
-                    inner.fsm.mark_kill_switch_armed();
-                }
+                apply_stored_protection(&mut inner, &protection);
                 emit_status(&app, &status_of(&inner));
             }
             if !info.suspended {
@@ -883,14 +985,13 @@ pub async fn restore_session(app: AppHandle, state: Arc<TonoState>) {
             if inner.sign_in_generation != generation {
                 return;
             }
-            if let Some(status) = wanted_kill_switch {
-                if status.verified {
-                    inner.fsm.mark_session_verified();
+            apply_stored_protection(&mut inner, &protection);
+            inner.account_state = match &protection {
+                StoredProtection::Unknown(reason) => {
+                    AccountState::Error(format!("{err}; {}", unknown_protection_message(reason)))
                 }
-                inner.kill_switch = Some(status);
-                inner.fsm.mark_kill_switch_armed();
-            }
-            inner.account_state = AccountState::Error(err.to_string());
+                _ => AccountState::Error(err.to_string()),
+            };
             emit_status(&app, &status_of(&inner));
         }
     }
@@ -1045,7 +1146,7 @@ pub async fn resync_after_cancelled_quit(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenProbe, stage_key, token_probe, ui_state_key};
+    use super::{TokenProbe, stage_key, token_probe, ui_state_key, unknown_protection_message};
     use tono_core::connection::{ConnectStage, UiState};
 
     #[test]
@@ -1074,6 +1175,16 @@ mod tests {
         assert_eq!(ui_state_key(UiState::Connected), "connected");
         assert_eq!(ui_state_key(UiState::ProtectedOffline), "protectedOffline");
         assert_eq!(ui_state_key(UiState::Disconnecting), "disconnecting");
+    }
+
+    #[test]
+    fn an_unreadable_protection_state_is_reported_as_unknown_with_a_way_out() {
+        let message = unknown_protection_message("pipe not found");
+        // It must not read as "not protected", and it must carry both the cause and the
+        // elevated command that restores connectivity if the app cannot release it.
+        assert!(message.contains("unknown"), "{message}");
+        assert!(message.contains("pipe not found"), "{message}");
+        assert!(message.contains("emergency-disarm"), "{message}");
     }
 
     #[test]

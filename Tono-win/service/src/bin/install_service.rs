@@ -578,6 +578,17 @@ fn main() -> anyhow::Result<()> {
         account_password: None,
     };
 
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
+    const ERROR_SERVICE_EXISTS: i32 = 1073;
+
+    fn raw_error_code(error: &WindowsServiceError) -> Option<i32> {
+        match error {
+            WindowsServiceError::Winapi(error) => error.raw_os_error(),
+            _ => None,
+        }
+    }
+
     let service_access = ServiceAccess::QUERY_STATUS
         | ServiceAccess::START
         | ServiceAccess::STOP
@@ -593,39 +604,118 @@ fn main() -> anyhow::Result<()> {
             // UAC succeeded, but publishing/configuring/starting the replacement can still fail;
             // without this rollback a repair attempt turns that failure into a permanent outage.
             let mut restart_on_failure = RestartServiceOnFailure::new(&service, was_active);
-            let publish_outcome = publish_staged_binary(&staged, &target)?;
-            service.change_config(&service_info)?;
-            configure_windows_service_recovery(&service)?;
-            service.start(&Vec::<&OsStr>::new())?;
-            if publish_outcome == PublishOutcome::RebootRequired {
-                restart_on_failure.disarm();
-                println!(
-                    "Service restarted with the existing binary; reboot is required to publish the replacement."
-                );
-                std::process::exit(3010);
+            // Reconfigure before the binary swap, which is the first irreversible step: a record
+            // a previous uninstall only marked for deletion still opens and still stops, but
+            // every write to it fails with 1072. Discovering that after `publish_staged_binary`
+            // would abort the install on top of a half-swapped binary.
+            match service.change_config(&service_info) {
+                Ok(()) => {
+                    let publish_outcome = publish_staged_binary(&staged, &target)?;
+                    configure_windows_service_recovery(&service)?;
+                    service.start(&Vec::<&OsStr>::new())?;
+                    // The service is running on either path here — the old binary when the swap
+                    // was deferred — so readiness stays provable, and a build that dies on start
+                    // must not pass as a successful "reboot pending" install.
+                    wait_for_service_ready()?;
+                    restart_on_failure.disarm();
+                    if publish_outcome == PublishOutcome::RebootRequired {
+                        println!(
+                            "Service restarted with the existing binary; reboot is required to publish the replacement."
+                        );
+                        std::process::exit(3010);
+                    }
+                    return Ok(());
+                }
+                Err(error) if raw_error_code(&error) == Some(ERROR_SERVICE_MARKED_FOR_DELETE) => {
+                    // Nothing irreversible has run yet. SCM unregisters a deleted record only
+                    // once the last handle to it closes, so release ours — and the rollback that
+                    // borrows it, since a marked record cannot be restarted — before waiting.
+                    restart_on_failure.disarm();
+                    drop(restart_on_failure);
+                    drop(service);
+                    println!(
+                        "The existing service record is marked for deletion; waiting for Windows to unregister it."
+                    );
+                    if !wait_for_service_record_removal(&service_manager) {
+                        bail!(
+                            "the existing {} record is still marked for deletion because another program holds it open (services.msc, an MMC snap-in, or a monitoring agent); close it or reboot Windows, then run this installer again — nothing was modified",
+                            clash_verge_service_ipc::WINDOWS_SERVICE_NAME
+                        );
+                    }
+                }
+                Err(error) => return Err(error.into()),
             }
-            wait_for_service_ready()?;
-            restart_on_failure.disarm();
-            return Ok(());
         }
-        Err(WindowsServiceError::Winapi(error)) if error.raw_os_error() == Some(1060) => {}
+        Err(error) if raw_error_code(&error) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {}
         Err(error) => return Err(error.into()),
     }
 
     let publish_outcome = publish_staged_binary(&staged, &target)?;
-    let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
-    let service = service_manager.create_service(&service_info, start_access)?;
+    let service = match service_manager.create_service(&service_info, service_access) {
+        Ok(service) => service,
+        // TOCTOU mirror of the probe above: the record was (re)registered between the two calls,
+        // by a concurrent installer or by whatever recreated the deletion we just waited out.
+        // Adopting it reaches the same end state instead of aborting after the binary swap.
+        Err(error) if raw_error_code(&error) == Some(ERROR_SERVICE_EXISTS) => {
+            let service = service_manager.open_service(
+                clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
+                service_access,
+            )?;
+            stop_windows_service(&service)?;
+            service.change_config(&service_info)?;
+            service
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     service.set_description("Tono Service helps to launch the Tono core")?;
     configure_windows_service_recovery(&service)?;
     if publish_outcome == PublishOutcome::RebootRequired {
-        println!("Service was registered; reboot is required to publish and start its binary.");
+        // The binary only exists as a rename queued with the session manager, so there is
+        // nothing to start and nothing to verify. Say that instead of implying a live service.
+        println!(
+            "Service was registered, but its binary is queued for the next reboot: it was not started and its readiness could not be verified. Restart the machine to finish installation."
+        );
         std::process::exit(3010);
     }
     service.start(&Vec::<&OsStr>::new())?;
     wait_for_service_ready()?;
 
     Ok(())
+}
+
+/// Wait out an SCM record that a previous `DeleteService` only marked for deletion. The record
+/// survives until the last handle to it closes, so a services.msc window, an MMC snap-in or a
+/// monitoring agent can keep it — and the 1072 every write to it returns — alive long past the
+/// uninstall that deleted it. Reports whether the record is gone.
+#[cfg(windows)]
+fn wait_for_service_record_removal(
+    service_manager: &platform_lib::service_manager::ServiceManager,
+) -> bool {
+    use platform_lib::{Error as WindowsServiceError, service::ServiceAccess};
+
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const REMOVAL_ATTEMPTS: usize = 50;
+    const REMOVAL_INTERVAL: Duration = Duration::from_millis(100);
+
+    for _ in 0..REMOVAL_ATTEMPTS {
+        match service_manager.open_service(
+            clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS,
+        ) {
+            Ok(service) => drop(service),
+            Err(WindowsServiceError::Winapi(error))
+                if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+            {
+                return true;
+            }
+            // Any other failure says nothing about the record itself, so keep polling rather
+            // than guessing; the caller reports the timeout as the actionable condition.
+            Err(_) => {}
+        }
+        std::thread::sleep(REMOVAL_INTERVAL);
+    }
+    false
 }
 
 #[cfg(windows)]

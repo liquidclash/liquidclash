@@ -102,6 +102,7 @@ pub struct RunStateStore<E: RunStateEnv> {
     privileged_outcome_uncertain: AtomicBool,
     operation_done: Notify,
     privileged_timeout: Duration,
+    evidence_timeout: Duration,
 }
 
 /// Hard cap on one privileged operation (install/uninstall/reinstall). The
@@ -109,6 +110,17 @@ pub struct RunStateStore<E: RunStateEnv> {
 /// pipe-wait on a wedged child — pinning `operation_running` and bricking
 /// every later Connect (the real-machine bug this bounds).
 pub const PRIVILEGED_ACTION_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Hard cap on the platform install-evidence probe. Reading the registry is a
+/// millisecond operation when the platform is healthy, but it is not *bounded*
+/// by anything: Windows SCM serialises `OpenSCManager`/`OpenService` on its
+/// database lock, so one unrelated service stuck in START_PENDING/STOP_PENDING
+/// blocks every reader for as long as it is stuck. This probe sits on the
+/// startup path in front of `init_window`/`init_tray`, so an unbounded wait
+/// here is an app with no window and no tray icon — recoverable only from Task
+/// Manager. Five seconds is far outside a healthy machine's range and far
+/// inside a user's patience for the window to appear.
+pub const INSTALL_EVIDENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<E: RunStateEnv> RunStateStore<E> {
     pub fn new(env: E) -> Self {
@@ -120,6 +132,7 @@ impl<E: RunStateEnv> RunStateStore<E> {
             privileged_outcome_uncertain: AtomicBool::new(false),
             operation_done: Notify::new(),
             privileged_timeout: PRIVILEGED_ACTION_TIMEOUT,
+            evidence_timeout: INSTALL_EVIDENCE_TIMEOUT,
         }
     }
 
@@ -127,6 +140,13 @@ impl<E: RunStateEnv> RunStateStore<E> {
     #[cfg(test)]
     pub fn with_privileged_timeout(mut self, timeout: Duration) -> Self {
         self.privileged_timeout = timeout;
+        self
+    }
+
+    /// A store with a shorter install-evidence cap, for timeout tests.
+    #[cfg(test)]
+    pub fn with_evidence_timeout(mut self, timeout: Duration) -> Self {
+        self.evidence_timeout = timeout;
         self
     }
 
@@ -220,9 +240,26 @@ impl<E: RunStateEnv> RunStateStore<E> {
     /// Work out the Service's health from scratch: platform evidence first, then a live probe.
     ///
     /// Platform evidence that cannot be inspected is *unavailable*, not *absent* — assuming
-    /// "not installed" there would offer the user an install that is already there.
+    /// "not installed" there would offer the user an install that is already there. Evidence
+    /// that never answers within [`INSTALL_EVIDENCE_TIMEOUT`] is the same kind of unreadable
+    /// and takes the same branch: a wedged SCM says nothing about whether we are installed.
     pub async fn detect_service_health(&self) -> ServiceHealth {
-        let has_marker = match self.env.trusted_install_evidence().await {
+        let evidence = match tokio::time::timeout(self.evidence_timeout, self.env.trusted_install_evidence()).await {
+            Ok(evidence) => evidence,
+            Err(_elapsed) => {
+                logging!(
+                    warn,
+                    Type::Service,
+                    "trusted service evidence did not answer within {:?}; treating the platform registry as uninspectable",
+                    self.evidence_timeout
+                );
+                return ServiceHealth::Unavailable(format!(
+                    "service detection timed out after {:?}",
+                    self.evidence_timeout
+                ));
+            }
+        };
+        let has_marker = match evidence {
             Ok(exists) => exists,
             Err(error) => {
                 logging!(
@@ -1155,6 +1192,25 @@ mod tests {
         assert!(
             matches!(health, ServiceHealth::Unavailable(_)),
             "an uninspectable registry must not be reported as absent: {health:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detection_treats_a_wedged_registry_as_unavailable_not_absent() {
+        // The startup path runs this in front of the window and the tray, so an SCM stuck
+        // behind its database lock must produce a verdict, not an endless wait.
+        let store = with_env(FakeEnv::new().evidence_never_answers()).with_evidence_timeout(Duration::from_millis(50));
+
+        let health = store.detect_service_health().await;
+
+        assert!(
+            matches!(health, ServiceHealth::Unavailable(_)),
+            "a registry that never answers must not be reported as absent: {health:?}"
+        );
+        assert_eq!(
+            store.env.probe_count(),
+            0,
+            "the verdict must be reached without waiting on a second probe"
         );
     }
 

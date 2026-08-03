@@ -2,6 +2,7 @@ use crate::ServiceErrorCode;
 use crate::core::auth::ServiceError;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_DIR_NOT_EMPTY, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
@@ -19,32 +20,88 @@ use windows_sys::Win32::Storage::FileSystem::{
     READ_CONTROL, SetFileInformationByHandle,
 };
 
-pub(crate) fn cleanup_system_owned_entries(root: &Path) -> Result<(), ServiceError> {
+/// Entries one walk may visit. The tree belongs to the client, so a pathological one — millions
+/// of names, or a directory graph that keeps producing them — must not be able to keep a blocking
+/// worker busy indefinitely. Comfortably above any real application data root.
+const MAX_ENTRIES: u32 = 20_000;
+/// Nesting one walk may descend. Reparse points are never followed, so this only bounds genuinely
+/// deep trees; a real root is a handful of levels.
+const MAX_DEPTH: usize = 32;
+
+/// What the walk is allowed to spend before it gives up on its own.
+///
+/// The caller also times out, but a caller's timeout cannot stop a blocking worker — an abandoned
+/// walk keeps opening and deleting. This is the bound that actually ends the work.
+struct Budget {
+    deadline: Instant,
+    remaining_entries: u32,
+}
+
+impl Budget {
+    fn new(duration: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + duration,
+            remaining_entries: MAX_ENTRIES,
+        }
+    }
+
+    fn spend_entry(&mut self) -> Result<(), ServiceError> {
+        if Instant::now() >= self.deadline {
+            return Err(cleanup_error(
+                "legacy cleanup exceeded its time budget; it will be retried",
+            ));
+        }
+        self.remaining_entries = self
+            .remaining_entries
+            .checked_sub(1)
+            .ok_or_else(|| cleanup_error("legacy cleanup exceeded its entry budget"))?;
+        Ok(())
+    }
+}
+
+pub(crate) fn cleanup_system_owned_entries(
+    root: &Path,
+    budget: Duration,
+) -> Result<(), ServiceError> {
     let root_handle = open_entry(root).map_err(|error| {
         cleanup_error(format!(
             "failed to open application data root {root:?}: {error}"
         ))
     })?;
     let root_path = final_path(root_handle.0)?;
-    cleanup_directory(root, &root_path)
+    cleanup_directory(root, &root_path, 0, &mut Budget::new(budget))
 }
 
-fn cleanup_directory(path: &Path, root_path: &str) -> Result<(), ServiceError> {
+fn cleanup_directory(
+    path: &Path,
+    root_path: &str,
+    depth: usize,
+    budget: &mut Budget,
+) -> Result<(), ServiceError> {
+    if depth > MAX_DEPTH {
+        return Err(cleanup_error("legacy cleanup exceeded its depth budget"));
+    }
     let entries = std::fs::read_dir(path).map_err(|error| {
         cleanup_error(format!(
             "failed to enumerate legacy directory {path:?}: {error}"
         ))
     })?;
     for entry in entries {
+        budget.spend_entry()?;
         let entry = entry.map_err(|error| {
             cleanup_error(format!("failed to read legacy directory entry: {error}"))
         })?;
-        cleanup_entry(&entry.path(), root_path)?;
+        cleanup_entry(&entry.path(), root_path, depth, budget)?;
     }
     Ok(())
 }
 
-fn cleanup_entry(path: &Path, root_path: &str) -> Result<(), ServiceError> {
+fn cleanup_entry(
+    path: &Path,
+    root_path: &str,
+    depth: usize,
+    budget: &mut Budget,
+) -> Result<(), ServiceError> {
     let handle = match open_entry(path) {
         Ok(handle) => handle,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -67,7 +124,7 @@ fn cleanup_entry(path: &Path, root_path: &str) -> Result<(), ServiceError> {
     let system_owned = is_local_system_owned(handle.0)?;
 
     if is_directory && !is_reparse {
-        cleanup_directory(path, root_path)?;
+        cleanup_directory(path, root_path, depth + 1, budget)?;
         if system_owned {
             delete_open_entry(handle.0, true)?;
         }
@@ -230,7 +287,20 @@ impl Drop for LocalDescriptor {
 
 #[cfg(test)]
 mod tests {
-    use super::path_is_below_root;
+    use super::{Budget, MAX_ENTRIES, path_is_below_root};
+    use std::time::Duration;
+
+    #[test]
+    fn a_walk_stops_on_its_own_entry_and_time_budget() {
+        let mut entries = Budget::new(Duration::from_secs(60));
+        for _ in 0..MAX_ENTRIES {
+            entries.spend_entry().expect("budgeted entries must pass");
+        }
+        assert!(entries.spend_entry().is_err());
+
+        let mut expired = Budget::new(Duration::ZERO);
+        assert!(expired.spend_entry().is_err());
+    }
 
     #[test]
     fn final_path_check_is_component_bounded_and_case_insensitive() {

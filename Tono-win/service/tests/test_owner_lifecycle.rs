@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::service_paths;
 use clash_verge_service_ipc::{
     IpcCommand, OwnerCredentials, OwnerSessionProof, RuntimeBundle, ServiceErrorCode,
-    ServiceStatusSnapshot, StartClashRequest, StartClashResult, connect,
+    ServiceStatusSnapshot, StartClashRequest, StartClashResult, test_client,
     get_status as client_get_status, load_active_owner, load_owner_desired_state, owner_key,
     run_ipc_server, start_clash as client_start_clash, stop_clash as client_stop_clash,
     stop_ipc_server,
@@ -437,7 +437,7 @@ async fn protected_routes_reject_protocol_mismatch_before_deserialization() -> R
     common::wait_for_ipc().await?;
 
     let invalid = serde_json::Value::String("not an authenticated request".to_owned());
-    let client = connect().await?;
+    let client = test_client().await?;
     let responses = [
         client
             .get(IpcCommand::Status.as_ref())

@@ -168,8 +168,8 @@ pub struct RuleConfig {
     /// when the exe moves), which the add-before-remove plan then swaps atomically.
     pub app_path: String,
     /// Cloud-approved DIRECT endpoints (WeChat acceleration): exact `IP:port` tuples any
-    /// process may reach on the physical NIC. Present in every mode **while armed**; never
-    /// persisted, never restored, never inherited by the next arm — omission = clear.
+    /// process may reach on the physical NIC. Rendered **only in `Locked`** (see rule G);
+    /// never persisted, never restored, never inherited by the next arm — omission = clear.
     pub direct_endpoints: Vec<ProxyEndpoint>,
 }
 
@@ -406,26 +406,36 @@ pub fn session_rules(config: &RuleConfig) -> Vec<FilterSpec> {
 
     // G: cloud-approved DIRECT endpoints (WeChat acceleration). One exact `IP:port` permit
     // per tuple, hard-permit weight, and deliberately NOT app-scoped — the WeChat client
-    // process needs the direct path just as much as the browser beside it. Present in every
-    // mode for as long as the switch is armed (the Mac helper's session-exception
-    // lifecycle); the facade's omission=clear contract decides when the set is empty.
-    for endpoint in &config.direct_endpoints {
-        let Some((ip, port, protocol)) = parse_endpoint(endpoint) else {
-            continue;
-        };
-        filters.push(spec(
-            format!("session/permit-direct/{ip}/{port}/{}", protocol.number()),
-            "session permit approved DIRECT",
-            layer_for(ip),
-            WEIGHT_HARD_PERMIT,
-            A::Permit,
-            vec![
-                remote_address_condition(ip),
-                C::Protocol(protocol),
-                C::RemotePort(port),
-            ],
-            false,
-        ));
+    // process needs the direct path just as much as the browser beside it.
+    //
+    // Locked only. A DIRECT plan exists to let specific traffic bypass the tunnel *while
+    // connected*; in Bootstrap and in Blocked ("Protected Offline") there is no tunnel to
+    // bypass and the user is told nothing gets out. Because these permits carry no app-id
+    // condition, leaving them up in those modes would hand up to 256 (IP, port) tuples on
+    // shared multi-tenant CDN addresses to every process on the machine, for a bypass whose
+    // whole purpose is absent. The facade keeps the approved set in the armed session's memory
+    // across a mode change, so re-locking re-renders it; the omission=clear contract still
+    // decides when the set is empty. Retracting them is a mode change like any other: the
+    // key-only diff removes exactly these keys, so nothing stale is left installed.
+    if config.mode == KillSwitchStatusMode::Locked {
+        for endpoint in &config.direct_endpoints {
+            let Some((ip, port, protocol)) = parse_endpoint(endpoint) else {
+                continue;
+            };
+            filters.push(spec(
+                format!("session/permit-direct/{ip}/{port}/{}", protocol.number()),
+                "session permit approved DIRECT",
+                layer_for(ip),
+                WEIGHT_HARD_PERMIT,
+                A::Permit,
+                vec![
+                    remote_address_condition(ip),
+                    C::Protocol(protocol),
+                    C::RemotePort(port),
+                ],
+                false,
+            ));
+        }
     }
 
     // D: defense-in-depth hard DNS block. The floor's weight-8 loopback permit still wins for
@@ -1348,10 +1358,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn direct_endpoints_are_permitted_exactly_for_any_process_in_every_mode() {
-        let mut base = config(KillSwitchStatusMode::Bootstrap);
-        base.direct_endpoints = vec![
+    fn config_with_direct_endpoints(mode: KillSwitchStatusMode) -> RuleConfig {
+        let mut config = config(mode);
+        config.direct_endpoints = vec![
             endpoint("203.0.113.9", 443),
             ProxyEndpoint {
                 ip: "203.0.113.10".to_owned(),
@@ -1359,75 +1368,115 @@ mod tests {
                 protocol: ProxyProtocol::Udp,
             },
         ];
+        config
+    }
 
-        for mode in [
-            KillSwitchStatusMode::Bootstrap,
-            KillSwitchStatusMode::Locked,
-            KillSwitchStatusMode::Blocked,
-        ] {
-            base.mode = mode;
-            let filters = expected_filters(&base);
+    #[test]
+    fn direct_endpoints_are_permitted_exactly_for_any_process_while_locked() {
+        let filters = expected_filters(&config_with_direct_endpoints(KillSwitchStatusMode::Locked));
 
-            // Exact tuples permitted — with app_id_matches = false, proving the permits are
-            // not app-scoped (the WeChat client itself must use them).
-            let tcp = packet(
-                LayerKind::AleAuthConnectV4,
-                IpProtocol::Tcp,
-                "203.0.113.9",
-                443,
-            );
-            assert_eq!(arbitrate(&filters, &tcp), FilterAction::Permit, "{mode:?}");
-            let udp = packet(
-                LayerKind::AleAuthConnectV4,
-                IpProtocol::Udp,
-                "203.0.113.10",
-                8000,
-            );
-            assert_eq!(arbitrate(&filters, &udp), FilterAction::Permit, "{mode:?}");
+        // Exact tuples permitted — with app_id_matches = false, proving the permits are
+        // not app-scoped (the WeChat client itself must use them).
+        let tcp = packet(
+            LayerKind::AleAuthConnectV4,
+            IpProtocol::Tcp,
+            "203.0.113.9",
+            443,
+        );
+        assert_eq!(arbitrate(&filters, &tcp), FilterAction::Permit);
+        let udp = packet(
+            LayerKind::AleAuthConnectV4,
+            IpProtocol::Udp,
+            "203.0.113.10",
+            8000,
+        );
+        assert_eq!(arbitrate(&filters, &udp), FilterAction::Permit);
 
-            // Same IP, wrong port: blocked. Wrong IP: blocked.
-            let wrong_port = packet(
-                LayerKind::AleAuthConnectV4,
-                IpProtocol::Tcp,
-                "203.0.113.9",
-                8443,
-            );
-            assert_eq!(
-                arbitrate(&filters, &wrong_port),
-                FilterAction::Block,
-                "{mode:?}"
-            );
-            let wrong_ip = packet(
-                LayerKind::AleAuthConnectV4,
-                IpProtocol::Tcp,
-                "203.0.113.11",
-                443,
-            );
-            assert_eq!(
-                arbitrate(&filters, &wrong_ip),
-                FilterAction::Block,
-                "{mode:?}"
-            );
+        // Same IP, wrong port: blocked. Wrong IP: blocked.
+        let wrong_port = packet(
+            LayerKind::AleAuthConnectV4,
+            IpProtocol::Tcp,
+            "203.0.113.9",
+            8443,
+        );
+        assert_eq!(arbitrate(&filters, &wrong_port), FilterAction::Block);
+        let wrong_ip = packet(
+            LayerKind::AleAuthConnectV4,
+            IpProtocol::Tcp,
+            "203.0.113.11",
+            443,
+        );
+        assert_eq!(arbitrate(&filters, &wrong_ip), FilterAction::Block);
 
-            // And the DIRECT permit is hard-permit weight without an app-id condition.
-            let permit = filters
-                .iter()
-                .find(|filter| {
-                    filter.conditions.contains(&Condition::RemoteAddressV4 {
-                        addr: [203, 0, 113, 9],
-                        prefix: 32,
-                    })
+        // And the DIRECT permit is hard-permit weight without an app-id condition.
+        let permit = filters
+            .iter()
+            .find(|filter| {
+                filter.conditions.contains(&Condition::RemoteAddressV4 {
+                    addr: [203, 0, 113, 9],
+                    prefix: 32,
                 })
-                .expect("direct permit must exist");
-            assert_eq!(permit.weight, WEIGHT_HARD_PERMIT);
-            assert!(!permit.conditions.contains(&Condition::AleAppId));
-        }
+            })
+            .expect("direct permit must exist");
+        assert_eq!(permit.weight, WEIGHT_HARD_PERMIT);
+        assert!(!permit.conditions.contains(&Condition::AleAppId));
 
         // Omission renders nothing.
         let without = expected_filters(&config(KillSwitchStatusMode::Locked));
         assert!(
             !without.iter().any(|filter| filter.name.contains("DIRECT")),
             "no direct endpoints configured, no DIRECT permits"
+        );
+    }
+
+    /// The contract this replaces was "present in every mode while armed". A DIRECT permit is
+    /// a hole in the tunnel, and it carries no app-id condition, so in the two modes where no
+    /// tunnel exists it is a hole for every process on the machine into nothing. Bootstrap and
+    /// Blocked must therefore arbitrate the exact approved tuples to Block, and the rendered
+    /// set must not merely down-weight them — the permits must be absent, so the key-only diff
+    /// removes them when the mode changes instead of leaving them installed.
+    #[test]
+    fn direct_permits_are_absent_and_blocked_outside_locked() {
+        for mode in [
+            KillSwitchStatusMode::Bootstrap,
+            KillSwitchStatusMode::Blocked,
+        ] {
+            let filters = expected_filters(&config_with_direct_endpoints(mode));
+            assert!(
+                !filters.iter().any(|filter| filter.name.contains("DIRECT")),
+                "{mode:?}: no tunnel exists, so no DIRECT permit may be installed"
+            );
+            for (protocol, ip, port) in [
+                (IpProtocol::Tcp, "203.0.113.9", 443_u16),
+                (IpProtocol::Udp, "203.0.113.10", 8000),
+            ] {
+                let approved = packet(LayerKind::AleAuthConnectV4, protocol, ip, port);
+                assert_eq!(
+                    arbitrate(&filters, &approved),
+                    FilterAction::Block,
+                    "{mode:?}: {ip}:{port} must not escape while disconnected"
+                );
+            }
+        }
+
+        // The mode change is what retracts them: every DIRECT key rendered while locked is in
+        // the removal set once the switch drops back to Blocked, and nothing survives it.
+        let locked = expected_filters(&config_with_direct_endpoints(KillSwitchStatusMode::Locked));
+        let blocked =
+            expected_filters(&config_with_direct_endpoints(KillSwitchStatusMode::Blocked));
+        let direct_keys = locked
+            .iter()
+            .filter(|filter| filter.name.contains("DIRECT"))
+            .map(|filter| filter.key)
+            .collect::<Vec<_>>();
+        assert_eq!(direct_keys.len(), 2);
+        let plan = diff(
+            &locked.iter().map(|filter| filter.key).collect::<Vec<_>>(),
+            &blocked,
+        );
+        assert!(
+            direct_keys.iter().all(|key| plan.remove.contains(key)),
+            "a mode change must never leave a stale DIRECT permit installed"
         );
     }
 }

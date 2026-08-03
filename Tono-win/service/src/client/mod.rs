@@ -362,6 +362,31 @@ pub fn is_ipc_path_exists() -> bool {
     Path::new(IPC_PATH).exists()
 }
 
+/// Liveness probe: prove a verified transport can be built, and drop it again.
+///
+/// The client itself is deliberately never handed out (see [`connect_with_max_retries`]) — on
+/// Windows its connect is synchronous, so a client living on an arbitrary runtime would carry
+/// that hazard with it. Building and dropping one inside [`run_ipc_request`] answers "is the
+/// Service reachable" without exporting the hazard.
+pub async fn connect() -> Result<()> {
+    run_ipc_request(call_guard(Some(STATUS_TIMEOUT)), || async {
+        connect_with_max_retries(Some(READ_REQUEST_ATTEMPTS))
+            .await
+            .map(drop)
+    })
+    .await
+}
+
+/// Integration-test transport for the `/__test/*` routes, which have no typed wrapper.
+///
+/// Test-gated on purpose: this hands out the client the production API deliberately does not,
+/// and it is sound only because the integration suite runs on unix sockets where the connect is
+/// not synchronous. It must never become reachable from a shipping build.
+#[cfg(feature = "test")]
+pub async fn test_client() -> Result<IpcHttpClient> {
+    connect_with_max_retries(Some(READ_REQUEST_ATTEMPTS)).await
+}
+
 pub async fn get_version() -> Result<Response<ProtocolInfo>> {
     run_ipc_request(call_guard(Some(STATUS_TIMEOUT)), get_version_inner).await
 }

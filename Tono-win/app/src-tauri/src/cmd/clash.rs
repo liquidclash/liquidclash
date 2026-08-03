@@ -105,12 +105,16 @@ pub async fn apply_dns_config(apply: bool) -> CmdResult {
 
 /// 检查DNS配置文件是否存在
 #[tauri::command]
-pub fn check_dns_config_exists() -> CmdResult<bool> {
+pub async fn check_dns_config_exists() -> CmdResult<bool> {
     use crate::utils::dirs;
+    use tokio::fs;
 
     let dns_path = dirs::app_home_dir().stringify_err()?.join(constants::files::DNS_CONFIG);
 
-    Ok(dns_path.exists())
+    // `Path::exists` is a synchronous stat, and %APPDATA% can be redirected to a UNC share where
+    // a stat blocks on the redirector. As a sync command that stat ran on the Tauri main thread;
+    // `try_exists` puts it on the blocking pool like every other read in this module.
+    fs::try_exists(&dns_path).await.stringify_err()
 }
 
 /// 获取DNS配置文件内容

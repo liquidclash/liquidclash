@@ -5,7 +5,7 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     AuthenticatedRequest, IpcCommand, MacosProxyConfig, OwnerSessionProof, RuntimeBundle,
-    ServiceErrorCode, ServiceOperationKind, StartClashRequest, StartClashResult, connect,
+    ServiceErrorCode, ServiceOperationKind, StartClashRequest, StartClashResult, test_client,
     get_status, run_ipc_server, set_system_proxy, start_clash, stop_clash, stop_ipc_server,
 };
 use serde::Deserialize;
@@ -19,7 +19,7 @@ struct WireResponse<T> {
 
 #[cfg(unix)]
 async fn proxy_barrier_post(action: &str) -> Result<()> {
-    let client = connect().await?;
+    let client = test_client().await?;
     let response = client
         .post(&format!("/__test/proxy-barrier/{action}"))
         .send()
@@ -34,7 +34,7 @@ async fn proxy_barrier_post(action: &str) -> Result<()> {
 
 #[cfg(unix)]
 async fn proxy_barrier_wait(event: &str) -> Result<()> {
-    let client = connect().await?;
+    let client = test_client().await?;
     let response = client
         .get(&format!("/__test/proxy-barrier/{event}"))
         .send()
@@ -94,7 +94,7 @@ async fn client_uses_versioned_session_aware_proxy_lifecycle() -> Result<()> {
     );
     assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
 
-    let client = connect().await?;
+    let client = test_client().await?;
     let payload = serde_json::to_value(AuthenticatedRequest {
         credentials,
         payload: StartClashRequest {

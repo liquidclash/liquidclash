@@ -13,6 +13,10 @@
 //! core; the twenty-seven items the halves lend each other stay inside.
 
 mod assets;
+/// Only Windows starts a core through the digest gate today, but the rule it encodes is pure and
+/// is checked on every platform's test run.
+#[cfg(any(windows, test))]
+mod core_integrity;
 mod staging;
 
 pub(crate) use assets::{PreparedRuntime, prepare_runtime};

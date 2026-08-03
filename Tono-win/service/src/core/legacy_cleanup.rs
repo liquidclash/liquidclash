@@ -1,8 +1,21 @@
 use crate::ServiceErrorCode;
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::paths::service_paths;
+use std::time::Duration;
 #[cfg(unix)]
 use tracing::{info, warn};
+
+/// The walk's own budget, spent inside the blocking worker.
+///
+/// The walk is over `owner.app_data_root` — a client-supplied tree — so it stops itself rather
+/// than relying on the caller abandoning it: an abandoned walk keeps deleting.
+#[cfg(windows)]
+const LEGACY_CLEANUP_BUDGET: Duration = Duration::from_secs(15);
+/// The caller's backstop, for a root that stops answering mid-syscall and never reaches its own
+/// budget check. Cleanup is best-effort housekeeping: this runs at the tail of StartClash while
+/// `OWNER_LIFECYCLE_LOCK` is held, so an unbounded wait here is an armed machine with no
+/// reachable disconnect. Leaving the marker unwritten simply retries on the next start.
+const LEGACY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) async fn cleanup_legacy_owner_files(
     owner: &AuthenticatedOwner,
@@ -25,26 +38,46 @@ pub(crate) async fn cleanup_legacy_owner_files(
         };
         if uid != 0 {
             let root = owner.app_data_root.clone();
-            tokio::task::spawn_blocking(move || cleanup_root_owned_entries(&root))
-                .await
-                .map_err(|error| cleanup_error(format!("legacy cleanup task failed: {error}")))??;
+            await_bounded(tokio::task::spawn_blocking(move || {
+                cleanup_root_owned_entries(&root)
+            }))
+            .await?;
         }
     }
 
     #[cfg(windows)]
     {
         let root = owner.app_data_root.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::core::windows_legacy_cleanup::cleanup_system_owned_entries(&root)
-        })
-        .await
-        .map_err(|error| cleanup_error(format!("legacy cleanup task failed: {error}")))??;
+        await_bounded(tokio::task::spawn_blocking(move || {
+            crate::core::windows_legacy_cleanup::cleanup_system_owned_entries(
+                &root,
+                LEGACY_CLEANUP_BUDGET,
+            )
+        }))
+        .await?;
     }
 
     tokio::fs::write(&marker, b"ok\n")
         .await
         .map_err(|error| cleanup_error(format!("failed to persist cleanup marker: {error}")))?;
     Ok(())
+}
+
+/// Wait for one cleanup walk, but never longer than [`LEGACY_CLEANUP_TIMEOUT`].
+///
+/// The task is not cancelled on expiry — a blocking worker cannot be — but the caller stops
+/// waiting, which is what matters: the marker stays unwritten, the caller logs, and the lifecycle
+/// lock is released on schedule.
+async fn await_bounded(
+    task: tokio::task::JoinHandle<Result<(), ServiceError>>,
+) -> Result<(), ServiceError> {
+    match tokio::time::timeout(LEGACY_CLEANUP_TIMEOUT, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(cleanup_error(format!("legacy cleanup task failed: {error}"))),
+        Err(_) => Err(cleanup_error(
+            "legacy cleanup did not finish before its deadline; it will be retried",
+        )),
+    }
 }
 
 #[cfg(unix)]

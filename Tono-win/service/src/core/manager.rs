@@ -173,6 +173,16 @@ impl ChildGuard {
     }
 
     async fn kill_now(&mut self) -> Result<()> {
+        // An unconfirmed kill cannot be produced with a real child off Windows: SIGKILL always
+        // lands, and tokio answers `start_kill` on an already-reaped child with `Ok`. Without a
+        // seam the retry's fail-closed branch — the one that keeps a possibly-live core tracked
+        // and tells the caller the stop did not happen — would be untestable, and an untestable
+        // branch is how the self-deadlock this retry now avoids survived in the first place.
+        #[cfg(test)]
+        if tests::kill_failure_is_simulated() {
+            anyhow::bail!("simulated: core termination could not be confirmed");
+        }
+
         for reader in self.readers.drain(..) {
             reader.abort();
         }
@@ -384,6 +394,20 @@ pub struct CoreManager {
     failed_child: Arc<Mutex<Option<ChildGuard>>>,
 }
 
+/// Identifies one core process instance, for callers that must notice a core replaced underneath
+/// them.
+///
+/// The pid alone is not an identity. Windows hands pids out of a free list, so a core that died
+/// and was restarted inside one staging window can come back wearing the pid its caller sampled,
+/// and a check keyed on the pid alone would confirm an instance that no longer exists. `restarts`
+/// only ever grows for the life of the manager, so the pair differs across every watchdog restart
+/// even when the pid does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CoreInstanceId {
+    pub(super) pid: u32,
+    pub(super) restarts: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct CoreStatusSnapshot {
     pub(super) core_pid: Option<u32>,
@@ -423,24 +447,30 @@ impl CoreManager {
         }
     }
 
-    /// The pid and configuration of the core currently running, if one is.
+    /// The identity and configuration of the core currently running, if one is.
     ///
     /// Staging is defined relative to a live core: it writes into the generation that core was
     /// started in and reasons about the binary it was started from. Both facts live only here,
     /// which is why the decision to stage or to restart cannot be made by the client.
     ///
-    /// The pid is read *after* the configuration guard is held, and it is returned alongside the
-    /// configuration rather than merely checked. The watchdog clears it from a task that holds no
-    /// lock, so reading it first would let this hand back the configuration of a core that had
-    /// already died; and the caller needs the value itself in order to notice a core replaced
-    /// underneath it later on.
-    pub(super) async fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
+    /// The pid is read *after* the configuration guard is held, and the identity is returned
+    /// alongside the configuration rather than merely checked. The watchdog clears it from a task
+    /// that holds no lock, so reading it first would let this hand back the configuration of a core
+    /// that had already died; and the caller needs the value itself in order to notice a core
+    /// replaced underneath it later on.
+    pub(super) async fn running_core_config(&self) -> Option<(CoreInstanceId, ClashConfig)> {
         let config = self.running_config.lock().await;
+        // Acquire pairs with the watchdog's Release store of the pid. The watchdog publishes the
+        // pid last, so a reader that sees a pid is guaranteed to see the restart count belonging
+        // to the same instance rather than the previous one's.
         let pid = self.running_pid.load(Ordering::Acquire);
         if pid == 0 {
             return None;
         }
-        config.clone().map(|config| (pid, config))
+        let restarts = self.restart_count.load(Ordering::Relaxed);
+        config
+            .clone()
+            .map(|config| (CoreInstanceId { pid, restarts }, config))
     }
 
     pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
@@ -558,13 +588,33 @@ impl CoreManager {
 
         let watchdog_result = self.stop_watchdog().await;
         let mut recovered_failed_child = false;
-        if let Some(mut child_guard) = self.failed_child.lock().await.take() {
+        // One guard for the whole retry, mutated in place. `failed_child` is a `tokio::sync::Mutex`
+        // and tokio mutexes are not reentrant, so this must never take the child out under one
+        // guard and put it back under another: written as
+        // `if let Some(g) = self.failed_child.lock().await.take()`, the scrutinee's guard stays
+        // alive for the entire then-block under edition 2024 (only the `else` block sees it
+        // dropped early), so re-locking inside that block parks the task on a guard it is itself
+        // holding. `stop_core` runs with CORE_MANAGER and OWNER_LIFECYCLE_LOCK held, so that park
+        // is permanent and takes every mutating route down with it — ReleaseKillSwitch included,
+        // which is the difference between a failed stop and an undisarmable machine.
+        //
+        // Holding the guard across `kill_now` is safe in a way re-locking is not: nothing is
+        // acquired underneath it, so it is a leaf and cannot join a cycle, the wait is bounded by
+        // `CORE_TERMINATION_TIMEOUT`, and the only other writers of this slot (`start_core` and the
+        // watchdog, already joined above) are excluded by CORE_MANAGER — which also means the
+        // child can no longer be lost to a concurrent store while it is out of the slot.
+        let mut failed_child = self.failed_child.lock().await;
+        if let Some(child_guard) = failed_child.as_mut() {
             if let Err(error) = child_guard.kill_now().await {
-                *self.failed_child.lock().await = Some(child_guard);
+                // Unconfirmed dead, so it stays tracked for a later attempt, and the caller is
+                // told the stop did not happen.
                 return Err(error.context("failed to retry termination of tracked core"));
             }
+            // Proven dead: drop the guard rather than keep retrying a process that is gone.
+            *failed_child = None;
             recovered_failed_child = true;
         }
+        drop(failed_child);
         if !recovered_failed_child {
             watchdog_result?;
         }
@@ -780,12 +830,19 @@ impl CoreManager {
                                 recovery_exhausted = true;
                                 break 'watchdog;
                             }
-                            running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
-                            *start_time_arc.lock().await = Some(Instant::now());
+                            // The pid is published last, and with Release, because it is what
+                            // `running_core_config` gates on: everything written above is then
+                            // visible to any reader that observed this instance's pid. Bumping the
+                            // restart count afterwards would let a caller sample a recycled pid
+                            // beside the previous instance's count and conclude nothing had
+                            // changed. Until the store lands, readers see the zero written when
+                            // the old core died, which they already treat as "no core".
                             let now_secs = unix_timestamp_secs();
+                            *start_time_arc.lock().await = Some(Instant::now());
                             started_at_arc.store(now_secs, Ordering::Relaxed);
                             restart_count_arc.fetch_add(1, Ordering::Relaxed);
                             last_recovery_at_arc.store(now_secs, Ordering::Relaxed);
+                            running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
                             consecutive_attempt += 1;
                             info!(
                                 "Core restarted successfully (attempt #{})",
@@ -823,11 +880,18 @@ impl CoreManager {
     }
 
     async fn stop_watchdog(&self) -> Result<()> {
-        if let Some(shutdown_tx) = self.watchdog_shutdown.lock().await.take() {
+        // Both slots are emptied in their own statement, so the guard dies with the statement
+        // rather than living on inside the block below it. Under edition 2024 an `if let` keeps its
+        // scrutinee's temporary alive for the whole then-block, and the second block below waits
+        // on a join, a task abort and a process termination — none of which may run while a
+        // non-reentrant lock this task holds is still standing.
+        let shutdown_tx = self.watchdog_shutdown.lock().await.take();
+        if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(());
         }
 
-        if let Some(mut handle) = self.watchdog_handle.lock().await.take() {
+        let watchdog_handle = self.watchdog_handle.lock().await.take();
+        if let Some(mut handle) = watchdog_handle {
             match tokio::time::timeout(WATCHDOG_JOIN_TIMEOUT, &mut handle).await {
                 Ok(joined) => {
                     joined.context("watchdog task failed to join")??;
@@ -1303,13 +1367,57 @@ pub static LOGGER_MANAGER: Lazy<Arc<AsyncLogger>> = Lazy::new(|| Arc::new(AsyncL
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{CoreManager, prepare_core_ipc_socket, secure_core_ipc_socket};
+    use super::{ChildGuard, CoreManager, prepare_core_ipc_socket, secure_core_ipc_socket};
     use crate::core::state::core_lifecycle_state;
     use crate::core::structure::{ClashConfig, CoreConfig, ServiceLifecycleState};
     use crate::{OwnerIdentity, WriterConfig};
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Stdio;
     use std::time::Duration;
+
+    /// A guard whose `kill_now` is guaranteed to fail, without needing a process that ignores
+    /// termination. Tokio refuses to kill a child it has already reaped, which is the same shape of
+    /// failure as the real one: a kill the service cannot confirm.
+    static SIMULATE_KILL_FAILURE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Whether `kill_now` should report an unconfirmed kill; see the seam in `kill_now`.
+    pub(super) fn kill_failure_is_simulated() -> bool {
+        SIMULATE_KILL_FAILURE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Guard that resets the seam even if the test panics, so one failure cannot cascade.
+    struct SimulatedKillFailure;
+
+    impl SimulatedKillFailure {
+        fn arm() -> Self {
+            SIMULATE_KILL_FAILURE.store(true, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for SimulatedKillFailure {
+        fn drop(&mut self) {
+            SIMULATE_KILL_FAILURE.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A child that is already reaped. Note this does NOT make `kill_now` fail — tokio answers
+    /// `start_kill` on a finished child with `Ok` — so the failure itself comes from the seam.
+    async fn reaped_guard() -> anyhow::Result<ChildGuard> {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        child.wait().await?;
+        Ok(ChildGuard {
+            child: Some(child),
+            readers: Vec::new(),
+        })
+    }
 
     #[tokio::test]
     #[serial]
@@ -1374,6 +1482,50 @@ mod tests {
         // A start that failed without leaving a core must not stay parked at Starting.
         assert_eq!(core_lifecycle_state(), ServiceLifecycleState::Running);
         std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_retry_termination_returns_instead_of_waiting_on_its_own_guard()
+    -> anyhow::Result<()> {
+        let manager = CoreManager::new();
+        let _simulated = SimulatedKillFailure::arm();
+        *manager.failed_child.lock().await = Some(reaped_guard().await?);
+
+        // The timeout is the assertion. `stop_core` runs under CORE_MANAGER and the owner
+        // lifecycle lock, so a self-deadlock here does not merely hang this call: it wedges every
+        // mutating route, kill-switch release included, for the life of the service.
+        let result = tokio::time::timeout(Duration::from_secs(5), manager.stop_core())
+            .await
+            .expect("stop_core must return rather than re-lock a mutex this task already holds");
+
+        let error = result.expect_err("a kill that could not be confirmed is not a stop");
+        assert!(
+            format!("{error:#}").contains("failed to retry termination of tracked core"),
+            "{error:#}"
+        );
+        assert!(
+            manager.failed_child.lock().await.is_some(),
+            "a core that may still be alive stays tracked for a later attempt"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_confirmed_kill_stops_tracking_the_child() -> anyhow::Result<()> {
+        let manager = CoreManager::new();
+        // No process left to kill, so `kill_now` succeeds — the other half of the retry's
+        // contract, which the deadlock fix must not have turned into a permanent retry.
+        *manager.failed_child.lock().await = Some(ChildGuard {
+            child: None,
+            readers: Vec::new(),
+        });
+
+        manager.stop_core().await?;
+
+        assert!(manager.failed_child.lock().await.is_none());
         Ok(())
     }
 }

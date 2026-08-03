@@ -453,8 +453,9 @@ fn delete_filter_if_exists(engine: &Engine, key: Guid) -> Result<()> {
 struct AppId(*mut FWP_BYTE_BLOB);
 
 impl AppId {
-    /// `None` when no app-scoped rule is needed or no path is recorded (emergency intent) —
-    /// the caller then skips app-id filters, which fails closed, never open.
+    /// `None` when no path is recorded (emergency intent). That is only benign while the plan
+    /// contains no app-scoped rule; `install` turns it into the fail-closed fallback otherwise,
+    /// because a null blob would abort the transaction that carries the block itself.
     fn resolve(path: &str) -> Result<Option<Self>> {
         if path.is_empty() {
             return Ok(None);
@@ -485,6 +486,69 @@ impl Drop for AppId {
     }
 }
 
+/// Absolute deadline for one enumeration loop, checked between pages. Enumerating a whole
+/// engine is milliseconds when it is healthy, and this sits well inside the facade's per-call
+/// budget (`WFP_CALL_TIMEOUT`, 25 s): the blocking thread therefore terminates — and releases
+/// the facade's single-writer claim, which only that thread can release — before its caller
+/// gives up on the answer.
+const ENUM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Hard cap on the entries one enumeration may return. Every provider's filters on a real
+/// machine amount to a few thousand; 2^18 is far beyond that and still finite, so an engine
+/// that keeps handing back pages — or hands back the same page forever — cannot keep this
+/// thread inside the loop for the life of the process.
+const ENUM_MAX_ENTRIES: usize = 262_144;
+
+/// The bound on one `Fwpm*Enum0` loop: an absolute deadline and an entry cap.
+///
+/// Those loops stop only when the engine reports zero entries, so without this a single
+/// misbehaving enumeration is permanent, not merely slow: the caller's budget abandons the
+/// *answer* but deliberately leaves the in-flight claim standing until this thread returns, and
+/// every later WFP operation — arm, lock, verify, release, emergency disarm — is then refused
+/// until the process restarts.
+///
+/// Exceeding either bound is an error, never a short result. A truncated enumeration read as
+/// "these are all our filters" would make the install diff delete filters that are still live,
+/// or make the residual check report a clean machine that is in fact still blocked.
+struct EnumBudget {
+    what: &'static str,
+    /// The start, not a precomputed deadline: `Instant::elapsed` cannot panic, whereas
+    /// `Instant` arithmetic can.
+    started_at: std::time::Instant,
+    seen: usize,
+}
+
+impl EnumBudget {
+    fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            started_at: std::time::Instant::now(),
+            seen: 0,
+        }
+    }
+
+    /// Charge one returned page. Called after the page has been consumed and freed, so an
+    /// over-budget enumeration cannot leak the engine allocation it was reading.
+    fn charge(&mut self, returned: u32) -> Result<()> {
+        self.seen = self.seen.saturating_add(returned as usize);
+        if self.seen > ENUM_MAX_ENTRIES {
+            bail!(
+                "{} returned more than {ENUM_MAX_ENTRIES} entries without finishing; the result \
+                 is incomplete and is discarded rather than treated as the full set",
+                self.what
+            );
+        }
+        if self.started_at.elapsed() >= ENUM_DEADLINE {
+            bail!(
+                "{} did not finish within {ENUM_DEADLINE:?} ({} entries so far); the result is \
+                 incomplete and is discarded rather than treated as the full set",
+                self.what,
+                self.seen
+            );
+        }
+        Ok(())
+    }
+}
+
 /// A Tono filter found in the engine: its key and the sublayer it lives in (needed by the
 /// legacy sweep, which must empty a foreign sublayer before deleting it).
 struct FilterInfo {
@@ -497,6 +561,9 @@ struct FilterInfo {
 /// so a rule left by an older build on a layer or in a sublayer the current model no longer
 /// uses is still found for reconciliation and the emergency sweep. No other provider's
 /// objects are ever collected.
+///
+/// Bounded by [`EnumBudget`] and all-or-nothing: callers diff against this list and delete what
+/// is missing from it, so a partial answer is returned as an error, never as a short `Vec`.
 fn enumerate_our_filters(engine: &Engine) -> Result<Vec<FilterInfo>> {
     let mut filters = Vec::new();
     let mut enum_handle = std::ptr::null_mut();
@@ -505,6 +572,7 @@ fn enumerate_our_filters(engine: &Engine) -> Result<Vec<FilterInfo>> {
         unsafe { FwpmFilterCreateEnumHandle0(engine.0, std::ptr::null(), &mut enum_handle) };
     check(status, "FwpmFilterCreateEnumHandle0")?;
     let result = (|| -> Result<()> {
+        let mut budget = EnumBudget::new("FwpmFilterEnum0 (Tono filter enumeration)");
         loop {
             let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
             let mut returned = 0_u32;
@@ -513,6 +581,11 @@ fn enumerate_our_filters(engine: &Engine) -> Result<Vec<FilterInfo>> {
                 unsafe { FwpmFilterEnum0(engine.0, enum_handle, 128, &mut entries, &mut returned) };
             check(status, "FwpmFilterEnum0")?;
             if returned == 0 {
+                // Free the empty page too: the zero-count call is how *every* enumeration
+                // ends, so skipping it would leak one engine allocation per install, residual
+                // check and legacy sweep. `free_block` ignores a null pointer.
+                // SAFETY: `entries` is null or the engine-allocated array from the call above.
+                unsafe { free_block(entries) };
                 break;
             }
             for index in 0..returned as isize {
@@ -539,6 +612,7 @@ fn enumerate_our_filters(engine: &Engine) -> Result<Vec<FilterInfo>> {
             }
             // SAFETY: `entries` is the engine-allocated array from the call above.
             unsafe { free_block(entries) };
+            budget.charge(returned)?;
         }
         Ok(())
     })();
@@ -565,6 +639,7 @@ fn enumerate_our_sublayer_keys(engine: &Engine) -> Result<Vec<Guid>> {
         unsafe { FwpmSubLayerCreateEnumHandle0(engine.0, std::ptr::null(), &mut enum_handle) };
     check(status, "FwpmSubLayerCreateEnumHandle0")?;
     let result = (|| -> Result<()> {
+        let mut budget = EnumBudget::new("FwpmSubLayerEnum0 (Tono sublayer enumeration)");
         loop {
             let mut entries: *mut *mut FWPM_SUBLAYER0 = std::ptr::null_mut();
             let mut returned = 0_u32;
@@ -574,6 +649,9 @@ fn enumerate_our_sublayer_keys(engine: &Engine) -> Result<Vec<Guid>> {
             };
             check(status, "FwpmSubLayerEnum0")?;
             if returned == 0 {
+                // As for filters: free the terminating empty page as well.
+                // SAFETY: `entries` is null or the engine-allocated array from the call above.
+                unsafe { free_block(entries) };
                 break;
             }
             for index in 0..returned as isize {
@@ -594,6 +672,7 @@ fn enumerate_our_sublayer_keys(engine: &Engine) -> Result<Vec<Guid>> {
             }
             // SAFETY: engine-allocated array from the call above.
             unsafe { free_block(entries) };
+            budget.charge(returned)?;
         }
         Ok(())
     })();
@@ -729,8 +808,15 @@ pub(crate) fn install(expected: &[FilterSpec], app_path: &str) -> Result<()> {
         .iter()
         .any(|spec| spec.conditions.contains(&Condition::AleAppId));
     let app_id = if needs_app_id {
-        match AppId::resolve(app_path) {
-            Ok(app_id) => app_id,
+        // `Ok(None)` (no recorded path) is as fatal as a resolve failure once the plan actually
+        // contains an app-scoped rule, and it must take the same fail-closed fallback: handing
+        // `apply_plan` a null blob makes `build_condition` bail *inside* the transaction, which
+        // aborts the whole commit — the block-all floor included — and leaves the machine fully
+        // open while the intent still says wanted. Collapse it into the error case here.
+        match AppId::resolve(app_path).and_then(|resolved| {
+            resolved.context("no staged core path is recorded for the app-scoped permit")
+        }) {
+            Ok(app_id) => Some(app_id),
             Err(error) => {
                 // Fail closed: install everything except the app-scoped permits so the block
                 // is live, then surface why the endpoint permit is missing. The watchdog will

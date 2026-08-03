@@ -353,11 +353,18 @@ fn windows_cleanup() -> CleanupOutcome {
 /// a daemon may be alive that could still be arming them.
 #[cfg(windows)]
 fn windows_recovery_state_present() -> bool {
+    // `Path::exists()` collapses ACCESS_DENIED and SHARING_VIOLATION into `false`, which would
+    // turn an unreadable artifact into a fail-open "nothing to clean up" on the one signal that
+    // guards the irreversible half of the uninstall. Anything but a proven absence means present.
+    fn may_exist(path: &std::path::Path) -> bool {
+        path.try_exists().unwrap_or(true)
+    }
+
     let paths = clash_verge_service_ipc::service_paths();
     let state = paths.persistent_state_dir();
-    state.join("kill-switch.json").exists()
-        || state.join("protected-dns.json").exists()
-        || paths.pid_file_path().exists()
+    may_exist(&state.join("kill-switch.json"))
+        || may_exist(&state.join("protected-dns.json"))
+        || may_exist(&paths.pid_file_path())
 }
 
 /// Best-effort binary removal; runs only after the disarm was proven (or nothing was armed),

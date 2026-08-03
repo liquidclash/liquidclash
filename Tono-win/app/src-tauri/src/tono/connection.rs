@@ -73,6 +73,12 @@ const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// the absolute deadline and look like a hang/failure even when the backend was still making
 /// progress. 120 s keeps UI bounded while matching cold first-connect reality.
 const CONNECT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(120);
+/// The redacted runtime copy is a diagnostics convenience, but it lands under `%APPDATA%`,
+/// which enterprise policy can redirect to a UNC share or a sync-provider placeholder folder.
+/// `OpenOptions::open`/`write_all` then have no timeout of their own, so an offline share can
+/// park the write for minutes. Bound it well under the transaction budget: a diagnostics file
+/// must never be the reason a connect spends its clock.
+const REDACTED_COPY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// UI budget for an explicit release. The ordered DNS → Core → WFP sequence runs in a detached
 /// reconciliation task, so reaching this budget stops waiting but never cancels a safety step.
 const EXPLICIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -257,7 +263,7 @@ async fn attempt_inner(state: &Arc<TonoState>, app: &AppHandle) -> Attempt {
             if inner.connect_generation != generation {
                 return Attempt::Stale;
             }
-            return Attempt::GuardRejected("a connection transition is already in flight".to_string());
+            return Attempt::GuardRejected(TRANSITION_IN_FLIGHT_REJECTION.to_string());
         }
         // F3: a fresh attempt resets the step record and clears the last
         // failure details (retry bookkeeping persists across attempts).
@@ -340,13 +346,13 @@ async fn guard_snapshot(
     }
     let status = inner.fsm.status();
     if status.is_connecting || status.is_connected || status.is_disconnecting {
-        return Err("a connection transition is already in flight".to_string());
+        return Err(TRANSITION_IN_FLIGHT_REJECTION.to_string());
     }
     if inner.catalog_requires_choice {
         return Err("the selected node left the catalog; pick a server again".to_string());
     }
     if inner.nodes.is_empty() {
-        return Err("the exit catalog is not available yet".to_string());
+        return Err(CATALOG_NOT_READY_REJECTION.to_string());
     }
     let selected = inner
         .selected_node
@@ -373,6 +379,10 @@ pub const SERVICE_BUSY_PREFIX: &str = "TONO_SERVICE_BUSY";
 /// Disconnect/Sign-out/Quit release is still finishing. Connect must wait — racing would let
 /// a late release tear down a fresh StartClash (the P0 fixed in the final review).
 pub const RELEASE_RECONCILING_PREFIX: &str = "TONO_RELEASE_RECONCILING";
+/// The two guard rejections that clear on their own; see [`guard_rejection_is_transient`].
+/// Named so the classifier and the sites that produce them cannot drift apart.
+const TRANSITION_IN_FLIGHT_REJECTION: &str = "a connection transition is already in flight";
+const CATALOG_NOT_READY_REJECTION: &str = "the exit catalog is not available yet";
 /// Installed Service is below protocol revision 9 (Test 5 or older).
 pub const SERVICE_TOO_OLD_PREFIX: &str = "TONO_SERVICE_TOO_OLD";
 /// The Service's WFP engine call did not return inside its budget — the Base Filtering Engine
@@ -447,9 +457,12 @@ async fn ensure_service_ready() -> Result<(), String> {
         .await
         .map_err(|err| map_service_ready_error(&err))?;
     match service::tono_probe_kill_switch_release_support().await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!(
-            "{SERVICE_TOO_OLD_PREFIX}: Tono Service is too old for this App (protocol revision below the system-safety floor); reinstall/repair the Tono Service from this installer"
+        Ok(None) => Ok(()),
+        // The detail carries both sides' epoch/revision. The old wording asserted "too old",
+        // which `supports_client` cannot actually distinguish — it rejects a *newer* Service
+        // just as flatly — so a mismatched pair used to be told to reinstall the wrong half.
+        Ok(Some(detail)) => Err(format!(
+            "{SERVICE_TOO_OLD_PREFIX}: Tono Service protocol does not match this App ({detail}); reinstall/repair the Tono Service from this installer"
         )),
         Err(err) => Err(format!("cannot query the Tono Service protocol: {err}")),
     }
@@ -534,7 +547,18 @@ async fn run_stages(
     let secret = generate_controller_secret();
     let runtime =
         build_owned_runtime_with_ports(nodes, &node.name, &secret, None, runtime_ports).map_err(StageFailure::error)?;
-    write_redacted_copy(state, &runtime.redacted_yaml()).await;
+    // Under the transaction like every other stage on this path. `apply_cloud_policy`'s copy is
+    // already covered because that whole stage runs inside a `wait`; this one was the only
+    // uncovered await in `run_stages`, and an %APPDATA% redirected to an offline share parks it
+    // where the 120 s budget cannot reach — Connecting forever, every retry then rejected as
+    // "already connecting". The write itself never fails the connect (see `write_redacted_copy`),
+    // so this wait only trips when the budget was already spent.
+    transaction
+        .wait(
+            "writing redacted runtime copy",
+            write_redacted_copy(state, &runtime.redacted_yaml()),
+        )
+        .await?;
     let bundle = RuntimeBundle {
         yaml: runtime.yaml().to_string(),
         assets: Vec::new(),
@@ -569,7 +593,7 @@ async fn run_stages(
             // A disconnect/switch bumped us while the StartClash IPC was in
             // flight; it cannot be retracted. Patch the late arm (H-1).
             drop(inner);
-            return Err(stale_after_arm(state).await);
+            return Err(stale_after_arm(state, generation).await);
         }
         inner.fsm.mark_kill_switch_armed();
         inner.controller_secret = Some(secret.clone());
@@ -626,7 +650,7 @@ async fn run_stages(
         )
         .await??;
     if state.lock().await.connect_generation != generation {
-        return Err(stale_after_dns(state).await);
+        return Err(stale_after_dns(state, generation).await);
     }
     transaction
         .wait("fake-IP verification", verify_fake_ip())
@@ -661,7 +685,7 @@ async fn run_stages(
         let mut inner = state.lock().await;
         if inner.connect_generation != generation {
             drop(inner);
-            return Err(stale_after_arm(state).await);
+            return Err(stale_after_arm(state, generation).await);
         }
         inner.kill_switch = Some(kill_status);
         inner.fsm.mark_session_verified();
@@ -722,7 +746,7 @@ async fn start_core_cancellation_safe(
             .await
             .map_err(StageFailure::error)?;
         if task_state.lock().await.connect_generation != generation {
-            return Err(stale_after_arm(&task_state).await);
+            return Err(stale_after_arm(&task_state, generation).await);
         }
         Ok(())
     });
@@ -745,7 +769,7 @@ async fn enable_dns_cancellation_safe(state: &Arc<TonoState>, generation: u64) -
             .await
             .map_err(StageFailure::error)?;
         if task_state.lock().await.connect_generation != generation {
-            return Err(stale_after_dns(&task_state).await);
+            return Err(stale_after_dns(&task_state, generation).await);
         }
         Ok(())
     });
@@ -772,8 +796,10 @@ pub fn stale_exit_needs_release(start_clash_committed: bool, release_intent: boo
 /// StartClash lifecycle IPC of up to ~30 s, while this patch is bounded and
 /// order-safe by construction — it runs strictly after the arm commit it
 /// patches, and is idempotent against the bumper's own release.
-async fn stale_after_arm(state: &Arc<TonoState>) -> StageFailure {
-    let release_intent = { state.lock().await.release_on_stale };
+async fn stale_after_arm(state: &Arc<TonoState>, generation: u64) -> StageFailure {
+    // Asks for the intent of the bump that retired *this* generation, not the latest one: a
+    // later non-releasing bump must not downgrade a pending release into "keep blocking".
+    let release_intent = { state.lock().await.release_intent_for(generation) };
     if stale_exit_needs_release(true, release_intent) {
         logging!(
             warn,
@@ -794,8 +820,8 @@ async fn stale_after_arm(state: &Arc<TonoState>) -> StageFailure {
 /// restore DNS while the old enable IPC is still in flight; if that enable commits afterwards,
 /// releasing WFP alone strands the machine on loopback DNS with no resolver. Node-switch
 /// invalidations deliberately keep DNS protected because their replacement transaction owns it.
-async fn stale_after_dns(state: &Arc<TonoState>) -> StageFailure {
-    let release_intent = { state.lock().await.release_on_stale };
+async fn stale_after_dns(state: &Arc<TonoState>, generation: u64) -> StageFailure {
+    let release_intent = { state.lock().await.release_intent_for(generation) };
     if release_intent {
         if let Err(error) = service::tono_restore_protected_dns().await {
             logging!(
@@ -805,7 +831,7 @@ async fn stale_after_dns(state: &Arc<TonoState>) -> StageFailure {
             );
             return StageFailure::Stale;
         }
-        return stale_after_arm(state).await;
+        return stale_after_arm(state, generation).await;
     }
     StageFailure::Stale
 }
@@ -895,6 +921,14 @@ async fn fail_connect(state: &Arc<TonoState>, app: &AppHandle, err: String) -> S
         } else if armed && !session_verified && !was_disconnecting {
             // Keep reality visible until the required full release actually succeeds.
             inner.fsm.mark_kill_switch_armed();
+            // ...and stop claiming Connecting while it runs. The predicate below deliberately
+            // skips `connect_failed` in this case (it would resolve to FullRelease and disarm
+            // before the release had actually run), which left `is_connecting` true alongside
+            // `is_protection_blocked` for the whole of `release_explicit` — up to 30 s of a UI
+            // reading "Connecting" with no transaction in flight, during which `guard_snapshot`
+            // rejected every new connect. This is the state both exit branches below converge
+            // on anyway, minus the release verdict.
+            inner.fsm.initial_release_failed();
         }
         if !was_disconnecting && (session_verified || !armed) {
             // Drives the FSM to Protected Offline (armed) or releases it
@@ -1087,6 +1121,19 @@ pub async fn schedule_reconnect(state: &Arc<TonoState>, app: &AppHandle) {
 
 /// Whether a protected reconnect may run: the barrier is up, the machine is
 /// idle in Protected Offline, and the catalog is not waiting for the user.
+/// Guard rejections that describe a moment rather than a decision.
+///
+/// `guard_snapshot`'s first check is `release_in_progress`, which is transient by construction,
+/// and its transition check clears as soon as the in-flight attempt ends. Treating either as a
+/// verdict ends the reconnect chain for good, and the machine then sits blocked in Protected
+/// Offline with no scheduled retry and nothing shown to the user. Everything else — suspended,
+/// signed out, no selection, a vanished node — needs a person, so it correctly stops the chain.
+pub fn guard_rejection_is_transient(reason: &str) -> bool {
+    reason.contains(RELEASE_RECONCILING_PREFIX)
+        || reason == TRANSITION_IN_FLIGHT_REJECTION
+        || reason == CATALOG_NOT_READY_REJECTION
+}
+
 pub fn reconnect_allowed(requires_choice: bool, status: &ConnectionStatus, kill_switch_armed: bool) -> bool {
     kill_switch_armed
         && !requires_choice
@@ -1183,7 +1230,24 @@ async fn reconnect_loop(state: Arc<TonoState>, app: AppHandle, first_delay: Dura
             }
         }
         match attempt(&state, &app).await {
-            Attempt::Connected | Attempt::GuardRejected(_) | Attempt::Stale => return,
+            Attempt::Connected | Attempt::Stale => return,
+            Attempt::GuardRejected(reason) => {
+                if !guard_rejection_is_transient(&reason) {
+                    return;
+                }
+                // The attempt never started, so this is not a connect failure: no `fail_connect`,
+                // no error shown, no retry_attempt bump. It only earns the next delay, because
+                // ending the loop here would strand the machine blocked with nothing scheduled.
+                logging!(info, Type::Service, "Tono: 自动重连被暂态守卫拒绝，稍后重试: {reason}");
+                let next = {
+                    let mut inner = state.lock().await;
+                    inner.fsm.next_reconnect_delay()
+                };
+                match next {
+                    Some(next_delay) => delay = next_delay,
+                    None => return,
+                }
+            }
             Attempt::Failed(err) => {
                 let _ = fail_connect(&state, &app, err).await;
                 let next = {
@@ -1262,7 +1326,7 @@ async fn stay_armed_after_failed_release(state: &Arc<TonoState>, app: &AppHandle
 /// stop the core, keep the kill switch armed, and wait for the user to pick
 /// a surviving node (no auto-reconnect).
 pub async fn selected_node_vanished(state: Arc<TonoState>, app: AppHandle) {
-    let active = {
+    let generation = {
         let mut inner = state.lock().await;
         let active = inner.fsm.status().is_connected || inner.fsm.status().is_connecting;
         // M2: only touch the generation, the intent bit, and the tasks when
@@ -1273,23 +1337,46 @@ pub async fn selected_node_vanished(state: Arc<TonoState>, app: AppHandle) {
             // release the barrier (H-1 intent).
             inner.invalidate_connection(false);
         }
-        active
+        active.then_some(inner.connect_generation)
     };
-    if !active {
+    let Some(generation) = generation else {
         return;
-    }
+    };
     logging!(warn, Type::Service, "Tono: 选中节点从新目录中消失，停止核心但保持封锁");
     let _ = service::tono_stop_core(false).await;
     let _ = service::tono_restrict_bootstrap().await;
 
     let mut inner = state.lock().await;
+    // Two IPCs ran with the lock released. If a disconnect / sign-out / quit took ownership in
+    // that window, its FSM state is the truth and must not be overwritten here: the
+    // `connect_failed()` below runs the failure decision table, and for an armed-but-unverified
+    // session — exactly what a *failed* release leaves behind — it resolves to FullRelease and
+    // calls `release()`, clearing `kill_switch_armed` and showing NotConnected over a barrier
+    // that is still blocking. `quit_release` would then compute `protected == false` and skip
+    // the release entirely. Leaving `stay_armed_after_failed_release`'s state alone is the same
+    // "keep the real armed state visible" treatment.
+    if inner.connect_generation != generation {
+        logging!(
+            info,
+            Type::Service,
+            "Tono: 目录消失清理已被更新的连接代际取代，保留其可见状态"
+        );
+        return;
+    }
     inner.controller_secret = None;
     inner.controller_port = None;
     let vanished_node = inner.selected_node.clone();
     if inner.fsm.status().is_connected {
         inner.fsm.tunnel_died();
     } else {
-        inner.fsm.connect_failed();
+        // `initial_release_failed`, not `connect_failed`: this teardown deliberately keeps
+        // blocking (stop_core(false) + restrict_bootstrap), but for an attempt that armed and
+        // has not yet been verified the decision table resolves `connect_failed` to a full
+        // release, which clears the armed latch while the Service is still blocking. The UI
+        // would then read notConnected over a live barrier, and Disconnect / Sign out / Quit
+        // would each compute "nothing to release" and skip it — a silent total blackout that
+        // survives app exit.
+        inner.fsm.initial_release_failed();
     }
     commands::emit_status(&app, &commands::status_of(&inner));
     drop(inner);
@@ -1323,15 +1410,33 @@ pub async fn switch_selected_node(state: Arc<TonoState>, app: AppHandle, generat
         if inner.fsm.status().is_connected {
             inner.fsm.tunnel_died();
         } else {
-            inner.fsm.connect_failed();
+            // Keep-blocking teardown: see the note in `selected_node_vanished`. A switch that
+            // interrupts an armed-but-unverified attempt must not let the decision table
+            // release the latch the Service is still enforcing.
+            inner.fsm.initial_release_failed();
         }
         commands::emit_status(&app, &commands::status_of(&inner));
     }
     // Keep the barrier up between the old and the new tunnel.
     let _ = service::tono_stop_core(false).await;
-    if let Attempt::Failed(err) = attempt(&state, &app).await {
-        let _ = fail_connect(&state, &app, err).await;
-        schedule_reconnect(&state, &app).await;
+    // The entry check above is not enough: that stop is an IPC that can take seconds, and a
+    // disconnect landing inside it owns the machine from that point on. Without this the switch
+    // would re-arm WFP and start a core after the user's release had already completed.
+    if state.lock().await.connect_generation != generation {
+        return;
+    }
+    match attempt(&state, &app).await {
+        Attempt::Failed(err) => {
+            let _ = fail_connect(&state, &app, err).await;
+            schedule_reconnect(&state, &app).await;
+        }
+        // Same reason as in `reconnect_loop`: a guard that clears on its own must leave a retry
+        // behind, or the switch ends with the machine blocked and idle.
+        Attempt::GuardRejected(reason) if guard_rejection_is_transient(&reason) => {
+            logging!(info, Type::Service, "Tono: 节点切换被暂态守卫拒绝，稍后重试: {reason}");
+            schedule_reconnect(&state, &app).await;
+        }
+        Attempt::Connected | Attempt::GuardRejected(_) | Attempt::Stale => {}
     }
 }
 
@@ -1511,21 +1616,65 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
 /// (restrict to bootstrap), rerun the full transaction.
 pub(crate) async fn handle_network_change(state: &Arc<TonoState>, app: &AppHandle) {
     logging!(warn, Type::Service, "Tono: 检测到网络或核心变化，失效 Connected 并重连");
-    {
+    // Captured under the same guard as the `is_connected` check, because that check is the
+    // *entry* condition and everything below it runs across awaits. This helper is reached from
+    // two callers and only one of them is connection-scoped: the cloud-policy sync runs inside
+    // `tasks.catalog_sync`, which is account-scoped and deliberately survives a disconnect, so
+    // `invalidate_connection` never aborts it. Without a generation, a policy revision arriving
+    // while Connected would tear the tunnel down, the user would press Disconnect during the
+    // resulting Protected Offline flash, the release would complete — and this task would then
+    // walk into `attempt` and silently re-arm WFP and restart the core with no user action.
+    // The netmon caller was protected only by accident, by `abort_network_monitor()` landing at
+    // its next await; now both are protected on purpose.
+    let generation = {
         let mut inner = state.lock().await;
         if !inner.fsm.status().is_connected {
             return;
         }
         inner.fsm.tunnel_died();
         commands::emit_status(&app, &commands::status_of(&inner));
-    }
+        inner.connect_generation
+    };
     state.audit().log(AuditEvent::ProtectedOffline {
         reason: "networkChange",
     });
     let _ = service::tono_restrict_bootstrap().await;
-    if let Attempt::Failed(err) = attempt(state, app).await {
-        let _ = fail_connect(state, app, err).await;
-        schedule_reconnect(state, app).await;
+    // Stop the core before re-attempting, like both sibling teardowns (`switch_selected_node`,
+    // `selected_node_vanished`). `restrict_bootstrap` only rewrites WFP; it leaves mihomo
+    // running, and mihomo owns loopback:53 for the whole session — the very port `run_stages`'
+    // DNS preflight binds. Without this, every sleep/wake and Wi-Fi flap burned attempt #1 on a
+    // guaranteed "DNS UDP 127.0.0.1:53 is unavailable", recorded a ConnectFail, bumped the retry
+    // counter and showed a DNS error, and only then stopped the core on the way out.
+    // `false` = keep blocking: the core goes down, the barrier stays armed.
+    let _ = service::tono_stop_core(false).await;
+    // Immediately before re-entering the transaction, and deliberately not earlier: a disconnect
+    // bumps the generation as its very first act (`invalidate_connection(true)`, before any
+    // IPC), so any release that will complete has already bumped by the time this reads. A moved
+    // generation means someone else owns the machine — exit without touching the FSM, the core
+    // or the UI, exactly like `StageFailure::Stale`.
+    {
+        let inner = state.lock().await;
+        if inner.connect_generation != generation || inner.fsm.status().is_disconnecting {
+            logging!(
+                info,
+                Type::Service,
+                "Tono: 网络变化重连已被更新的连接代际取代，交由其所有者处理"
+            );
+            return;
+        }
+    }
+    match attempt(state, app).await {
+        Attempt::Failed(err) => {
+            let _ = fail_connect(state, app, err).await;
+            schedule_reconnect(state, app).await;
+        }
+        // A transient guard (a release still reconciling, a transition still finishing) is not a
+        // verdict — without a reschedule the machine sits blocked with nothing left to retry.
+        Attempt::GuardRejected(reason) if guard_rejection_is_transient(&reason) => {
+            logging!(info, Type::Service, "Tono: 重连被暂态守卫拒绝，稍后重试: {reason}");
+            schedule_reconnect(state, app).await;
+        }
+        Attempt::Connected | Attempt::GuardRejected(_) | Attempt::Stale => {}
     }
 }
 
@@ -1605,7 +1754,7 @@ async fn set_stage(
     // `armed` marks stage boundaries past a committed StartClash: a stale
     // exit there patches the late arm (H-1).
     if armed {
-        Err(stale_after_arm(state).await)
+        Err(stale_after_arm(state, generation).await)
     } else {
         Err(StageFailure::Stale)
     }
@@ -1921,7 +2070,7 @@ async fn apply_cloud_policy(
         let mut inner = state.lock().await;
         if inner.connect_generation != generation {
             drop(inner);
-            return Err(stale_after_arm(state).await);
+            return Err(stale_after_arm(state, generation).await);
         }
         inner.controller_secret = Some(secret.clone());
         inner.controller_port = Some(controller_port);
@@ -1932,11 +2081,11 @@ async fn apply_cloud_policy(
         .await
         .map_err(StageFailure::error)?;
     if state.lock().await.connect_generation != generation {
-        return Err(stale_after_arm(state).await);
+        return Err(stale_after_arm(state, generation).await);
     }
     lock_kill_switch_with_retries().await.map_err(StageFailure::error)?;
     if state.lock().await.connect_generation != generation {
-        return Err(stale_after_arm(state).await);
+        return Err(stale_after_arm(state, generation).await);
     }
 
     state.audit().log(AuditEvent::PolicyActivated {
@@ -2204,27 +2353,75 @@ fn detect_physical_interface_windows() -> Result<String, String> {
     Ok(alias)
 }
 
+/// Open the redacted copy with the per-user DACL the rest of Tono's private files get.
+///
+/// It was the one file in the set written through plain `OpenOptions`, so it inherited whatever
+/// the parent directory grants while `selection.json` and the owner token did not — and it is
+/// the file that describes the selected node. A copy left by an earlier build fails the
+/// private-file validation on its inherited ACL; replacing it once is how those converge.
+#[cfg(windows)]
+fn open_private_redacted_copy(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let open = || crate::core::owner_identity::open_or_create_private_current_user_file(path);
+    let file = match open() {
+        Ok(file) => file,
+        Err(error) => {
+            if !path.exists() {
+                // Nothing to converge — the create itself failed, so report that.
+                return Err(std::io::Error::other(error));
+            }
+            std::fs::remove_file(path)?;
+            open().map_err(std::io::Error::other)?
+        }
+    };
+    // The helper opens without truncating; this file is always rewritten whole.
+    file.set_len(0)?;
+    Ok(file)
+}
+
 /// Persist the redacted runtime copy (§5: the secret never touches disk).
+///
+/// Never fails the connect. The copy is a diagnostics convenience — the runtime the core
+/// actually receives travels over IPC and never through this file — so refusing an otherwise
+/// healthy connect because a support artefact could not be written trades availability for
+/// nothing. Skipping is also the safe direction for §5: not writing cannot leak. It is loud in
+/// the log instead, and the timeout is reported separately from a write error so a stalled
+/// redirected AppData is diagnosable rather than looking like a permissions problem.
 async fn write_redacted_copy(state: &Arc<TonoState>, redacted: &str) {
     let path = { state.lock().await.catalog_dir.join("owned-runtime.redacted.yaml") };
-    let result = tokio::task::spawn_blocking({
+    let write = tokio::task::spawn_blocking({
         let redacted = redacted.to_string();
         move || -> std::io::Result<()> {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&path)?;
+            #[cfg(windows)]
+            let mut file = open_private_redacted_copy(&path)?;
+            #[cfg(not(windows))]
+            let mut file = {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                options.open(&path)?
+            };
             use std::io::Write as _;
             file.write_all(redacted.as_bytes())
         }
-    })
-    .await;
-    if let Err(err) = result {
-        logging!(warn, Type::Service, "Tono: 写入 redacted 运行时副本失败: {err}");
+    });
+    // Abandoning the JoinHandle cannot stop the blocking thread — a thread parked inside a UNC
+    // `open` stays parked until the redirector gives up. It commits nothing the connect depends
+    // on, so leaving it behind is safe; what matters is that this future returns.
+    match tokio::time::timeout(REDACTED_COPY_WRITE_TIMEOUT, write).await {
+        Ok(Ok(Ok(()))) => {}
+        // Previously dropped on the floor: only the JoinError was reported, so a failed write
+        // was silent.
+        Ok(Ok(Err(err))) => logging!(warn, Type::Service, "Tono: 写入 redacted 运行时副本失败: {err}"),
+        Ok(Err(err)) => logging!(warn, Type::Service, "Tono: 写入 redacted 运行时副本失败: {err}"),
+        Err(_elapsed) => logging!(
+            warn,
+            Type::Service,
+            "Tono: 写入 redacted 运行时副本超时 ({REDACTED_COPY_WRITE_TIMEOUT:?})，跳过；连接继续"
+        ),
     }
 }
 
@@ -2234,7 +2431,8 @@ mod tests {
         FailurePlan, MAX_DIRECT_ENDPOINTS, RELEASE_RECONCILING_PREFIX, SERVICE_BUSY_PREFIX,
         SERVICE_TOO_OLD_PREFIX, SelectAction, build_direct_plan, collect_ipv4_literals,
         health_threshold_reached, is_fake_ip, is_retryable_lock_error, kill_switch_unhealthy,
-        BFE_NOT_RUNNING_PREFIX, WFP_ENGINE_WEDGED_PREFIX, map_service_ready_error,
+        BFE_NOT_RUNNING_PREFIX, CATALOG_NOT_READY_REJECTION, TRANSITION_IN_FLIGHT_REJECTION,
+        WFP_ENGINE_WEDGED_PREFIX, guard_rejection_is_transient, map_service_ready_error,
         map_wfp_engine_error, plan_failure, protected_dns_unhealthy, proxy_endpoint_of,
         reconnect_allowed, retry_now_is_noop, select_action, sign_out_needs_release,
         single_flight_begin, stale_exit_needs_release, stop_core_before_release,
@@ -2568,6 +2766,24 @@ mod tests {
         // Stable prefixes used by the UI for release/protocol gates.
         assert!(RELEASE_RECONCILING_PREFIX.starts_with("TONO_"));
         assert!(SERVICE_TOO_OLD_PREFIX.starts_with("TONO_"));
+    }
+
+    #[test]
+    fn only_self_clearing_guard_rejections_keep_the_reconnect_chain_alive() {
+        // These clear without anyone doing anything, so ending the chain on them leaves the
+        // machine blocked with no scheduled retry and nothing shown.
+        assert!(guard_rejection_is_transient(&format!(
+            "{RELEASE_RECONCILING_PREFIX}: network protection release is still reconciling; wait before reconnecting"
+        )));
+        assert!(guard_rejection_is_transient(TRANSITION_IN_FLIGHT_REJECTION));
+        assert!(guard_rejection_is_transient(CATALOG_NOT_READY_REJECTION));
+        // These need a person; retrying them forever would only spin.
+        assert!(!guard_rejection_is_transient("not signed in"));
+        assert!(!guard_rejection_is_transient("account is suspended"));
+        assert!(!guard_rejection_is_transient("select a server first"));
+        assert!(!guard_rejection_is_transient(
+            "the selected node left the catalog; pick a server again"
+        ));
     }
 
     #[test]

@@ -6,12 +6,16 @@
 //! lives in spawned tasks whose abort handles are registered here.
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+/// How many retired generations keep their H-1 intent; see `TonoInner::retired_intents`.
+const RETIRED_INTENT_HISTORY: usize = 16;
 
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::KillSwitchStatus;
@@ -203,7 +207,22 @@ pub struct TonoInner {
     /// A stale attempt past a committed StartClash patches the late arm
     /// only for the releasing kind — otherwise it would disarm the barrier
     /// the switch's fresh transaction is about to own.
+    ///
+    /// Read through [`TonoInner::release_intent_for`], never directly: on its own this is a
+    /// single last-writer-wins bit, and a stale attempt returning after two bumps would read
+    /// the newer bumper's intent rather than the intent of the bump that retired *it*.
     pub release_on_stale: bool,
+    /// The same intent, recorded per retired generation.
+    ///
+    /// The global bit above is safe today only positionally: every non-releasing bumper
+    /// requires `is_connected || is_connecting`, which `begin_disconnect()` clears atomically
+    /// under the same guard, so a releasing intent cannot currently be overwritten by a later
+    /// non-releasing one. Any future bumper firing from `is_disconnecting` or
+    /// `is_protection_blocked` would silently downgrade a pending releasing intent to "keep
+    /// blocking" and strand WFP armed after a completed Disconnect. The history is short
+    /// because a stale attempt that has not returned within this many bumps lost every race it
+    /// could have won long ago.
+    retired_intents: VecDeque<(u64, bool)>,
     /// Last `core_pid` / `restart_count` seen in the Service `/status`
     /// feed (runtime crash / TUN rebuild detection, M4).
     pub last_core_pid: Option<u32>,
@@ -250,10 +269,30 @@ impl TonoInner {
     /// token cancellation already retire every other task's in-flight work at its next stage
     /// boundary.
     pub fn retire_connection_generation(&mut self, release_on_stale: bool) {
+        let retired = self.connect_generation;
         self.connect_generation = self.connect_generation.wrapping_add(1);
         self.release_on_stale = release_on_stale;
+        if self.retired_intents.len() == RETIRED_INTENT_HISTORY {
+            self.retired_intents.pop_front();
+        }
+        self.retired_intents.push_back((retired, release_on_stale));
         self.connect_cancellation.cancel();
         self.connect_cancellation = CancellationToken::new();
+    }
+
+    /// The intent of the bump that retired `generation` (H-1).
+    ///
+    /// Callers pass the generation they were *running under*, so the answer describes the bump
+    /// that made them stale rather than whatever happened most recently.
+    #[must_use]
+    pub fn release_intent_for(&self, generation: u64) -> bool {
+        self.retired_intents
+            .iter()
+            .rev()
+            .find_map(|(retired, intent)| (*retired == generation).then_some(*intent))
+            // Older than the window: fall back to the global bit, which is what every caller
+            // used to read unconditionally.
+            .unwrap_or(self.release_on_stale)
     }
 
     /// Build the on-disk catalog cache rooted at the state's directory.
@@ -329,6 +368,7 @@ impl TonoState {
                 connect_generation: 0,
                 connect_cancellation: CancellationToken::new(),
                 release_on_stale: false,
+                retired_intents: VecDeque::new(),
                 last_core_pid: None,
                 last_restart_count: None,
                 last_network_event_at: None,

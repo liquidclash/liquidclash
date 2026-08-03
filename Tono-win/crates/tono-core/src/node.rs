@@ -20,11 +20,25 @@ pub const REQUIRED_FLOW: &str = "xtls-rprx-vision";
 /// Only accepted `network` value.
 pub const REQUIRED_NETWORK: &str = "tcp";
 
-/// Node names that may never come from a catalog: the owned group name plus
-/// Mihomo built-in policy names, so a crafted node cannot hijack a rule
-/// target such as DIRECT. (Contract reserves `Tono-Exit`; the built-ins are
-/// defense in depth on top of the macOS parity set.)
-const RESERVED_NODE_NAMES: [&str; 5] = ["Tono-Exit", "DIRECT", "GLOBAL", "REJECT", "REJECT-DROP"];
+/// Node names that may never come from a catalog: every group name the owned
+/// runtime emits, plus Mihomo built-in policy names, so a crafted node cannot
+/// hijack a rule target such as DIRECT. (Contract reserves `Tono-Exit`; the
+/// built-ins are defense in depth on top of the macOS parity set.)
+///
+/// The two DIRECT group names matter as much as `Tono-Exit`: with a cloud
+/// policy in force they are emitted as `proxy-groups` entries *and* as rule
+/// targets, and Mihomo has a single proxy namespace — a catalog node sharing
+/// one of those names either breaks every connect or steers the DIRECT rules
+/// at the crafted node instead of the interface-bound group.
+const RESERVED_NODE_NAMES: [&str; 7] = [
+    "Tono-Exit",
+    crate::config::DIRECT_GROUP_NAME,
+    crate::config::WEB_DIRECT_GROUP_NAME,
+    "DIRECT",
+    "GLOBAL",
+    "REJECT",
+    "REJECT-DROP",
+];
 
 /// Reason a catalog node (or node set) was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -823,7 +837,18 @@ ws-opts: { path: /ignored }
 
     #[test]
     fn set_rejects_reserved_names() {
-        for name in ["Tono-Exit", "DIRECT", "GLOBAL", "REJECT", "REJECT-DROP"] {
+        // Every group name the owned runtime emits must be here, not just the exit group:
+        // the DIRECT groups share Mihomo's single proxy namespace whenever a cloud policy
+        // is in force.
+        for name in [
+            "Tono-Exit",
+            crate::config::DIRECT_GROUP_NAME,
+            crate::config::WEB_DIRECT_GROUP_NAME,
+            "DIRECT",
+            "GLOBAL",
+            "REJECT",
+            "REJECT-DROP",
+        ] {
             let mut node = admit_node(&passing_node()).unwrap();
             node.name = name.to_string();
             assert_eq!(

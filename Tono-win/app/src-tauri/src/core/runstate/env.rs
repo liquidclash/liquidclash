@@ -21,6 +21,8 @@ pub trait RunStateEnv: Send + Sync + 'static {
     /// "no installation" and is treated as unavailable rather than not-installed.
     ///
     /// Async so blocking systemd and Windows SCM checks can run off the runtime workers.
+    /// Callers must also bound it: getting off the workers keeps the runtime alive, but it
+    /// does not make an unanswerable registry answer. See `RunStateStore::detect_service_health`.
     fn trusted_install_evidence(&self) -> impl Future<Output = Result<bool>> + Send;
 
     /// Whether this app process is running elevated.
@@ -63,6 +65,11 @@ impl RunStateEnv for RealEnv {
     }
 
     async fn trusted_install_evidence(&self) -> Result<bool> {
+        // Windows SCM serialises `OpenSCManagerW`/`OpenServiceW` on its database lock, so a
+        // single unrelated service stuck in START_PENDING/STOP_PENDING blocks this read-only
+        // probe for as long as it is stuck. This hop keeps that off the async workers; the
+        // store bounds the wait. Unlike `run_privileged`, abandoning this JoinHandle needs no
+        // quarantine: the probe commits nothing, so a later attempt cannot race a first one.
         tokio::task::spawn_blocking(crate::core::service::trusted_service_evidence)
             .await
             .context("service registration probe did not finish")?
@@ -131,6 +138,7 @@ mod fake {
     pub struct FakeEnv {
         version_replies: Mutex<Vec<Result<ServiceVersionReply, String>>>,
         evidence: Result<bool, String>,
+        evidence_hangs: bool,
         elevated: bool,
         probe_count: Mutex<usize>,
         pac_available: Mutex<Option<bool>>,
@@ -144,6 +152,7 @@ mod fake {
             Self {
                 version_replies: Mutex::new(Vec::new()),
                 evidence: Ok(false),
+                evidence_hangs: false,
                 elevated: false,
                 probe_count: Mutex::new(0),
                 pac_available: Mutex::new(None),
@@ -191,6 +200,13 @@ mod fake {
         #[must_use]
         pub fn evidence_unavailable(mut self) -> Self {
             self.evidence = Err("registry probe failed".to_owned());
+            self
+        }
+
+        /// The platform registry never answers — a Windows SCM wedged behind its database lock.
+        #[must_use]
+        pub const fn evidence_never_answers(mut self) -> Self {
+            self.evidence_hangs = true;
             self
         }
 
@@ -272,6 +288,9 @@ mod fake {
         }
 
         async fn trusted_install_evidence(&self) -> Result<bool> {
+            if self.evidence_hangs {
+                std::future::pending::<()>().await;
+            }
             self.evidence.clone().map_err(|error| anyhow!(error))
         }
 

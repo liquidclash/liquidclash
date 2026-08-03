@@ -1,5 +1,5 @@
 use crate::core::auth::{
-    AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token,
+    AuthenticatedOwner, ServiceError, authenticate_owner_off_runtime, hash_session_token,
     ipc_request_context_to_auth_context,
 };
 use crate::core::desired::{
@@ -46,13 +46,30 @@ use tracing::{info, trace, warn};
 const IPC_MAX_RESTARTS: u32 = 10;
 const IPC_RESTART_WINDOW: Duration = Duration::from_secs(10);
 const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
-/// Generous on purpose: DNS enable/restore walk every adapter and fire a (possibly
-/// cold-start) PowerShell CIM call per adapter, with one retry each — sequential seconds per
-/// adapter on a machine with many NICs. All of these operations are idempotent and their
-/// state is inspectable through the status routes, so a slow handler is recoverable; a
-/// handler killed mid-transaction would not be. This is the [`OperationGuard`] budget for one
-/// privileged step inside a handler — the real bound on handler work — not a transport limit.
+/// How long shutdown waits for the listener task to acknowledge that it is done.
+const IPC_SHUTDOWN_DONE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The budget one privileged step *advertises*, and nothing more.
+///
+/// This value is only ever handed to [`OperationGuard::begin`], which records it as a deadline in
+/// the status snapshot ([`crate::core::operation`]). No timer reads it and nothing cancels a
+/// handler when it passes: a step that overruns is visible in `/status`, not stopped. Deliberate —
+/// a handler killed mid-transaction is worse than a slow one, and these operations are idempotent
+/// and inspectable — but do not read this constant, or the comments elsewhere that lean on it, as
+/// a bound. The real bounds are the per-call timeouts inside the subsystems (DNS/WFP engine calls,
+/// the authentication probe, the atomic replace, the cleanup walk).
+///
+/// It is generous because the work behind one step is: DNS enable/restore walk every adapter and
+/// fire a (possibly cold-start) PowerShell CIM call per adapter, with one retry each.
 const IPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounds for the rotation numbers in a client-supplied [`WriterConfig`].
+///
+/// `directory` is replaced with the owner's own log directory before use, but the rotation
+/// numbers used to reach flexi_logger — and the persisted desired state — exactly as sent:
+/// `max_log_size: 1` with a large `max_log_files` turns one authorized call into unbounded
+/// SYSTEM-side file creation on the system volume.
+const MIN_LOG_SIZE_BYTES: u64 = 64 * 1024;
+const MAX_LOG_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LOG_FILES: usize = 32;
 /// Transport-level write timeout. `kode-bridge` enforces it by dropping the handler future and
 /// answering a plain 408 — which would release the owner-lifecycle lock and the
 /// [`OperationGuard`] while detached `spawn_blocking` work (WFP transactions, PowerShell DNS
@@ -363,7 +380,17 @@ pub async fn stop_ipc_server() -> Result<()> {
     }
 
     if let Some(done) = IPC_SHUTDOWN_DONE.lock().await.take() {
-        let _ = done.await;
+        // The listener task fires this once it observes the shutdown signal — but it has to be
+        // scheduled to do so, and this runs with `IPC_LIFECYCLE_LOCK` held. If the workers are
+        // occupied, waiting here is what keeps `run_service` from ever reaching `Stopped` and
+        // SCM from ever seeing the service stop. The process is going away regardless, so give
+        // the handshake a bounded chance and then stop waiting for it.
+        if tokio::time::timeout(IPC_SHUTDOWN_DONE_TIMEOUT, done)
+            .await
+            .is_err()
+        {
+            warn!("IPC listener did not acknowledge shutdown in time; continuing teardown");
+        }
     }
 
     shutdown_ipc_server().await;
@@ -620,7 +647,11 @@ impl<T> OwnerRequestEnvelope for AuthenticatedSessionRequest<T> {
 ///
 /// This deliberately stops short of the lifecycle lock. `StartClash` validates its payload in
 /// between, and must keep doing so before it waits on a contended lock.
-fn authenticate_request<E>(
+///
+/// The authentication step is the one `await` here: it probes a client-supplied path, so it runs
+/// on a blocking worker under its own deadline rather than on one of the four runtime workers
+/// every other route also needs. The decision it returns is unchanged.
+async fn authenticate_request<E>(
     ctx: &kode_bridge::RequestContext,
 ) -> ControlFlow<Result<HttpResponse>, (E, AuthenticatedOwner)>
 where
@@ -633,7 +664,7 @@ where
         Ok(request) => request,
         Err(error) => return ControlFlow::Break(bad_request(format!("Invalid JSON: {error}"))),
     };
-    let owner = match authenticate_owner(ctx, request.credentials()) {
+    let owner = match authenticate_owner_off_runtime(ctx, request.credentials()).await {
         Ok(owner) => owner,
         Err(error) => return ControlFlow::Break(service_error(error)),
     };
@@ -696,10 +727,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::Status.as_ref(), |ctx| async move {
             trace!("Received Status command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             // Authenticated diagnostics deliberately do not join the lifecycle writer queue.
             // The aggregate carries `active_operation` and uses committed/cached subsystem
             // snapshots when a mutation is in flight.
@@ -713,7 +745,7 @@ fn create_ipc_router() -> Result<Router> {
         .get(IpcCommand::PreflightMacosKillSwitch.as_ref(), |ctx| async move {
             trace!("Received PreflightMacosKillSwitch command");
             let (_request, _owner) =
-                match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
@@ -726,18 +758,29 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetKillSwitchStatus.as_ref(), |ctx| async move {
             trace!("Received GetKillSwitchStatus command");
-            let (_request, _owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             // Status must remain readable while Start/Stop/DNS/WFP owns the lifecycle writer.
-            ok_json(windows_kill_switch::status().await)
+            let mut status = windows_kill_switch::status().await;
+            // Whether the machine is protected is not a secret from the local users who share
+            // it; which exit node it is protected *towards* is. The active-owner read is
+            // deliberately lock-free, like the rest of this route, and mirrors what `/status`
+            // already does with the core PID and uptime.
+            if require_active_owner(&owner).await.is_err() {
+                status.endpoints.clear();
+            }
+            ok_json(status)
         })
         .post(IpcCommand::LockKillSwitch.as_ref(), |ctx| async move {
             trace!("Received LockKillSwitch command");
             let (request, owner) = match authenticate_request::<
                 AuthenticatedSessionRequest<KillSwitchLockRequest>,
-            >(&ctx) {
+            >(&ctx)
+            .await
+            {
                 ControlFlow::Continue(authenticated) => authenticated,
                 ControlFlow::Break(response) => return response,
             };
@@ -761,10 +804,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .post(IpcCommand::MarkKillSwitchVerified.as_ref(), |ctx| async move {
             trace!("Received MarkKillSwitchVerified command");
-            let (request, owner) = match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             let _lifecycle_guard = match enter_owner_lifecycle(
                 &owner,
                 OwnerLifecycleGate::ActiveSession(&request.session),
@@ -787,10 +831,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .post(IpcCommand::RestrictKillSwitchBootstrap.as_ref(), |ctx| async move {
             trace!("Received RestrictKillSwitchBootstrap command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             // Do not require the active-owner/session record: the disconnect path calls this
             // after a stop has already cleared that record. The separate armed-policy owner
             // gate still runs after taking the lifecycle lock; checking it before this await
@@ -813,10 +858,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .post(IpcCommand::ReleaseKillSwitch.as_ref(), |ctx| async move {
             trace!("Received ReleaseKillSwitch command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             // Do not require the active-owner/session record: a successful stop clears the
             // record and invalidates the session, so that gate would make explicit Disconnect/
             // Sign-Out unreachable from Protected Offline. The separate armed-policy owner
@@ -858,9 +904,20 @@ fn create_ipc_router() -> Result<Router> {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        return service_unavailable(format!(
-                            "Kill switch release refused; active Core ownership could not be verified: {error:#}"
-                        ));
+                        // An unreadable ownership record proves nothing either way, and refusing
+                        // on it is what leaves an armed machine with no way back: every retry
+                        // reads the same broken file. The caller has already proved it owns the
+                        // armed policy, so take the *stronger* of the two readable outcomes —
+                        // stop and retire the Core unconditionally — and only then release. A
+                        // record that is readable and names someone else is still refused above.
+                        warn!(
+                            "Active Core ownership is unreadable; stopping and retiring the running Core before release: {error:#}"
+                        );
+                        if let Err(error) = rollback_started_owner(&owner).await {
+                            return service_unavailable(format!(
+                                "Kill switch release refused; the active Core could not be safely stopped and retired: {error:#}"
+                            ));
+                        }
                     }
                 }
             }
@@ -869,7 +926,7 @@ fn create_ipc_router() -> Result<Router> {
         .post(IpcCommand::EnableProtectedDns.as_ref(), |ctx| async move {
             trace!("Received EnableProtectedDns command");
             let (request, owner) =
-                match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx) {
+                match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx).await {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
@@ -891,10 +948,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .post(IpcCommand::RestoreProtectedDns.as_ref(), |ctx| async move {
             trace!("Received RestoreProtectedDns command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             // DNS restore must run after a stop cleared the active-owner/session record, so use
             // the armed-policy owner gate instead. It runs under the lifecycle lock to avoid
             // stale authorization.
@@ -912,17 +970,18 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetProtectedDnsStatus.as_ref(), |ctx| async move {
             trace!("Received GetProtectedDnsStatus command");
-            let (_request, _owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, _owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             // Authenticated and lock-free: the DNS watchdog/mutations publish this snapshot.
             ok_json(dns::status().await)
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
             trace!("Received StartClash command");
             let (request, owner) =
-                match authenticate_request::<AuthenticatedRequest<StartClashRequest>>(&ctx) {
+                match authenticate_request::<AuthenticatedRequest<StartClashRequest>>(&ctx).await {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
@@ -1056,10 +1115,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
             trace!("Received GetClashLogs command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             let _lifecycle_guard =
                 match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveOwner).await {
                     ControlFlow::Continue(guard) => guard,
@@ -1069,10 +1129,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetClashLogSnapshot.as_ref(), |ctx| async move {
             trace!("Received GetClashLogSnapshot command");
-            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
+            let (_request, owner) =
+                match authenticate_request::<AuthenticatedRequest<()>>(&ctx).await {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             let _lifecycle_guard =
                 match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveOwner).await {
                     ControlFlow::Continue(guard) => guard,
@@ -1092,7 +1153,9 @@ fn create_ipc_router() -> Result<Router> {
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
             trace!("Received StopClash command");
             let (request, owner) =
-                match authenticate_request::<AuthenticatedSessionRequest<StopClashPayload>>(&ctx) {
+                match authenticate_request::<AuthenticatedSessionRequest<StopClashPayload>>(&ctx)
+                    .await
+                {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
@@ -1147,7 +1210,9 @@ fn create_ipc_router() -> Result<Router> {
         .post(IpcCommand::StageRuntime.as_ref(), |ctx| async move {
             trace!("Received StageRuntime command");
             let (request, owner) =
-                match authenticate_request::<AuthenticatedSessionRequest<RuntimeBundle>>(&ctx) {
+                match authenticate_request::<AuthenticatedSessionRequest<RuntimeBundle>>(&ctx)
+                    .await
+                {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
@@ -1174,7 +1239,9 @@ fn create_ipc_router() -> Result<Router> {
         .post(IpcCommand::UpdateWriter.as_ref(), |ctx| async move {
             trace!("Received UpdateWriter command");
             let (request, owner) =
-                match authenticate_request::<AuthenticatedSessionRequest<WriterConfig>>(&ctx) {
+                match authenticate_request::<AuthenticatedSessionRequest<WriterConfig>>(&ctx)
+                    .await
+                {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
@@ -1191,12 +1258,18 @@ fn create_ipc_router() -> Result<Router> {
             let _operation_guard =
                 OperationGuard::begin(ServiceOperationKind::UpdateWriter, IPC_HANDLER_TIMEOUT);
             // The client does not get to choose where the service writes: whatever it sent is
-            // replaced with the owner's own log directory.
+            // replaced with the owner's own log directory. It does not get to choose how much it
+            // writes either — the rotation numbers are clamped before they reach the writer or
+            // the durable desired state.
             writer_config.directory = service_paths()
                 .for_owner(&owner.identity)
                 .logs_dir()
                 .to_string_lossy()
                 .into_owned();
+            writer_config.max_log_size = writer_config
+                .max_log_size
+                .clamp(MIN_LOG_SIZE_BYTES, MAX_LOG_SIZE_BYTES);
+            writer_config.max_log_files = writer_config.max_log_files.clamp(1, MAX_LOG_FILES);
             match set_or_update_writer(&writer_config).await {
                 Ok(_) => info!("Update writer successfully"),
                 Err(e) => {
@@ -1211,7 +1284,9 @@ fn create_ipc_router() -> Result<Router> {
         .post(IpcCommand::SetSystemProxy.as_ref(), |ctx| async move {
             trace!("Received SetSystemProxy command");
             let (request, owner) =
-                match authenticate_request::<AuthenticatedSessionRequest<MacosProxyConfig>>(&ctx) {
+                match authenticate_request::<AuthenticatedSessionRequest<MacosProxyConfig>>(&ctx)
+                    .await
+                {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };

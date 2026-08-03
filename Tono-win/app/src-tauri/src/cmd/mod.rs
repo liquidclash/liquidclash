@@ -76,6 +76,24 @@ impl<T, E: std::fmt::Display> StringifyErr<T> for Result<T, E> {
     }
 }
 
+/// Run blocking OS work off the caller's thread and flatten the join failure into the command's
+/// own error type.
+///
+/// A synchronous `#[tauri::command]` is invoked inline on the Tauri main thread, so a command
+/// that touches the OS — a subprocess, the SCM, the registry, a path enterprise policy can
+/// redirect onto a network share — freezes the window for as long as that call takes. None of
+/// those calls carry a timeout of their own, so "as long as it takes" has no upper bound.
+/// Commands route through here instead of each rolling its own hop.
+pub async fn blocking<T, F>(work: F) -> CmdResult<T>
+where
+    F: FnOnce() -> CmdResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    crate::process::AsyncHandler::spawn_blocking(work)
+        .await
+        .map_err(|err| -> String { format!("background task did not finish: {err}").into() })?
+}
+
 impl<T, E: std::fmt::Display> WithErrorCode<T> for Result<T, E> {
     fn with_error_code(self, code: &str) -> CmdResult<T> {
         self.map_err(|error| coded_error(code, error))

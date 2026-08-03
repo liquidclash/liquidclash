@@ -217,6 +217,53 @@ mod app_init {
 /// silently make the outer wait the effective limit.
 const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long the Tono state recovery keeps trying, and how often.
+///
+/// The failure it recovers from is `TonoState::create`, whose first act is `create_dir_all` on
+/// the Tono data directory. Its realistic causes — a full disk, a roaming profile not mounted
+/// yet, an ACL a policy refresh repairs — are transient often enough to be worth retrying, and
+/// the cost of not retrying is an app in which protection can never be released.
+const TONO_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
+const TONO_STATE_RETRY_ATTEMPTS: usize = 8;
+
+/// Keep trying to build the Tono product state, telling the user why the app is degraded.
+///
+/// Without managed state the window is not merely missing a feature: every Tono command,
+/// including Disconnect, fails before it runs, so an armed barrier from a previous session has
+/// no owner and no release path. A toast per attempt is the loudest channel available from here
+/// and is at least truthful; each retry that succeeds restores the whole product layer.
+async fn recover_tono_state(app_handle: AppHandle, first_error: String) {
+    let mut error = first_error;
+    for attempt in 0..TONO_STATE_RETRY_ATTEMPTS {
+        // The first wait also lets the WebView finish loading, otherwise the notice is emitted
+        // into a frontend that is not listening yet.
+        let delay = if attempt == 0 {
+            constants::timing::STARTUP_ERROR_DELAY
+        } else {
+            TONO_STATE_RETRY_DELAY
+        };
+        tokio::time::sleep(delay).await;
+        handle::Handle::notice_message("tono_state_init_failed", error.clone());
+        match tono::TonoState::create() {
+            Ok(state) => {
+                let state = std::sync::Arc::new(state);
+                if app_handle.manage(state.clone()) {
+                    logging!(info, Type::Setup, "Tono state recovered after {} attempt(s)", attempt + 1);
+                    tono::commands::restore_session_guarded(app_handle.clone(), state).await;
+                }
+                return;
+            }
+            Err(err) => error = format!("{err:#}"),
+        }
+    }
+    logging!(
+        error,
+        Type::Setup,
+        "Tono state could not be created after {TONO_STATE_RETRY_ATTEMPTS} attempts: {error}"
+    );
+    handle::Handle::notice_message("tono_state_init_failed_permanently", error);
+}
+
 /// Everything that must still happen once exit is *committed* (`RunEvent::Exit`).
 ///
 /// Deliberately a plain async fn so it can be driven on the async runtime rather than on the
@@ -346,6 +393,12 @@ pub fn run() {
                     }
                     Err(e) => {
                         logging!(error, Type::Setup, "Failed to init Tono state: {e:#}");
+                        // A log line was the entire response, and the window then opened looking
+                        // perfectly normal while every `tono::commands` entry point failed at
+                        // state resolution — including the only route that can release an armed
+                        // WFP barrier. Make it visible and keep trying.
+                        let app_handle = app.app_handle().clone();
+                        AsyncHandler::spawn(move || recover_tono_state(app_handle, format!("{e:#}")));
                     }
                 }))
             {

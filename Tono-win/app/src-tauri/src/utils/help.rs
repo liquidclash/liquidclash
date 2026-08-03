@@ -3,6 +3,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clash_verge_logging::{Type, logging};
 use nanoid::nanoid;
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::AsyncWriteExt as _;
 use serde_yaml_ng::{Mapping, Value};
 #[cfg(target_os = "windows")]
 use std::path::Path;
@@ -66,12 +67,45 @@ pub async fn save_yaml<T: Serialize + Sync>(path: &PathBuf, data: &T, prefix: Op
         None => data_str,
     };
 
-    tokio::fs::write(path, yaml_str.as_bytes())
+    // Temp file → fsync → rename, instead of truncating the destination in place. A
+    // truncate-in-place write that dies on ENOSPC, a crash or a power cut leaves a *truncated*
+    // config behind, and the layer above reads an unparsable `profiles.yaml` as `default()` —
+    // after which `cleanup_orphaned_files` deletes every profile file on disk. The rename is
+    // the atomic step: a reader sees the whole old file or the whole new one, never half of
+    // either. Same pattern as `tono_core::catalog`'s durable write.
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("cannot save to a path with no file name: \"{}\"", path.display()))?;
+    let mut temp_name = file_name.to_os_string();
+    // Unique per write, not just per process: two saves of the same file must not share a
+    // staging path, or one would rename the other's half-written bytes into place.
+    temp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let temp_path = path.with_file_name(temp_name);
+
+    let staged = async {
+        let mut file = tokio::fs::File::create(&temp_path).await?;
+        file.write_all(yaml_str.as_bytes()).await?;
+        // Without this the rename can reach the disk while the contents have not.
+        file.sync_all().await
+    }
+    .await;
+    if let Err(error) = staged {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(error).with_context(|| format!("failed to save file \"{}\"", path.display()));
+    }
+    tokio::fs::rename(&temp_path, path)
         .await
         .with_context(|| format!("failed to save file \"{}\"", path.display()))?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(())
 }
+
+/// Disambiguates concurrent staging files; see `save_yaml`.
+static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 const ALPHABET: [char; 62] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',

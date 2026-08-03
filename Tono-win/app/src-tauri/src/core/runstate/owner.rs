@@ -64,6 +64,7 @@ pub enum OwnerStep {
 pub struct OwnerWatch {
     unreadable_samples: u8,
     missing_core_samples: u8,
+    displaced_samples: u8,
 }
 
 impl OwnerWatch {
@@ -72,6 +73,7 @@ impl OwnerWatch {
         Self {
             unreadable_samples: 0,
             missing_core_samples: 0,
+            displaced_samples: 0,
         }
     }
 
@@ -93,7 +95,22 @@ impl OwnerWatch {
                     OwnerStep::Continue
                 }
             }
-            OwnerSample::NotActive => OwnerStep::Recover(OwnerRecoveryReason::Displaced),
+            // Debounced like every other bad reading, and for the same reason: displacement is
+            // indistinguishable from a *deliberate* session handoff. `tono_start_core_with_kill_switch`
+            // clears the active session before issuing StartClash and only repopulates it after
+            // the reply, so a monitor from the previous start ticking inside that window reads a
+            // perfectly successful status as "someone else owns this" and tears the proxy down
+            // while our own second StartClash is in flight — which every connect carrying a
+            // cloud policy passes through twice. The handoff now also cancels the monitor; this
+            // is the belt to that braces.
+            OwnerSample::NotActive => {
+                self.displaced_samples = self.displaced_samples.saturating_add(1);
+                if self.displaced_samples >= SUSTAINED_SAMPLES {
+                    OwnerStep::Recover(OwnerRecoveryReason::Displaced)
+                } else {
+                    OwnerStep::Continue
+                }
+            }
             OwnerSample::Status {
                 is_active,
                 desired_core_should_be_running,
@@ -106,12 +123,19 @@ impl OwnerWatch {
                 } else {
                     0
                 };
+                // An answer that says we *are* active is the contradiction that clears the run.
+                self.displaced_samples = if is_active {
+                    0
+                } else {
+                    self.displaced_samples.saturating_add(1)
+                };
                 match recovery_reason(
                     is_active,
                     desired_core_should_be_running,
                     service_state,
                     core_pid,
                     self.missing_core_samples,
+                    self.displaced_samples,
                 ) {
                     Some(reason) => OwnerStep::Recover(reason),
                     None => OwnerStep::Continue,
@@ -147,9 +171,15 @@ const fn recovery_reason(
     service_state: ServiceLifecycleState,
     core_pid: Option<u32>,
     missing_core_samples: u8,
+    displaced_samples: u8,
 ) -> Option<OwnerRecoveryReason> {
     if !is_active {
-        return Some(OwnerRecoveryReason::Displaced);
+        // Same debounce as the `NotActive` sample: the Service reports us inactive for the whole
+        // of a deliberate session handoff, and acting on the first one tears down our own start.
+        if displaced_samples >= SUSTAINED_SAMPLES {
+            return Some(OwnerRecoveryReason::Displaced);
+        }
+        return None;
     }
     let core_is_gone = !is_settling(service_state) && core_pid.is_none() && missing_core_samples >= SUSTAINED_SAMPLES;
     if !desired_running || matches!(service_state, ServiceLifecycleState::Fatal) || core_is_gone {
@@ -257,9 +287,21 @@ mod tests {
         assert_eq!(watch.observe(OwnerSample::Unreadable), OwnerStep::Continue);
     }
 
+    const fn not_the_owner() -> OwnerSample {
+        OwnerSample::Status {
+            is_active: false,
+            desired_core_should_be_running: true,
+            service_state: ServiceLifecycleState::Running,
+            core_pid: Some(1),
+        }
+    }
+
     #[test]
-    fn a_service_reporting_not_active_is_displacement() {
+    fn a_sustained_run_of_not_active_is_displacement() {
         let mut watch = OwnerWatch::new();
+        // A single sample is our own session handoff far more often than it is displacement.
+        assert_eq!(watch.observe(OwnerSample::NotActive), OwnerStep::Continue);
+        assert_eq!(watch.observe(OwnerSample::NotActive), OwnerStep::Continue);
         assert_eq!(
             watch.observe(OwnerSample::NotActive),
             OwnerStep::Recover(OwnerRecoveryReason::Displaced)
@@ -267,18 +309,27 @@ mod tests {
     }
 
     #[test]
-    fn a_status_saying_we_are_not_the_owner_is_displacement() {
+    fn a_sustained_run_of_statuses_disowning_us_is_displacement() {
         let mut watch = OwnerWatch::new();
-        let sample = OwnerSample::Status {
-            is_active: false,
-            desired_core_should_be_running: true,
-            service_state: ServiceLifecycleState::Running,
-            core_pid: Some(1),
-        };
+        assert_eq!(watch.observe(not_the_owner()), OwnerStep::Continue);
+        assert_eq!(watch.observe(not_the_owner()), OwnerStep::Continue);
         assert_eq!(
-            watch.observe(sample),
+            watch.observe(not_the_owner()),
             OwnerStep::Recover(OwnerRecoveryReason::Displaced)
         );
+    }
+
+    #[test]
+    fn a_session_handoff_window_does_not_tear_down_our_own_start() {
+        // The shape of `tono_start_core_with_kill_switch`: the session is cleared, one or two
+        // ticks land inside the window, then the new session is adopted and status is ours again.
+        let mut watch = OwnerWatch::new();
+        assert_eq!(watch.observe(OwnerSample::NotActive), OwnerStep::Continue);
+        assert_eq!(watch.observe(not_the_owner()), OwnerStep::Continue);
+        assert_eq!(watch.observe(healthy()), OwnerStep::Continue);
+        // ...and the run has to start over afterwards.
+        assert_eq!(watch.observe(OwnerSample::NotActive), OwnerStep::Continue);
+        assert_eq!(watch.observe(OwnerSample::NotActive), OwnerStep::Continue);
     }
 
     #[test]

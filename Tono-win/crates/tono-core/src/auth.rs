@@ -471,22 +471,34 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
 
     /// Best-effort server logout, then local token wipe (§2).
     pub async fn logout(&self) {
-        let refresh = self.credentials.refresh_token().ok().flatten();
-        if self.state.lock().await.access_token.is_some() {
+        // Gate on "a session exists", not on "an access token is cached". A process that
+        // never completed an authorized call — offline at startup, or a refresh that failed
+        // on transport — holds a valid refresh token and no access token, and the old gate
+        // wiped that token locally while leaving it live on the server. `authorized` refreshes
+        // first when the access token is missing, and `refresh_access_token` fails without a
+        // network call when the store is empty, so the never-signed-in case stays a no-op.
+        let has_session = self.credentials.refresh_token().ok().flatten().is_some()
+            || self.state.lock().await.access_token.is_some();
+        if has_session {
+            // Read the refresh token immediately before the POST: reaching the server may go
+            // through a refresh that rotates it, which would put a stale value in the body.
             let body = serde_json::to_string(&LogoutRequest {
-                refresh_token: refresh,
+                refresh_token: self.credentials.refresh_token().ok().flatten(),
             })
             .ok();
             let _ = self.authorized(HttpMethod::Post, endpoints::LOGOUT, body).await;
         }
+        // Wipe the persisted token while the state lock is held. Releasing it first left a
+        // window in which a refresh that started after the epoch bump could read the token
+        // back off disk and resurrect the session the user just ended.
         {
             let mut state = self.state.lock().await;
             state.access_token = None;
             // Invalidate any in-flight refresh so its stale result is
             // discarded instead of resurrecting the wiped session (L3).
             state.epoch += 1;
+            let _ = self.credentials.delete_refresh_token();
         }
-        let _ = self.credentials.delete_refresh_token();
     }
 
     /// Send with the current access token; on 401 refresh once and retry
