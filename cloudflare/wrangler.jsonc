@@ -1,0 +1,62 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tono-control-plane-staging",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-02",
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "api.afk.ccwu.cc",
+      "custom_domain": true
+    },
+    {
+      "pattern": "releases.afk.ccwu.cc",
+      "custom_domain": true
+    }
+  ],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "secrets": {
+    "required": [
+      "JWT_SECRET",
+      "ADMIN_API_TOKEN",
+      "HOME_AGENT_TOKEN",
+      "TAILSCALE_OAUTH_CLIENT_ID",
+      "TAILSCALE_OAUTH_CLIENT_SECRET",
+      "RESEND_API_KEY",
+      "CATALOG_ENCRYPTION_KEY"
+    ]
+  },
+  "d1_databases": [{
+    "binding": "DB", "database_name": "tono-control-plane",
+    "database_id": "caf9b9fb-b4d5-498d-a1ad-7d5cdbb4237c", "migrations_dir": "migrations"
+  }],
+  "vars": {
+    "ALLOWED_ORIGIN": "https://api.afk.ccwu.cc",
+    "TAILSCALE_TAILNET": "Tcw8bpg2c621CNTRL",
+    "TAILSCALE_ENROLLMENT_ENABLED": "false",
+    "ACCESS_TOKEN_TTL_SECONDS": "900",
+    "REFRESH_TOKEN_TTL_SECONDS": "2592000",
+    "PENDING_DEVICE_TTL_SECONDS": "1800",
+    "RATE_LIMIT_WINDOW_SECONDS": "900",
+    "RATE_LIMIT_EMAIL_START_IP": "20",
+    "RATE_LIMIT_EMAIL_START_EMAIL": "5",
+    "RATE_LIMIT_EMAIL_VERIFY_IP": "30",
+    "RATE_LIMIT_EMAIL_VERIFY_CHALLENGE": "5",
+    "RATE_LIMIT_OIDC_START_IP": "20",
+    "RATE_LIMIT_OIDC_START_INSTALLATION": "10",
+    "RATE_LIMIT_OIDC_VERIFY_IP": "30",
+    "RATE_LIMIT_OIDC_VERIFY_CHALLENGE": "5",
+    "RATE_LIMIT_DIAGNOSTICS_IP_HOUR": "30",
+    "RATE_LIMIT_DIAGNOSTICS_USER_HOUR": "5",
+    "RATE_LIMIT_DIAGNOSTICS_USER_DAY": "20",
+    "DIAGNOSTICS_RETENTION_SECONDS": "2592000",
+    "EMAIL_CODE_TTL_SECONDS": "600",
+    "OIDC_CHALLENGE_TTL_SECONDS": "300",
+    "EMAIL_FROM": "Tono <login@lecvia.com>",
+    "APPLE_CLIENT_ID": "com.raydocs.tono",
+    "GOOGLE_CLIENT_ID": "",
+    "DIRECT_SIGNUP_ALLOWLIST": "ruiruiwan2019@gmail.com,ruiruiwan8@gmail.com,stephonhe0227@gmail.com",
+    "CONFIRM_CLAIM_TTL_SECONDS": "300"
+  }
+}

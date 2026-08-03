@@ -156,6 +156,17 @@ pub enum AuditEvent {
     PolicySyncFail {
         error: String,
     },
+    // diagnostics (user-initiated upload only)
+    /// The user uploaded a diagnostics report and the intake accepted it.
+    /// Recorded locally so the machine's own trail shows that a report left
+    /// it, and with which support reference.
+    DiagnosticsUploaded {
+        reference: String,
+    },
+    /// The user asked for an upload and it failed.
+    DiagnosticsUploadFail {
+        error: String,
+    },
     // lifecycle
     AuditEnabled,
     AuditDisabled,
@@ -194,6 +205,7 @@ impl AuditEvent {
                 error: redact(&error),
             },
             PolicySyncFail { error } => PolicySyncFail { error: redact(&error) },
+            DiagnosticsUploadFail { error } => DiagnosticsUploadFail { error: redact(&error) },
             other => other,
         }
     }

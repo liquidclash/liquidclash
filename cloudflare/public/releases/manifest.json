@@ -1,0 +1,303 @@
+{
+ "schemaVersion": 1,
+ "channel": "test",
+ "generatedAt": "2026-08-03T02:13:49Z",
+ "releaseCenter": "https://releases.afk.ccwu.cc/",
+ "controlPlane": {
+  "baseURL": "https://api.afk.ccwu.cc",
+  "apiVersion": "0.0.1",
+  "trafficPolicy": {
+   "currentRevision": 2,
+   "currentSchema": 2,
+   "supportedSchemas": [
+    1,
+    2
+   ]
+  }
+ },
+ "releaseSet": {
+  "id": "2026-08-02-windows-test6",
+  "status": "windows-real-machine-validation",
+  "reason": "Windows 2.5.4 Test 6 closes the residual connect-availability P1s (timeout self-abort, failed-release latch, reconnect flapping), speeds up the connect path, and is the first build whose NSIS payload passed the full extraction gate. Limited Windows real-machine acceptance only; not for broad customer rollout until the S6 fault-injection checklist passes."
+ },
+ "platforms": {
+  "macos": {
+   "current": {
+    "releaseId": "macos-0.0.1-build37",
+    "version": "0.0.1",
+    "build": 37,
+    "architecture": "arm64",
+    "minimumOS": "26.3",
+    "trafficPolicySchemas": [
+     1,
+     2
+    ],
+    "update": {
+     "mechanism": "sparkle-2",
+     "feedURL": "https://releases.afk.ccwu.cc/macos/appcast.xml",
+     "legacyFeedURL": "https://api.afk.ccwu.cc/appcast.xml",
+     "automaticCheckSeconds": 21600,
+     "silentInstall": false
+    },
+    "artifact": {
+     "name": "Tono-0.0.1-build37-arm64.dmg",
+     "url": "https://github.com/raydocs/liquidclash/releases/download/tono-0.0.1-build37/Tono-0.0.1-build37-arm64.dmg",
+     "size": 20523223,
+     "sha256": "2026bae06f681a127a21ce5df4e20dea5d3df8bea3ef8666b38d3dd0a191be8d",
+     "sparkleEdSignature": "WP0cbCcxEA07pPJi8I63nefPIYu/+u+f+W1cIMXvF83q9+uy/reJArQ8Ki+wtL1owFcKvmP2BdrCSKrpYT63Dg=="
+    },
+    "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-0.0.1-build37"
+   }
+  },
+  "windows": {
+   "current": {
+    "releaseId": "windows-2.5.4-test6",
+    "version": "2.5.4",
+    "build": "test6",
+    "architecture": "x86_64",
+    "installer": "nsis",
+    "trafficPolicySchemas": [
+     1,
+     2
+    ],
+    "recommended": false,
+    "availability": "limited-real-machine-test",
+    "update": {
+     "mechanism": "manual",
+     "automaticUpdaterEnabled": false,
+     "reason": "Windows Authenticode and Tauri updater signing keys are not configured for this customer-test artifact."
+    },
+    "commit": "36b70c25028d694fda7f0a97d12c1139805a949b",
+    "artifact": {
+     "name": "Tono_2.5.4_x64-setup.exe",
+     "url": "https://github.com/raydocs/liquidclash/releases/download/tono-windows-2.5.4-test6/Tono_2.5.4_x64-setup.exe",
+     "size": 30852322,
+     "sha256": "ef92f8bce4c4fdea9db4e44dcfd68d570f5bacb179892bcc6bf4b46eb97a4ece",
+     "authenticodeSigned": false,
+     "tauriUpdaterSignature": null
+    },
+    "service": {
+     "sha256": "26852af3462596443105a60c6d8abbf4dc756e0005b8cac4c804ef042fec834b",
+     "size": 2895360
+    },
+    "mihomo": {
+     "version": "v1.19.29-tono-gvisor-adaptive.1",
+     "sha256": "a064b52f2e4c476189edc7e078f22a45e16252d265afe9be1ee90afe0fec9969",
+     "gvisorTcpBufferKiB": [
+      4,
+      32,
+      128
+     ]
+    },
+    "validation": {
+     "tonoCoreTests": 152,
+     "serviceTests": 166,
+     "appTests": 388,
+     "frontendTests": 85,
+     "packagingTests": 5,
+     "windowsCrossBuild": true,
+     "nsisPayloadExtracted": true,
+     "fullReleasePreflightPassed": true,
+     "windowsRealMachine": false
+    },
+    "knownLimitations": [
+     "Test 6 is only for limited Windows real-machine acceptance. The fixes have automated regression coverage but have not been proven on a real Windows machine (S6 fault injection pending).",
+     "This cross-built artifact is unsigned and has not yet completed Windows real-machine installation, WFP, DNS, upgrade, disconnect, crash-recovery or uninstall verification.",
+     "Connect-speed improvements are estimated from code-path analysis; real-machine timing validation is pending."
+    ],
+    "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.4-test6"
+   }
+  }
+ },
+ "archive": [
+  {
+   "releaseId": "windows-2.5.4-test6",
+   "platform": "windows",
+   "version": "2.5.4",
+   "build": "test6",
+   "publishedAt": "2026-08-03T02:13:49Z",
+   "status": "limited-real-machine-test",
+   "summary": [
+    "Fixes the connect-timeout handler aborting its own task, which stranded the UI in Connecting and killed the auto-reconnect chain.",
+    "A failed kill-switch release now keeps the armed state visible instead of showing notConnected over a live WFP barrier (and no longer lets Quit skip the release).",
+    "Resets network-monitor seeds on every connect success, ending the deterministic connect/teardown flapping loop after network events.",
+    "Flushes the Windows resolver cache after DNS enable so cached real-IP answers can no longer defeat the fake-ip probe (up to 7s wasted or a spurious connect failure).",
+    "WFP boot restore installs the current filter set before sweeping legacy sublayers, closing the v1-upgrade fail-open window; unreadable intent now arms the emergency block.",
+    "Connect path parallelized: five prep probes run concurrently, bootstrap host resolution is parallel (worst case ~32s to ~2s), controller readiness polls on an adaptive grid.",
+    "First build whose NSIS payload passed the full extraction gate: exactly one stable Mihomo, no alpha, no Unix helpers."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.4-test6"
+  },
+  {
+   "releaseId": "windows-2.5.4-test5",
+   "platform": "windows",
+   "version": "2.5.4",
+   "build": "test5",
+   "publishedAt": "2026-08-02T17:03:18Z",
+   "status": "limited-real-machine-test",
+   "summary": [
+    "Moves every privileged Service IPC request onto a dedicated two-worker Tokio runtime so synchronous Windows pipe and Service Control Manager work cannot starve the Tauri runtime.",
+    "Keeps an IPC request alive after the calling future is dropped, preserving late-arm reconciliation and Kill Switch safety semantics.",
+    "Sets a four-worker floor for the Tauri runtime and reports live elapsed time while Starting Kill Switch is still in progress.",
+    "Retains the Test 4 TUN interface-alias fix, startup cleanup, initial-failure release and verified-session fail-closed behavior.",
+    "The extracted NSIS payload contains the new Service hashes and IPC-runtime evidence; application, installer and uninstaller icons exactly match the Tono source icon.",
+    "Unsigned cross-build for limited Windows real-machine acceptance only; broad customer rollout remains blocked pending the full Windows checklist."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.4-test5"
+  },
+  {
+   "releaseId": "windows-2.5.4-test4",
+   "platform": "windows",
+   "version": "2.5.4",
+   "build": "test4",
+   "publishedAt": "2026-08-02T16:11:52Z",
+   "status": "unsafe-superseded",
+   "summary": [
+    "Do not continue customer testing: a Windows real-machine test shows the native App window becoming unresponsive immediately after entering Starting Kill Switch.",
+    "Superseded by Test 5; retained only as an immutable audit record.",
+    "Resolves the Mihomo TUN alias with ConvertInterfaceAliasToLuid so the Windows traffic-locking stage no longer fails with Windows error 123.",
+    "Retains startup cleanup for unverified stale Kill Switch state, safe initial-failure release and fail-closed handling for verified sessions.",
+    "Centers the dashboard content, replaces the old eye/bird-like center glyph with the official Tono ribbon mark and reduces the glow effect.",
+    "Extracted NSIS payload Service and Mihomo hashes match the build inputs; application, installer and uninstaller icons match the Tono source icon.",
+    "Unsigned cross-build for limited Windows real-machine testing only; full Windows validation remains pending."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.4-test4"
+  },
+  {
+   "releaseId": "windows-2.5.4-test3",
+   "platform": "windows",
+   "version": "2.5.4",
+   "build": "test3",
+   "publishedAt": "2026-08-02T11:23:45Z",
+   "status": "unsafe-superseded",
+   "summary": [
+    "Do not use for connection testing: the Service resolves the Mihomo TUN alias with the wrong Windows API, so locking traffic fails with Windows error 123.",
+    "Superseded by Test 4; retained only as an immutable audit record.",
+    "Does not restore an unverified stale Kill Switch intent merely because the Tono GUI opens.",
+    "Safely restores DNS and releases WFP protection when the first connection attempt fails, while verified tunnel failures remain fail-closed.",
+    "Adds owner/session-gated Kill Switch verification and advances the Service protocol to revision 8.",
+    "Replaces application, tray, installer, uninstaller and web icons with Tono branding; extracted NSIS payload hashes and icons were verified.",
+    "A Test 2 record captured during its brief Locked-before-verification window remains fail-closed on first migration because the legacy format cannot distinguish it from an established session; Restore normal network or Disconnect clears it."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.4-test3"
+  },
+  {
+   "releaseId": "windows-2.5.4-test2",
+   "platform": "windows",
+   "version": "2.5.4",
+   "build": "test2",
+   "publishedAt": "2026-08-02T10:15:16Z",
+   "status": "unsafe-superseded",
+   "summary": [
+    "Do not use: this build may restore stale unverified Kill Switch state when the GUI opens and interrupt all network access.",
+    "Superseded by Test 3; retained only as an immutable audit record.",
+    "Accepts canonical Windows extended-length core paths under Program Files without weakening the Service allowlist.",
+    "Requires per-machine installs under Program Files and gives legacy custom-location users an explicit uninstall-and-reinstall path."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.4-test2"
+  },
+  {
+   "releaseId": "windows-2.5.4-test1",
+   "platform": "windows",
+   "version": "2.5.4",
+   "build": "test1",
+   "publishedAt": "2026-08-02T01:17:54Z",
+   "status": "customer-test",
+   "summary": [
+    "Accepts traffic-policy v1 and v2 with exact reviewed web host TCP/443 rules.",
+    "Claude process rules precede all DIRECT rules; Anthropic, Claude and Tono domains remain protected.",
+    "Uses the same bounded adaptive gVisor TCP buffer policy as Mac Build 37.",
+    "Cross-build and automated tests passed; Windows real-machine verification remains required."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.4-test1"
+  },
+  {
+   "releaseId": "macos-0.0.1-build37",
+   "platform": "macos",
+   "version": "0.0.1",
+   "build": 37,
+   "publishedAt": "2026-08-01T22:21:36Z",
+   "status": "prerelease",
+   "summary": [
+    "Seven-day exact-host China direct canary with independent cloud rollback.",
+    "Claude App, Claude Code and Anthropic official traffic retain proxy precedence.",
+    "Native WeChat and 16 reviewed video hostnames use exact host, pinned IPv4 and bounded port rules.",
+    "Experimental Mihomo v1.19.29-tono-gvisor-adaptive.1 uses bounded adaptive gVisor TCP buffers."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-0.0.1-build37"
+  },
+  {
+   "releaseId": "windows-2.5.3-test1",
+   "platform": "windows",
+   "version": "2.5.3",
+   "build": "test1",
+   "publishedAt": "2026-08-01T19:37:01Z",
+   "status": "historical-test",
+   "sourceCommit": "59737f5959907e3a5446144fa6cd95ea2e881774",
+   "summary": [
+    "First hardened Windows x64 NSIS test build.",
+    "Cross-compiled and packaged on macOS; Windows verification remains required.",
+    "Unsigned test artifact; automatic updater is disabled.",
+    "Supports traffic-policy v1 only and is not paired with the current v2 canary."
+   ],
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-windows-2.5.3-test1"
+  },
+  {
+   "releaseId": "macos-0.0.1-build34",
+   "platform": "macos",
+   "version": "0.0.1",
+   "build": 34,
+   "publishedAt": "2026-08-01T09:01:47Z",
+   "status": "rollback",
+   "summary": [
+    "Established the Sparkle 2 signed automatic-update baseline.",
+    "Added six-hour checks and manual Check for Updates.",
+    "Retained mainland weak-network timeout and bounded retry behavior."
+   ],
+   "artifact": {
+    "name": "Tono-0.0.1-build34-arm64.dmg",
+    "url": "https://github.com/raydocs/liquidclash/releases/download/tono-0.0.1-build34/Tono-0.0.1-build34-arm64.dmg",
+    "size": 20549488,
+    "sha256": "399a6789823d8e09fc49afb0db0dfba2eaaa4d76f04e6d936344b2cf0a059bb0"
+   },
+   "releaseURL": "https://github.com/raydocs/liquidclash/releases/tag/tono-0.0.1-build34"
+  },
+  {
+   "releaseId": "macos-0.0.1-build33-private-archive",
+   "platform": "macos",
+   "version": "0.0.1",
+   "build": 33,
+   "createdAt": "2026-08-01T08:36:05Z",
+   "status": "private-draft-archive",
+   "summary": [
+    "Stored 39 retained macOS package and checksum assets in a private GitHub Release draft.",
+    "Build 33 fixed ambiguous node-switch config reload timeouts while remaining fail-closed.",
+    "Private rollback and audit inventory; not a customer download channel."
+   ],
+   "storage": {
+    "provider": "github-release-draft",
+    "tag": "tono-0.0.1-build33",
+    "assetCount": 39,
+    "customerVisible": false
+   }
+  },
+  {
+   "releaseId": "macos-0.0.1-build25-private-archive",
+   "platform": "macos",
+   "version": "0.0.1",
+   "build": 25,
+   "createdAt": "2026-07-31T01:40:57Z",
+   "status": "private-draft-archive",
+   "summary": [
+    "Private notarized binary backup used to diagnose mainland connection failures.",
+    "Introduced local traffic audit for helper, Kill Switch, TUN, DNS and Reality stage diagnosis."
+   ],
+   "storage": {
+    "provider": "github-release-draft",
+    "tag": "tono-0.0.1-build25",
+    "assetCount": 1,
+    "customerVisible": false
+   }
+  }
+ ]
+}

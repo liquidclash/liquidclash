@@ -109,6 +109,23 @@
     "copyDetails": "复制诊断信息",
     "copied": "诊断信息已复制",
     "copyFailed": "复制诊断信息失败",
+    "upload": {
+      "action": "上传诊断信息",
+      "uploading": "正在上传…",
+      "confirmTitle": "向 Tono 支持上传诊断信息",
+      "confirmMessage": "将向 Tono 发送一份与你的账号关联的诊断报告：应用与 Windows 版本、Tono 服务协议版本、所选服务器名称、连接状态、Kill Switch 与 DNS 状态及其最近的错误信息、各连接步骤与耗时、是否存在 Hyper-V/WSL 类虚拟网卡，以及本地日志文件的路径。不会发送你的配置、密钥、令牌、服务器地址，也不会发送任何日志文件的内容。若想先查看确切内容，可先使用“复制诊断信息”。",
+      "confirmSend": "发送报告",
+      "successHint": "报告已上传。请把这个参考编号提供给 Tono 支持：",
+      "copyCode": "复制编号",
+      "codeCopied": "已复制",
+      "errors": {
+        "signedOut": "你当前未登录，报告无法关联到账号。请登录后重试，或使用“复制诊断信息”把文本发送给支持人员。",
+        "rateLimited": "最近上传的报告过多。请几分钟后再试，或使用“复制诊断信息”把文本发送给支持人员。",
+        "unreachable": "无法连接到 Tono。请检查网络；若 Kill Switch 正在封锁全部流量，请先“恢复正常网络”再重试。",
+        "unavailable": "该账号暂不支持上传诊断信息。请使用“复制诊断信息”把文本发送给支持人员。",
+        "failed": "上传失败。请使用“复制诊断信息”把文本发送给支持人员。"
+      }
+    },
     "steps": {
       "preparing": "正在准备保护…",
       "preparingService": "正在准备 Windows 服务…",

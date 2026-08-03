@@ -1,0 +1,63 @@
+// Tono tailnet policy artifact.
+// Apply in the Tailscale admin policy editor and run its policy tests first.
+// tag:pending-tunnel-client intentionally has no grants.
+
+{
+  "tagOwners": {
+    // Assign only tag:tono-controller to the Worker's OAuth credential. It has
+    // no grants, but may create pending-tag auth keys and promote them to the
+    // active client tag. The Worker never owns tag:exit-home.
+    "tag:tono-controller":        ["autogroup:admin"],
+    "tag:pending-tunnel-client": ["tag:tono-controller"],
+    "tag:tunnel-client":         ["tag:tono-controller"],
+    "tag:exit-home":             ["autogroup:admin"]
+  },
+
+  // Exit-node advertisements from the designated home tag are approved
+  // automatically. Existing unapproved advertisements must be re-advertised or
+  // approved once in the admin console after this policy is installed.
+  "autoApprovers": {
+    "exitNode": ["tag:exit-home"]
+  },
+
+  "grants": [
+    // Active clients may reach the public Internet only through a router tagged
+    // tag:exit-home. This does not grant access to the exit host or home LAN.
+    {
+      "src": ["tag:tunnel-client"],
+      "dst": ["autogroup:internet"],
+      "via": ["tag:exit-home"],
+      "ip":  ["*"]
+    }
+  ],
+
+  "ssh": [],
+
+  "tests": [
+    {
+      "src": "tag:tono-controller",
+      "accept": [],
+      "deny": [
+        "tag:exit-home:443",
+        "192.168.0.1:22",
+        "8.8.8.8:53",
+        "8.8.8.8:443"
+      ]
+    },
+    {
+      "src": "tag:pending-tunnel-client",
+      "accept": [],
+      "deny": [
+        "tag:exit-home:443",
+        "192.168.0.1:22",
+        "8.8.8.8:53",
+        "8.8.8.8:443"
+      ]
+    },
+    {
+      "src": "tag:tunnel-client",
+      "accept": ["8.8.8.8:443"],
+      "deny": ["tag:exit-home:22", "192.168.0.1:22"]
+    }
+  ]
+}

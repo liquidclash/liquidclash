@@ -1723,6 +1723,23 @@ export interface TranslationResources {
         total: string
         tryBadge: string
         unknownStage: string
+        upload: {
+          action: string
+          codeCopied: string
+          confirmMessage: string
+          confirmSend: string
+          confirmTitle: string
+          copyCode: string
+          errors: {
+            failed: string
+            rateLimited: string
+            signedOut: string
+            unavailable: string
+            unreachable: string
+          }
+          successHint: string
+          uploading: string
+        }
       }
       servers: {
         cloudGroup: string

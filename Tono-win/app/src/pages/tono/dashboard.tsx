@@ -415,12 +415,7 @@ const DashboardPage = () => {
             {actionError}
           </span>
         )}
-        <ConnectProgressCard
-          uiState={uiState}
-          selectedServer={status?.selectedServer ?? null}
-          killSwitch={status?.killSwitch ?? null}
-          onRefreshStatus={mutateTonoStatus}
-        />
+        <ConnectProgressCard uiState={uiState} onRefreshStatus={mutateTonoStatus} />
         {status?.selectedServer && (
           <ActiveNodeCard
             serverName={status.selectedServer}

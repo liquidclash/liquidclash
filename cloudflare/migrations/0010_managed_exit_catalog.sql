@@ -1,0 +1,10 @@
+-- One encrypted, revisioned server catalog shared by authenticated Tono users.
+-- The AES-GCM key lives only in the Worker CATALOG_ENCRYPTION_KEY secret.
+CREATE TABLE managed_exit_catalog (
+  singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+  revision INTEGER NOT NULL CHECK(revision > 0),
+  ciphertext TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);

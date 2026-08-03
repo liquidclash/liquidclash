@@ -31,6 +31,20 @@ pub struct StepRecord {
     pub elapsed_ms: Option<u64>,
 }
 
+/// The wire value of a step state, identical to what `Serialize` emits.
+///
+/// The diagnostics report needs the token as an owned string rather than as
+/// part of a serialized `StepRecord`; keeping the mapping here (with a test
+/// pinning it to the serde output) is what stops the two from drifting.
+pub const fn state_key(state: StepState) -> &'static str {
+    match state {
+        StepState::Pending => "pending",
+        StepState::Current => "current",
+        StepState::Completed => "completed",
+        StepState::Failed => "failed",
+    }
+}
+
 /// The 8 §6 stages as fresh steps: all pending except the first, which is
 /// current at attempt start (FSM `begin_connect` lands on `Preparing`).
 pub fn initial_steps() -> Vec<StepRecord> {
@@ -121,9 +135,24 @@ pub fn snapshot_with_current_elapsed(steps: &[StepRecord], current_elapsed_ms: O
 #[cfg(test)]
 mod tests {
     use super::{
-        StepState, advance, complete_all, fail_current, initial_steps, snapshot_with_current_elapsed, total_elapsed_ms,
+        StepRecord, StepState, advance, complete_all, fail_current, initial_steps, snapshot_with_current_elapsed,
+        state_key, total_elapsed_ms,
     };
     use tono_core::connection::ConnectStage;
+
+    #[test]
+    fn state_key_matches_the_serialized_wire_value() {
+        for state in [StepState::Pending, StepState::Current, StepState::Completed, StepState::Failed] {
+            let record = StepRecord {
+                key: "preparing",
+                label: "Preparing",
+                state,
+                elapsed_ms: None,
+            };
+            let value = serde_json::to_value(&record).expect("StepRecord serializes");
+            assert_eq!(value["state"], state_key(state), "{state:?}");
+        }
+    }
 
     #[test]
     fn initial_record_is_first_current_rest_pending() {

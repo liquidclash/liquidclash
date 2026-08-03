@@ -109,6 +109,23 @@
     "copyDetails": "Copy details",
     "copied": "Details copied",
     "copyFailed": "Failed to copy details",
+    "upload": {
+      "action": "Upload diagnostics",
+      "uploading": "Uploading…",
+      "confirmTitle": "Upload diagnostics to Tono support",
+      "confirmMessage": "This sends a diagnostics report to Tono, tied to your account: app and Windows version, the Tono Service protocol version, your selected server's name, connection state, kill-switch and DNS status and their last error messages, the connect steps with timings, whether a Hyper-V/WSL-style virtual adapter is present, and the paths of the local log files. It never sends your configuration, keys, tokens, server addresses, or the contents of any log file. Use Copy details first if you want to read the exact contents.",
+      "confirmSend": "Send report",
+      "successHint": "Report uploaded. Give this reference code to Tono support:",
+      "copyCode": "Copy code",
+      "codeCopied": "Copied",
+      "errors": {
+        "signedOut": "You are signed out, so the report could not be linked to an account. Sign in and try again, or use Copy details and send the text to support.",
+        "rateLimited": "Too many reports were uploaded recently. Wait a few minutes and try again, or use Copy details and send the text to support.",
+        "unreachable": "Could not reach Tono. Check that you are online — if the kill switch is blocking everything, Restore Normal Internet first, then retry.",
+        "unavailable": "Diagnostics upload is not available on this account yet. Use Copy details and send the text to support.",
+        "failed": "The upload failed. Use Copy details and send the text to support."
+      }
+    },
     "steps": {
       "preparing": "Preparing protection…",
       "preparingService": "Preparing Windows Service…",

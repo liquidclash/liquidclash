@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tono 发布档案</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <header class="hero">
+      <p class="eyebrow">TONO RELEASE CENTER</p>
+      <h1>Tono 发布档案</h1>
+      <p class="lede">Mac 与 Windows 的版本、改动、兼容关系、校验值和下载入口统一保存在这里。安装包由 GitHub Release 提供不可变存档，Cloudflare 保存跨平台发布合同。</p>
+      <nav>
+        <a class="button primary" href="/manifest.json">机器可读 Manifest</a>
+        <a class="button" href="/macos/appcast.xml">macOS Appcast</a>
+        <a class="button" href="https://github.com/raydocs/liquidclash/releases">GitHub 安装包</a>
+      </nav>
+    </header>
+
+    <section>
+      <div class="section-heading">
+        <p class="eyebrow">CURRENT TEST SET</p>
+        <h2>当前跨平台状态</h2>
+      </div>
+      <div class="grid">
+        <article class="card current">
+          <div class="card-title"><span class="platform">macOS</span><span class="status good">可测试</span></div>
+          <h3>0.0.1 · Build 37</h3>
+          <p>Apple Silicon、macOS 26.3+。支持策略 v1–v2，已发布 Sparkle 签名自动更新。</p>
+          <ul>
+            <li>微信与 16 个视频 hostname 精确直连试验</li>
+            <li>Claude / Anthropic 官方流量优先代理</li>
+            <li>自适应 gVisor TCP buffer</li>
+          </ul>
+          <a class="text-link" href="https://github.com/raydocs/liquidclash/releases/download/tono-0.0.1-build37/Tono-0.0.1-build37-arm64.dmg">下载 Build 37 DMG →</a>
+        </article>
+
+        <article class="card">
+          <div class="card-title"><span class="platform">Windows</span><span class="status warn">小范围验收</span></div>
+          <h3>2.5.4 · Test Build 6</h3>
+          <p>修复连接超时卡死、释放失败误报未连接、网络事件后的重连死循环等 13 个缺陷，并显著加快连接（准备探测并发、DNS 缓存刷新、主机解析并行）。首个通过完整安装包载荷提取门的构建。仅用于 Windows 真机小范围验收。</p>
+          <ul>
+            <li>先确认只打开 App 不断网，窗口可拖动、最小化且保持响应</li>
+            <li>连接后拔插网线/切换 Wi-Fi，确认不再出现反复断连重连的死循环</li>
+            <li>连接超时后确认 UI 不再永久停在“连接中”，自动重连正常倒计时</li>
+            <li>若仍无响应，立即停止并保存进程 dump / Wait Chain；不要反复试</li>
+          </ul>
+          <a class="text-link" href="https://github.com/raydocs/liquidclash/releases/download/tono-windows-2.5.4-test6/Tono_2.5.4_x64-setup.exe">下载 Test 6 小范围验收包 →</a>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <p class="eyebrow">COMPATIBILITY CONTRACT</p>
+        <h2>每次发布必须一起核对</h2>
+      </div>
+      <div class="contract">
+        <div><strong>控制面</strong><span>策略 revision 2 · schema v2</span></div>
+        <div><strong>macOS</strong><span>Build 37 · 支持 v1–v2</span></div>
+        <div><strong>Windows 已发布包</strong><span>Test 2–5 停用 · Test 6 小范围验收</span></div>
+        <div><strong>Windows 验证</strong><span>真机 UI 响应与网络安全验收中</span></div>
+      </div>
+      <p class="note">以后只有 Manifest 中 Mac、Windows、控制面三者兼容时，release set 才会标记为 complete。这样不会再出现只升级 Mac、Windows 被新策略拒绝的情况。</p>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <p class="eyebrow">CHANGE ARCHIVE</p>
+        <h2>版本改动备份</h2>
+      </div>
+      <div class="timeline">
+        <article><time>2026-08-02</time><h3>Windows 2.5.4 Test 6（小范围验收）</h3><p>修复 13 个经对抗性验证的缺陷：连接超时不再中止自身任务（UI 永久“连接中”）、释放失败保留 armed 显示、连接成功重置监控种子（终结重连死循环）、DNS 启用后刷新解析缓存、WFP 开机先装后扫等；连接路径并发化提速。首个通过 7zz 载荷提取门与完整 preflight 的构建。真机 S6 故障注入仍待完成。</p></article>
+        <article><time>2026-08-02</time><h3>Windows 2.5.4 Test 5（已由 Test 6 取代）</h3><p>把 Windows Service IPC 放到独立 Tokio runtime，避免同步 named-pipe / SCM 工作饿死 Tauri runtime；调用方取消后请求仍可完成安全对账。连接中的阶段耗时现在会持续增长。安装包曾混入 alpha Mihomo 与 Unix 辅助文件，已由 Test 6 修正。</p></article>
+        <article><time>2026-08-02</time><h3>Windows 2.5.4 Test 4（已暂停）</h3><p>虽然修复了 TUN 接口别名 error 123，但 Windows 真机在进入“启动 Kill Switch”后原生窗口立即无响应。正在修复长生命周期连接任务与 UI 的隔离，当前不得继续测试。</p></article>
+        <article><time>2026-08-02</time><h3>Windows 2.5.4 Test 3（已停用）</h3><p>虽然修复了 GUI 启动恢复未验证 Kill Switch 状态，但锁定流量时把接口别名交给了错误的 Windows API，稳定返回 error 123。仅保留审计记录，请勿继续使用。</p></article>
+        <article><time>2026-08-02</time><h3>Windows 2.5.4 Test 2（已停用）</h3><p>可能在只打开 GUI 时恢复陈旧、未验证的 Kill Switch 状态并导致整机断网。已由 Test 4 取代，仅保留审计记录，请勿继续安装。</p></article>
+        <article><time>2026-08-02</time><h3>Windows 2.5.4 Test 1</h3><p>同步策略 v2、Claude 代理优先、精确视频 TCP/443、自适应 gVisor 和当前 Service helper；安装包、源码差异快照、构建清单均保存在 GitHub。</p></article>
+        <article><time>2026-08-01</time><h3>macOS Build 37</h3><p>七天精确域名直连试验；微信、视频网页独立统计和云端回滚；Claude 代理优先；自适应 Mihomo。</p></article>
+        <article><time>2026-08-01</time><h3>Windows 2.5.3 Test 1</h3><p>首个 hardened Windows x64 NSIS 测试包。未完成 Windows 真机和更新签名验证，现因仅支持策略 v1 转为历史包。</p></article>
+        <article><time>2026-08-01</time><h3>macOS Build 34</h3><p>建立 Sparkle 2 自动更新基线；每六小时检查；更新需用户确认；保留大陆弱网超时与有限重试。</p></article>
+        <article><time>2026-08-01</time><h3>macOS Build 33</h3><p>修复节点切换配置 reload 的模糊超时；失败继续保持 Kill Switch；同时保存 Build 33 以前安装包校验目录。</p></article>
+        <article><time>2026-07-31</time><h3>macOS Build 25</h3><p>用于国内连接故障定位的私有公证备份，加入 helper、Kill Switch、TUN、DNS 和 Reality 阶段审计。</p></article>
+      </div>
+    </section>
+
+    <footer>
+      <p>下载前核对 Manifest 中的 SHA-256。私有 draft 只保留回滚与审计记录，不作为客户下载渠道。</p>
+    </footer>
+  </main>
+</body>
+</html>

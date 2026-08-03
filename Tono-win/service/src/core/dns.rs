@@ -1,21 +1,40 @@
 //! Per-adapter DNS protection for the Windows kill switch.
 //!
-//! Snapshot every adapter's IPv4/IPv6 `NameServer`/`ProfileNameServer` → point them at the
-//! loopback resolver (`127.0.0.1` / `::1`) → verify by read-back → restore from the snapshot
-//! on disconnect. The snapshot (`protected-dns.json`) is written atomically to the service
-//! state directory *before* any value is changed — the same discipline as the kill-switch
-//! intent record.
+//! Snapshot every adapter's IPv4/IPv6 `NameServer`/`ProfileNameServer` → point IPv4 at the
+//! loopback resolver (`127.0.0.1`) and leave IPv6 with **no servers at all** → verify by
+//! read-back → restore from the snapshot on disconnect. The snapshot (`protected-dns.json`) is
+//! written atomically to the service state directory *before* any value is changed — the same
+//! discipline as the kill-switch intent record.
+//!
+//! **Why IPv6 gets an empty server list and not `::1`.** The core listens on
+//! `tono_core::config::DNS_LISTEN` = `127.0.0.1:53` — IPv4 only. Nothing has ever listened on
+//! `[::1]:53`. A build that pointed the IPv6 family at `::1` therefore configured a resolver
+//! that never answers, and every system lookup that Windows tried over IPv6 first waited out
+//! its full timeout: the fake-ip readiness probe failed three attempts at 2 s each and connect
+//! died in `securingDNS` on a machine whose DNS was otherwise fine. Nothing was bought for it —
+//! IPv6 DNS to a physical resolver is already *blocked* by WFP (the weight-6 `block-dns` filter
+//! on `CONNECT_V6` plus the condition-free v6 block-all), so `::1` prevented no leak. The
+//! protected IPv6 state is an empty **static** list ([`NO_NAME_SERVERS`]) — deliberately not
+//! DHCP, which would hand the ISP's resolvers straight back and *would* be a leak — so Windows
+//! falls through to the IPv4 loopback resolver, which answers. `::1` is still *recognised* as a
+//! protected/loopback value everywhere on the proof path, because adapters left that way by an
+//! older build must not read as restored.
 //!
 //! **DNS-before-disarm invariant (identical to the macOS helper):** the kill switch may only
 //! disarm after DNS restore is *proven*; if restore cannot be proven, the disarm is refused
 //! and the block stays armed. See `windows_kill_switch::disarm_unlocked`.
 //!
-//! **Proof covers the live resolver, not just the registry:** every live-apply result is
-//! recorded per adapter (in memory and in the snapshot file), and a restore is only proven
-//! when the registry matches *and* no adapter has a recorded live-apply failure. A failed
-//! live-apply is retried once during restore; an adapter that still fails keeps the restore
-//! unproven — fail-closed for the normal disarm, while the emergency path stays the documented
-//! escape hatch (it logs and proceeds).
+//! **Proof is read off the machine as it is now, never off history:** a restore is proven when
+//! the registry read-back matches the snapshot exactly *and* a live read says that nothing on
+//! the machine still resolves through the loopback core. Per-adapter live-apply results are
+//! still recorded (in memory and in the snapshot file) and a failed live-apply is still retried
+//! once during restore, but a `live_apply_failed` bit from an earlier round is a reason to
+//! *demand* that live evidence — never a veto over evidence that is already in. It used to be
+//! a veto, and that is exactly how a machine whose resolvers were provably the user's own again
+//! (`registry_match=true`) was refused release on a single stale failure while the degraded
+//! exit below needs a streak of three that one click on Disconnect can never reach. Evidence
+//! that cannot be obtained is *unproven*, never proven — fail-closed for the normal disarm,
+//! while the emergency path stays the documented escape hatch (it logs and proceeds).
 //!
 //! **The live apply is per address family.** IPv4 goes through CIM
 //! (`SetDNSServerSearchOrder`, an IPv4-only method), IPv6 through `netsh interface ipv6 set
@@ -59,8 +78,17 @@ const ENGINE_LIVE: bool = cfg!(all(windows, not(feature = "test")));
 
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 pub(crate) const LOOPBACK_V4: &str = "127.0.0.1";
+/// The IPv6 loopback address. **Recognised, never written.** Nothing listens on `[::1]:53`, so
+/// the protect path uses [`NO_NAME_SERVERS`] instead (see the module docs); this constant stays
+/// because an adapter left on `::1` by an older build must still be recognised as protected on
+/// the restore-proof path, or an upgrade would mis-prove a restore that never happened.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 pub(crate) const LOOPBACK_V6: &str = "::1";
+/// The protected IPv6 state: a *static* server list with nothing in it, which the registry
+/// stores as an empty `NameServer`. Distinct from deleting the value, which means DHCP and
+/// would put the ISP's resolvers back.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+pub(crate) const NO_NAME_SERVERS: &str = "";
 const SNAPSHOT_VERSION: u32 = 1;
 
 /// One adapter's original DNS values. `None` means the registry value was absent — the
@@ -74,7 +102,10 @@ pub(crate) struct AdapterDnsSnapshot {
     pub ipv6_profile_name_server: Option<String>,
     /// The last CIM live-apply for this adapter failed, so the running resolver cannot be
     /// trusted to match the registry until a retry succeeds. Recorded in memory and in the
-    /// snapshot file; blocks any restore proof (see the module docs).
+    /// snapshot file. It forces the loopback write to be replayed on the next enable
+    /// ([`needs_loopback_replay`]) and it is why the restore proof insists on live evidence —
+    /// but it does **not** by itself refuse a restore whose live state is verifiably correct
+    /// (see [`restore_is_proven`] and the module docs).
     #[serde(default)]
     pub live_apply_failed: bool,
 }
@@ -118,6 +149,15 @@ fn parse_name_server_list(value: &str) -> Vec<String> {
 /// worse — silently truncated to its IPv4 element, leaving the IPv6 resolver pointing at the
 /// previous ISP/DHCP server while the registry read-back still reports "protected". Each
 /// family now travels through its own mechanism and is proven separately (`engine`).
+///
+/// A saved value that is present but *empty* still maps to `None` (restore DHCP), even though
+/// an empty static list is what the protect path now writes for IPv6. Windows leaves an empty
+/// `NameServer` behind on perfectly ordinary DHCP adapters, so the registry cannot tell "the
+/// user chose static-with-no-servers" from "this family is on DHCP"; guessing static there
+/// would strand a DHCP machine with no resolvers at all. This never affects the protected
+/// state, which is read from the *snapshot* — the values as they were before Tono touched
+/// them — and the four exact registry values are written back verbatim regardless
+/// (`engine::apply_snapshot`), which is what the restore proof compares.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 fn restored_family_servers(profile: Option<&str>, base: Option<&str>) -> Option<Vec<String>> {
     let profile = profile.map(parse_name_server_list).unwrap_or_default();
@@ -156,7 +196,12 @@ fn format_name_server_list(servers: &[String]) -> String {
     servers.join(",")
 }
 
-/// Whether a read-back value is exactly the protected state: loopback only, nothing else.
+/// Whether a read-back value points at the loopback core: loopback only, nothing else.
+///
+/// This is the *recognition* predicate — "is the machine still resolving through a core that
+/// may no longer be running?" — and it is what the restore-proof path asks. Its meaning must
+/// not drift with the protect path: `::1` still counts, because an adapter left there by an
+/// older build is still pointed at a resolver that never answers.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 fn is_loopback_value(value: Option<&str>) -> bool {
     let Some(value) = value else {
@@ -167,6 +212,22 @@ fn is_loopback_value(value: Option<&str>) -> bool {
         && servers
             .iter()
             .all(|server| server == LOOPBACK_V4 || server == LOOPBACK_V6)
+}
+
+/// Whether a read-back **IPv6** value is the protected state — the question "is this adapter
+/// still protected?", which for IPv6 is not the same question as [`is_loopback_value`].
+///
+/// The protect path writes an empty static list, so an empty value is the protected state and
+/// must *not* read as drift: otherwise the watchdog would see every adapter as unprotected on
+/// every tick and rewrite the registry forever. A value absent altogether is DHCP — the ISP's
+/// resolvers — and is genuinely unprotected. `::1` is accepted so that an upgrade over a build
+/// that wrote it does not trigger a pointless machine-wide replay.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+fn is_protected_v6_value(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    parse_name_server_list(value).is_empty() || is_loopback_value(Some(value))
 }
 
 /// Idempotent enable: preserve every original already recorded, but append adapters that appeared
@@ -221,23 +282,88 @@ fn registry_restore_matches(snapshot: &DnsSnapshot, current: &[AdapterDnsSnapsho
     })
 }
 
-/// Restore is proven when every snapshotted adapter that is **still present in the live read**
-/// reads back exactly its saved values *and* carries no recorded live-apply failure — a
-/// registry match alone does not prove the running resolver left loopback.
+/// Restore is proven from the machine's **current** state, on two pieces of evidence together:
+/// every snapshotted adapter that is still present in the live read reads back exactly its
+/// saved values, *and* the live read says nothing on this machine still resolves through the
+/// loopback core. A registry match alone does not prove the second half, which is why
+/// `live_loopback` is a parameter and not an afterthought.
+///
+/// `live_loopback` carries that second half: `Some(false)` = nothing is on loopback (the only
+/// answer that can prove a restore), `Some(true)` = something provably still is (refused,
+/// unconditionally — this is the ordering invariant the disarm gate exists for), `None` = the
+/// engine could not be asked. Unobtainable evidence is *unproven*, never proven: it falls
+/// through to [`accepts_degraded_restore`], which still demands an exact registry match and a
+/// sustained failure streak.
+///
+/// What is deliberately **not** consulted: `live_apply_failed`. It records what happened in an
+/// earlier round, and using it as a veto is the defect this signature exists to fix — on a real
+/// machine the registry held the user's own resolvers again and nothing was on loopback, yet
+/// the release was refused because one adapter still carried the flag, and the degraded exit
+/// that is supposed to prevent exactly that deadlock needs three consecutive failures, which a
+/// user clicking Disconnect once never reaches. A historical failure is a reason to *demand*
+/// live evidence (the caller always gathers it), never a reason to overrule it.
 ///
 /// An adapter that has vanished from the live read (disabled, unplugged, or no longer holding a
-/// bound IP stack) counts as proven, *including* one carrying a live-apply failure flag: it has
-/// no running resolver left to leak through, and no amount of retrying can configure hardware
-/// that is not there. Demanding proof from an absent adapter would be an unrecoverable deadlock
-/// with no fail-closed benefit — the registry values it left behind are restored regardless,
-/// and if it comes back it comes back restored.
-fn restore_is_proven(snapshot: &DnsSnapshot, current: &[AdapterDnsSnapshot]) -> bool {
+/// bound IP stack) counts as proven: it has no running resolver left to leak through, and no
+/// amount of retrying can configure hardware that is not there. Demanding proof from an absent
+/// adapter would be an unrecoverable deadlock with no fail-closed benefit — the registry values
+/// it left behind are restored regardless, and if it comes back it comes back restored.
+fn restore_is_proven(
+    snapshot: &DnsSnapshot,
+    current: &[AdapterDnsSnapshot],
+    live_loopback: Option<bool>,
+) -> bool {
+    if live_loopback != Some(false) {
+        return false;
+    }
     snapshot.adapters.iter().all(|saved| {
         current
             .iter()
             .find(|adapter| adapter.interface_guid == saved.interface_guid)
-            .is_none_or(|adapter| !saved.live_apply_failed && registry_values_match(saved, adapter))
+            .is_none_or(|adapter| registry_values_match(saved, adapter))
     })
+}
+
+/// Whether the values saved for this adapter were *themselves* a loopback resolver.
+fn saved_dns_was_loopback(saved: &AdapterDnsSnapshot) -> bool {
+    is_loopback_value(saved.ipv4_name_server.as_deref())
+        || is_loopback_value(saved.ipv4_profile_name_server.as_deref())
+        || is_loopback_value(saved.ipv6_name_server.as_deref())
+        || is_loopback_value(saved.ipv6_profile_name_server.as_deref())
+}
+
+/// The adapters the live loopback read has to cover: everything present now, minus the ones
+/// whose *originals* were already a loopback resolver.
+///
+/// A machine that ran its own local resolver before Tono started (Acrylic, dnscrypt-proxy, a
+/// local Pi-hole) had `127.0.0.1` in the registry all along, and a correct restore puts it
+/// straight back. Asking the blunt "is anything on loopback?" question over that adapter would
+/// answer "yes" after every successful restore and refuse every disconnect for ever — the same
+/// class of deadlock this module keeps having to design out. The evidence the disarm gate
+/// actually needs is narrower: is anything on loopback that the snapshot says should not be?
+fn adapters_owing_live_proof(
+    snapshot: &DnsSnapshot,
+    current: &[AdapterDnsSnapshot],
+) -> Vec<AdapterDnsSnapshot> {
+    current
+        .iter()
+        .filter(|adapter| {
+            !snapshot.adapters.iter().any(|saved| {
+                saved.interface_guid == adapter.interface_guid && saved_dns_was_loopback(saved)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// How the live loopback evidence reads in an operator-facing message. `unknown` is its own
+/// state on purpose: "we could not look" must never be reported as "nothing was found".
+fn live_loopback_label(live_loopback: Option<bool>) -> &'static str {
+    match live_loopback {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
 }
 
 /// Consecutive failing live-apply rounds after which a registry-matching restore is accepted as
@@ -681,10 +807,15 @@ async fn engine_apply_snapshot(snapshot: &DnsSnapshot) -> Result<Vec<(String, bo
     }
     #[cfg(not(all(windows, not(feature = "test"))))]
     {
+        // The stub reports success unless a test asks for the machine condition that produced
+        // the real-machine deadlock: a live apply that fails while the registry restore behind
+        // it succeeds (`engine::apply_snapshot` writes the four registry values whatever the
+        // PowerShell batch reported).
+        let ok = !test_hooks::live_apply_fails();
         Ok(snapshot
             .adapters
             .iter()
-            .map(|adapter| (adapter.interface_guid.clone(), true))
+            .map(|adapter| (adapter.interface_guid.clone(), ok))
             .collect())
     }
 }
@@ -708,9 +839,13 @@ async fn engine_all_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<bool> {
     }
 }
 
-/// Whether any adapter still resolves through the loopback core. Only the snapshot-less
-/// recovery path needs this: everywhere else the question is "is protection complete?"
-/// (`engine_all_loopback`), not "is any of it left?".
+/// Whether any adapter still resolves through the loopback core — "is any of it left?", the
+/// mirror of `engine_all_loopback`'s "is protection complete?".
+///
+/// Two callers: the snapshot-less recovery, and the restore proof itself, which needs positive
+/// live evidence that the machine is not being left pointed at a core that is about to stop
+/// answering (see [`restore_is_proven`]). The restore proof narrows the adapter list first
+/// ([`adapters_owing_live_proof`]).
 async fn engine_any_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<bool> {
     #[cfg(all(windows, not(feature = "test")))]
     {
@@ -748,6 +883,19 @@ pub(crate) mod test_hooks {
     /// that cannot read its snapshot is genuinely unprovable.
     pub(crate) fn set_live_dns_on_loopback(on_loopback: bool) {
         LIVE_DNS_ON_LOOPBACK.store(on_loopback, Ordering::Relaxed);
+    }
+
+    static LIVE_APPLY_FAILS: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn live_apply_fails() -> bool {
+        LIVE_APPLY_FAILS.load(Ordering::Relaxed)
+    }
+
+    /// Simulate the machine from the real regression: PowerShell/CIM reports the live apply as
+    /// failed (which records `live_apply_failed` and starts the streak) while the registry
+    /// restore underneath it succeeded.
+    pub(crate) fn set_live_apply_fails(fails: bool) {
+        LIVE_APPLY_FAILS.store(fails, Ordering::Relaxed);
     }
 }
 
@@ -995,9 +1143,9 @@ async fn enable_unlocked(trigger: EnableTrigger) -> Result<DnsProtectionStatus> 
     status_unlocked().await
 }
 
-/// Restore every adapter from the snapshot, prove it by read-back *and* by clean live-apply
-/// records, then drop the snapshot. Failing any of that keeps the snapshot — and, via the
-/// disarm invariant, the block armed.
+/// Restore every adapter from the snapshot, prove it by registry read-back *and* by a live read
+/// that finds nothing left on the loopback core, then drop the snapshot. Failing any of that
+/// keeps the snapshot — and, via the disarm invariant, the block armed.
 pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
     if !SUPPORTED {
         return status_unlocked().await;
@@ -1042,31 +1190,78 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
         note_live_results(&mut snapshot, &live);
         // Persist the refreshed flags either way; a refused disarm must keep accurate records.
         atomic_write(&snapshot_path(), &serde_json::to_vec_pretty(&snapshot)?).await?;
-        if ENGINE_LIVE {
-            let current = engine_collect().await?;
-            if !restore_is_proven(&snapshot, &current) {
-                let registry = registry_restore_matches(&snapshot, &current);
-                if !accepts_degraded_restore(streak, registry) {
-                    bail!(
-                        "DNS restore could not be proven (registry_match={registry}, consecutive_live_apply_failures={streak}); protection remains armed"
-                    );
-                }
-                // The live mechanism is structurally unavailable on this machine, but the
-                // registry — what the DNS Client reads for the next lookup — holds exactly the
-                // saved values. Accept, and start the streak again so the next session must
-                // earn this exit on its own.
-                CONSECUTIVE_LIVE_FAILURES.store(0, Ordering::Relaxed);
-                return Ok(Some(format!(
-                    "{DNS_RESTORE_DEGRADED_PREFIX}: the original DNS servers were restored in \
-                     the registry and verified by read-back, but the live apply failed {streak} \
-                     rounds in a row, so the running resolver could not be confirmed. Disconnect \
-                     was allowed rather than leaving the machine locked in Protected Offline. If \
-                     name resolution misbehaves, disable and re-enable the network adapter (or \
-                     reboot); PowerShell/WMI on this machine appears to be restricted."
-                )));
+        // The registry half of the proof, read back off the machine. The stub engine reports no
+        // adapters at all, which would make the comparison vacuous, so off Windows the
+        // snapshot's own entries stand in and the live evidence below is what decides.
+        let current = if ENGINE_LIVE {
+            engine_collect().await?
+        } else {
+            snapshot.adapters.clone()
+        };
+        // The live half: is anything on this machine still pointed at the loopback core? This is
+        // the same evidence the corrupt-snapshot recovery runs on, and it is what replaced the
+        // `live_apply_failed` veto — a stale flag from an earlier round now makes us insist on
+        // this read, instead of overruling it.
+        //
+        // An engine that cannot answer leaves the restore *unproven*, never proven: the
+        // question falls to the degraded exit below, which still demands an exact registry
+        // match and a sustained streak.
+        let owing_live_proof = adapters_owing_live_proof(&snapshot, &current);
+        let live_loopback = match engine_any_loopback(&owing_live_proof).await {
+            Ok(any_loopback) => Some(any_loopback),
+            Err(error) => {
+                tracing::warn!(
+                    "dns: the live DNS state could not be read while proving the restore, so \
+                     the restore stays unproven: {error:#}"
+                );
+                None
             }
-        } else if snapshot.adapters.iter().any(|adapter| adapter.live_apply_failed) {
-            bail!("DNS restore could not be proven (recorded live-apply failure)");
+        };
+        if !restore_is_proven(&snapshot, &current, live_loopback) {
+            let registry = registry_restore_matches(&snapshot, &current);
+            let loopback = live_loopback_label(live_loopback);
+            if live_loopback == Some(true) {
+                // Provably still on loopback: refused before the degraded exit is even
+                // considered. No failure streak may release protection while the machine would
+                // be left resolving through a core that is about to stop answering — that is
+                // the ordering invariant the disarm gate exists to hold.
+                bail!(
+                    "DNS restore could not be proven: adapters on this machine still resolve \
+                     through Tono's loopback resolver (registry_match={registry}, \
+                     still_on_loopback={loopback}, \
+                     consecutive_live_apply_failures={streak}), so protection stays armed rather \
+                     than leaving DNS pointed at a resolver that is about to stop answering. \
+                     Try Disconnect again; if it keeps failing, right-click the Start-Menu entry \
+                     \"Tono — 恢复网络 (Restore Network)\" and choose \"Run as administrator\", \
+                     or run `tono-service.exe --emergency-disarm` from an elevated prompt — \
+                     either one releases the block and puts the saved DNS servers back."
+                );
+            }
+            if !accepts_degraded_restore(streak, registry) {
+                bail!(
+                    "DNS restore could not be proven (registry_match={registry}, \
+                     still_on_loopback={loopback}, \
+                     consecutive_live_apply_failures={streak}); protection remains armed. Try \
+                     Disconnect again; if it keeps failing, right-click the Start-Menu entry \
+                     \"Tono — 恢复网络 (Restore Network)\" and choose \"Run as administrator\", \
+                     or run `tono-service.exe --emergency-disarm` from an elevated prompt — \
+                     either one releases the block and puts the saved DNS servers back."
+                );
+            }
+            // The live mechanism is structurally unavailable on this machine, but the
+            // registry — what the DNS Client reads for the next lookup — holds exactly the
+            // saved values. Accept, and start the streak again so the next session must
+            // earn this exit on its own.
+            CONSECUTIVE_LIVE_FAILURES.store(0, Ordering::Relaxed);
+            return Ok(Some(format!(
+                "{DNS_RESTORE_DEGRADED_PREFIX}: the original DNS servers were restored in \
+                 the registry and verified by read-back, but the live apply failed {streak} \
+                 rounds in a row and the live DNS state could not be confirmed \
+                 (still_on_loopback={loopback}). Disconnect was allowed rather than leaving \
+                 the machine locked in Protected Offline. If name resolution misbehaves, \
+                 disable and re-enable the network adapter (or reboot); PowerShell/WMI on this \
+                 machine appears to be restricted."
+            )));
         }
         Ok(None)
     }
@@ -1297,7 +1492,10 @@ fn is_active_dns_adapter(oper_status: i32, if_type: u32, has_bound_ip: bool) -> 
 
 #[cfg(all(windows, not(feature = "test")))]
 mod engine {
-    use super::{AdapterDnsSnapshot, DnsSnapshot, is_active_dns_adapter, is_loopback_value};
+    use super::{
+        AdapterDnsSnapshot, DnsSnapshot, is_active_dns_adapter, is_loopback_value,
+        is_protected_v6_value,
+    };
     use anyhow::{Context as _, Result, bail};
     use std::ffi::CStr;
     use windows_sys::Win32::Foundation::{
@@ -1585,13 +1783,17 @@ mod engine {
     ///   every `Invoke-CimMethod` checks its `ReturnValue` — piping to `Out-Null` would report
     ///   success for a rejected call.
     /// * IPv6 goes through `netsh interface ipv6 set/add dnsservers`, keyed by the IPv6
-    ///   interface index. The CIM method is documented for IPv4 addresses only: handing it
-    ///   `::1` is how the previous version could either fail on every adapter forever or, worse,
-    ///   have the address silently dropped and leave an IPv6 resolver pointing at the ISP while
-    ///   the registry read-back still said "protected".
+    ///   interface index, in three shapes: `source=dhcp` (`$null`, restore a family that had no
+    ///   saved value), `source=static address=none` (an empty list — the protected state, since
+    ///   the core has no `[::1]:53` listener to point at), and `source=static` plus one `add`
+    ///   per extra server when restoring saved ones. The CIM method is documented for IPv4
+    ///   addresses only: handing it an IPv6 address is how an older version could either fail on
+    ///   every adapter forever or, worse, have the address silently dropped and leave an IPv6
+    ///   resolver pointing at the ISP while the registry read-back still said "protected".
     /// * The script then *reads the live list back per family* (`Get-DnsClientServerAddress`)
     ///   and only reports success when what it reads matches what it applied — exactly the
-    ///   loopback list when protecting, and "the loopback address is gone" when restoring
+    ///   loopback list for IPv4 and exactly *nothing* for IPv6 when protecting, and "the
+    ///   loopback address is gone" when restoring
     ///   (a restored family's servers may legitimately come back from DHCP in another order).
     ///   A family with no live DNS instance, an interface index of 0, or a CIM `ReturnValue` of
     ///   84 ("IP not enabled on adapter") is a non-participant: there is no resolver on it to
@@ -1608,7 +1810,10 @@ mod engine {
         /// Live IPv4/IPv6 interface indices; 0 means the family is not bound here.
         ipv4_index: u32,
         ipv6_index: u32,
-        /// `None` restores DHCP for that family (CIM `$null` / `netsh … source=dhcp`).
+        /// `None` restores DHCP for that family (CIM `$null` / `netsh … source=dhcp`);
+        /// `Some(empty)` is a *static* list with no servers at all (`netsh … source=static
+        /// address=none`), which is the protected IPv6 state. The two are not interchangeable:
+        /// DHCP would put the ISP's resolvers back.
         ipv4_servers: Option<Vec<String>>,
         ipv6_servers: Option<Vec<String>>,
     }
@@ -1616,11 +1821,17 @@ mod engine {
     /// What the live read-back has to prove.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ApplyMode {
-        /// Protecting: the family's live list must be *exactly* the loopback list.
+        /// Protecting: the family's live list must be *exactly* what was applied — the loopback
+        /// address for IPv4, and nothing at all for IPv6.
         Loopback,
         /// Restoring: the family's live list must no longer contain the loopback address.
         /// Exact equality is the registry's job (`restore_is_proven`), and DHCP may legitimately
         /// return the saved servers in another order or with an extra suffix server.
+        ///
+        /// An IPv6 family that comes back *empty* is deliberately not a failure here: a network
+        /// that supplies no DHCPv6 resolvers legitimately reads that way, and an empty list
+        /// strands nobody — only an IPv4 resolver still pointed at a stopped core can do that.
+        /// Exactness for IPv6 is enforced where it is unambiguous: the registry read-back.
         Restore,
     }
 
@@ -1786,6 +1997,9 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
     $e = 0
     if ($null -eq $v6) {
       netsh interface ipv6 set dnsservers "name=$i6" source=dhcp | Out-Null
+      $e = $e + $LASTEXITCODE
+    } elseif ($v6.Count -eq 0) {
+      netsh interface ipv6 set dnsservers "name=$i6" source=static address=none | Out-Null
       $e = $e + $LASTEXITCODE
     } else {
       netsh interface ipv6 set dnsservers "name=$i6" source=static "address=$($v6[0])" register=none validate=no | Out-Null
@@ -1981,17 +2195,24 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
             write_sz(&v4_key(guid), PROFILE_NAME_SERVER, super::LOOPBACK_V4)?;
         }
         if key_exists(&v6_key(guid))? {
-            write_sz(&v6_key(guid), NAME_SERVER, super::LOOPBACK_V6)?;
-            write_sz(&v6_key(guid), PROFILE_NAME_SERVER, super::LOOPBACK_V6)?;
+            // Empty, not `::1`: the core listens on `127.0.0.1:53` only, so an adapter pointed
+            // at `::1` has a configured IPv6 resolver that never answers and every system
+            // lookup pays the full OS timeout before falling back — the `securingDNS` failure
+            // this replaced. Empty is also not the same as *deleting* the value: deletion means
+            // DHCP, which would hand the ISP's IPv6 resolvers back and would be a real leak.
+            // With no IPv6 servers Windows uses the IPv4 loopback resolver, which answers.
+            write_sz(&v6_key(guid), NAME_SERVER, super::NO_NAME_SERVERS)?;
+            write_sz(&v6_key(guid), PROFILE_NAME_SERVER, super::NO_NAME_SERVERS)?;
         }
         Ok(LiveApplyEntry {
             guid: guid.to_owned(),
             ipv4_index: active.ipv4_index,
             ipv6_index: active.ipv6_index,
-            // One family per list: the IPv4 mechanism never sees `::1` and the IPv6 mechanism
-            // never sees `127.0.0.1`, and each is proven on its own family.
+            // One family per list: the IPv4 mechanism never sees an IPv6 address and the IPv6
+            // mechanism never sees `127.0.0.1`, and each is proven on its own family.
             ipv4_servers: Some(vec![super::LOOPBACK_V4.to_owned()]),
-            ipv6_servers: Some(vec![super::LOOPBACK_V6.to_owned()]),
+            // `Some(empty)` = a static list with no servers; `None` would mean DHCP.
+            ipv6_servers: Some(Vec::new()),
         })
     }
 
@@ -2095,10 +2316,14 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
         Ok(false)
     }
 
+    /// Whether every adapter is in the protected state. The two families do not answer the same
+    /// question: IPv4 must be on the loopback resolver, while IPv6 must have **no servers at
+    /// all** — that is what the protect path writes, and reading it as drift would have the
+    /// watchdog rewrite the registry every two seconds for ever.
     pub(super) fn all_loopback(guids: &[String]) -> Result<bool> {
         for guid in guids {
             let adapter = read_adapter(guid)?;
-            // Each present family must be fully on loopback — NameServer and, when set,
+            // Each present family must be fully protected — NameServer and, when set,
             // ProfileNameServer (which overrides NameServer for the active profile). An absent
             // family is skipped, matching the apply side.
             if key_exists(&v4_key(guid))?
@@ -2109,9 +2334,9 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
                 return Ok(false);
             }
             if key_exists(&v6_key(guid))?
-                && (!is_loopback_value(adapter.ipv6_name_server.as_deref())
+                && (!is_protected_v6_value(adapter.ipv6_name_server.as_deref())
                     || (adapter.ipv6_profile_name_server.is_some()
-                        && !is_loopback_value(adapter.ipv6_profile_name_server.as_deref())))
+                        && !is_protected_v6_value(adapter.ipv6_profile_name_server.as_deref())))
             {
                 return Ok(false);
             }
@@ -2149,12 +2374,43 @@ mod tests {
     #[test]
     fn loopback_detection_is_exact() {
         assert!(is_loopback_value(Some("127.0.0.1")));
-        assert!(is_loopback_value(Some("::1")));
+        assert!(
+            is_loopback_value(Some(LOOPBACK_V6)),
+            "the protect path no longer writes ::1, but an adapter left there by an older build \
+             is still pointed at a resolver that never answers and must not read as restored"
+        );
         assert!(is_loopback_value(Some("127.0.0.1, ::1")));
         assert!(!is_loopback_value(Some("127.0.0.1, 1.1.1.1")));
         assert!(!is_loopback_value(Some("1.1.1.1")));
         assert!(!is_loopback_value(Some("")));
         assert!(!is_loopback_value(None));
+    }
+
+    /// The IPv6 half of the `securingDNS` regression. Nothing listens on `[::1]:53`
+    /// (`tono_core::config::DNS_LISTEN` is `127.0.0.1:53`), so the protected IPv6 state is an
+    /// empty static server list — and "protected" therefore has to mean something different per
+    /// family, or the watchdog reads the state it just wrote as drift and rewrites it for ever.
+    #[test]
+    fn an_empty_ipv6_server_list_is_the_protected_state() {
+        assert!(
+            is_protected_v6_value(Some(NO_NAME_SERVERS)),
+            "an empty static list is what the protect path writes"
+        );
+        assert!(is_protected_v6_value(Some("  ,  ")));
+        assert!(
+            is_protected_v6_value(Some(LOOPBACK_V6)),
+            "an upgrade over a build that wrote ::1 must not read as drift"
+        );
+        assert!(
+            !is_protected_v6_value(None),
+            "an absent value is DHCP — the ISP's resolvers — not protection"
+        );
+        assert!(!is_protected_v6_value(Some("2606:4700:4700::1111")));
+        assert!(
+            !is_loopback_value(Some(NO_NAME_SERVERS)),
+            "an empty list resolves through nothing at all, so it is not evidence that the \
+             machine is still pointed at the loopback core"
+        );
     }
 
     #[test]
@@ -2210,19 +2466,70 @@ mod tests {
             ],
         };
         let restored = vec![adapter("{A}", Some("1.1.1.1")), adapter("{B}", None)];
-        assert!(restore_is_proven(&snapshot, &restored));
+        assert!(restore_is_proven(&snapshot, &restored, Some(false)));
 
         let still_loopback = vec![adapter("{A}", Some(LOOPBACK_V4)), adapter("{B}", None)];
-        assert!(!restore_is_proven(&snapshot, &still_loopback));
+        assert!(!restore_is_proven(&snapshot, &still_loopback, Some(true)));
 
         let wrong_server = vec![adapter("{A}", Some("8.8.8.8")), adapter("{B}", None)];
-        assert!(!restore_is_proven(&snapshot, &wrong_server));
+        assert!(!restore_is_proven(&snapshot, &wrong_server, Some(false)));
 
         let missing_adapter = vec![adapter("{A}", Some("1.1.1.1"))];
         assert!(
-            restore_is_proven(&snapshot, &missing_adapter),
+            restore_is_proven(&snapshot, &missing_adapter, Some(false)),
             "an adapter whose registry key vanished has no live resolver left to restore"
         );
+    }
+
+    /// The live half of the proof, which is what replaced the `live_apply_failed` veto. Only
+    /// "nothing is on loopback" can prove a restore; "something still is" refuses it, and
+    /// "we could not look" is unproven — never proven.
+    #[test]
+    fn restore_proof_needs_positive_live_evidence() {
+        let snapshot = DnsSnapshot {
+            version: SNAPSHOT_VERSION,
+            taken_at: 1,
+            adapters: vec![adapter("{A}", Some("1.1.1.1"))],
+        };
+        let restored = vec![adapter("{A}", Some("1.1.1.1"))];
+        assert!(restore_is_proven(&snapshot, &restored, Some(false)));
+        assert!(
+            !restore_is_proven(&snapshot, &restored, Some(true)),
+            "an exact registry match cannot outvote an adapter that is provably still on \
+             loopback — that ordering is the whole point of the disarm gate"
+        );
+        assert!(
+            !restore_is_proven(&snapshot, &restored, None),
+            "evidence that could not be gathered (a wedged engine, a timed-out call) is \
+             unproven; the degraded exit is the only way past it"
+        );
+    }
+
+    /// A machine that ran its own local resolver before Tono started had `127.0.0.1` all along.
+    /// Restoring it puts `127.0.0.1` back — correctly — so the blunt "is anything on loopback?"
+    /// question must not be asked about that adapter, or every disconnect is refused for ever.
+    #[test]
+    fn the_live_loopback_read_skips_adapters_whose_originals_were_loopback() {
+        let snapshot = DnsSnapshot {
+            version: SNAPSHOT_VERSION,
+            taken_at: 1,
+            adapters: vec![
+                adapter("{LOCAL-RESOLVER}", Some(LOOPBACK_V4)),
+                adapter("{NORMAL}", Some("1.1.1.1")),
+            ],
+        };
+        let current = vec![
+            adapter("{LOCAL-RESOLVER}", Some(LOOPBACK_V4)),
+            adapter("{NORMAL}", Some("1.1.1.1")),
+        ];
+        let owing = adapters_owing_live_proof(&snapshot, &current);
+        assert_eq!(owing.len(), 1);
+        assert_eq!(owing[0].interface_guid, "{NORMAL}");
+
+        // An adapter that appeared after the snapshot owes the proof: nothing says it was on
+        // loopback of its own accord.
+        let with_new = vec![adapter("{NEW}", Some(LOOPBACK_V4))];
+        assert_eq!(adapters_owing_live_proof(&snapshot, &with_new).len(), 1);
     }
 
     #[test]
@@ -2279,20 +2586,36 @@ mod tests {
             taken_at: 1,
             adapters: vec![v6_only.clone()],
         };
-        assert!(restore_is_proven(&snapshot, std::slice::from_ref(&v6_only)));
+        assert!(restore_is_proven(
+            &snapshot,
+            std::slice::from_ref(&v6_only),
+            Some(false)
+        ));
 
         let wrong_v6 = AdapterDnsSnapshot {
             ipv6_name_server: Some("2001:db8::53".to_owned()),
             ..v6_only.clone()
         };
-        assert!(!restore_is_proven(&snapshot, &[wrong_v6]));
+        assert!(!restore_is_proven(&snapshot, &[wrong_v6], Some(false)));
 
-        let drifted_to_loopback = AdapterDnsSnapshot {
-            ipv6_name_server: Some("::1".to_owned()),
+        // The protect path leaves IPv6 with no servers now, so this is what a *failed* v6
+        // restore looks like: the registry no longer holds the user's resolver.
+        let still_protected = AdapterDnsSnapshot {
+            ipv6_name_server: Some(NO_NAME_SERVERS.to_owned()),
+            ..v6_only.clone()
+        };
+        assert!(
+            !restore_is_proven(&snapshot, &[still_protected], Some(false)),
+            "an IPv6 family still holding the empty protected list is not restored, even though \
+             an empty list is not itself a loopback value"
+        );
+
+        let left_on_loopback_by_an_older_build = AdapterDnsSnapshot {
+            ipv6_name_server: Some(LOOPBACK_V6.to_owned()),
             ..v6_only
         };
         assert!(
-            !restore_is_proven(&snapshot, &[drifted_to_loopback]),
+            !restore_is_proven(&snapshot, &[left_on_loopback_by_an_older_build], Some(true)),
             "still on loopback is not a proven restore"
         );
     }
@@ -2308,11 +2631,16 @@ mod tests {
             adapter("{A}", Some("1.1.1.1")),
             adapter("{NEW}", Some("8.8.8.8")), // appeared later; not ours to prove
         ];
-        assert!(restore_is_proven(&snapshot, &current));
+        assert!(restore_is_proven(&snapshot, &current, Some(false)));
     }
 
+    /// The exact real-machine failure, in pure form. The registry held the user's own
+    /// resolvers again (`registry_match=true`) and nothing was on loopback, yet the release was
+    /// refused because one adapter carried a live-apply-failure flag — and the degraded exit
+    /// that exists to prevent that deadlock needs a streak of three, which one click on
+    /// Disconnect never reaches. The flag now makes us *demand* live evidence, not overrule it.
     #[test]
-    fn restore_proof_requires_clean_live_apply_records() {
+    fn a_live_apply_failure_no_longer_vetoes_a_restore_the_live_state_confirms() {
         let mut flagged = adapter("{A}", Some("1.1.1.1"));
         flagged.live_apply_failed = true;
         let snapshot = DnsSnapshot {
@@ -2322,11 +2650,20 @@ mod tests {
         };
         let current = vec![adapter("{A}", Some("1.1.1.1"))];
         assert!(
-            !restore_is_proven(&snapshot, &current),
-            "a recorded live-apply failure blocks the proof even when the registry matches"
+            restore_is_proven(&snapshot, &current, Some(false)),
+            "registry restored + nothing on loopback is a proven restore, whatever an earlier \
+             round recorded"
+        );
+        assert!(
+            !restore_is_proven(&snapshot, &current, Some(true)),
+            "the flag is not what refuses a restore — being provably still on loopback is"
+        );
+        assert!(
+            !restore_is_proven(&snapshot, &current, None),
+            "a flagged adapter with no obtainable live evidence stays unproven"
         );
 
-        // Memory failures merge into the snapshot the same way.
+        // Memory failures still merge into the snapshot; they simply no longer decide.
         let clean = DnsSnapshot {
             version: SNAPSHOT_VERSION,
             taken_at: 1,
@@ -2334,9 +2671,8 @@ mod tests {
         };
         let merged = with_live_failures(&clean, &["{A}".to_owned()].into_iter().collect());
         assert!(merged.adapters[0].live_apply_failed);
-        assert!(!restore_is_proven(&merged, &current));
-        let unaffected = with_live_failures(&clean, &Default::default());
-        assert!(restore_is_proven(&unaffected, &current));
+        assert!(restore_is_proven(&merged, &current, Some(false)));
+        assert!(!restore_is_proven(&merged, &current, Some(true)));
     }
 
     #[test]
@@ -2473,6 +2809,106 @@ mod tests {
             tokio::fs::metadata(&snapshot).await.is_err(),
             "no snapshot file may be written by the reconciler"
         );
+        Ok(())
+    }
+
+    /// Put the DNS globals back where a fresh process would have them; these tests drive the
+    /// real facade, and a leaked failure flag or streak would decide the next test's proof.
+    async fn reset_dns_state() {
+        let _ = tokio::fs::remove_file(snapshot_path()).await;
+        LIVE_APPLY_FAILURES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        CONSECUTIVE_LIVE_FAILURES.store(0, Ordering::Relaxed);
+        *DNS_LAST_ERROR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        test_hooks::set_live_dns_on_loopback(false);
+        test_hooks::set_live_apply_fails(false);
+    }
+
+    /// The real-machine regression, end to end. `securingDNS` aside, this is the half that
+    /// stranded the user: the registry restore had succeeded (`registry_match=true`), the live
+    /// apply reported a failure for one adapter (`consecutive_live_apply_failures=1`), nothing
+    /// was left on loopback — and the release was refused anyway, because a `live_apply_failed`
+    /// flag vetoed the proof. The degraded exit that exists to prevent exactly that deadlock
+    /// needs three consecutive failures, which one click on Disconnect can never reach.
+    #[tokio::test]
+    #[serial]
+    async fn a_live_apply_failure_does_not_strand_a_machine_whose_dns_is_restored() -> Result<()> {
+        reset_dns_state().await;
+        // The live apply fails this round; `engine::apply_snapshot` writes the four registry
+        // values regardless, which is why the machine's resolvers are the user's own again.
+        test_hooks::set_live_apply_fails(true);
+        let mut flagged = adapter("{A}", Some("1.1.1.1"));
+        flagged.live_apply_failed = true; // and an earlier round had already recorded one
+        atomic_write(
+            &snapshot_path(),
+            &serde_json::to_vec_pretty(&DnsSnapshot {
+                version: SNAPSHOT_VERSION,
+                taken_at: 1,
+                adapters: vec![flagged],
+            })?,
+        )
+        .await?;
+
+        let status = restore_protected().await?;
+
+        assert!(
+            !status.snapshot_present,
+            "a proven restore drops the snapshot, which is what opens the disarm gate"
+        );
+        assert!(
+            tokio::fs::metadata(snapshot_path()).await.is_err(),
+            "the snapshot file must be gone once the restore is proven"
+        );
+        assert_eq!(
+            status.last_error, None,
+            "the live state confirms the restore outright — this is not the degraded exit"
+        );
+        reset_dns_state().await;
+        Ok(())
+    }
+
+    /// The other half of the same change: dropping the historical veto must not drop the
+    /// ordering invariant. A machine that is provably still resolving through the loopback core
+    /// is refused however good the registry looks and however long the failure streak is, and
+    /// the refusal has to tell the user what to do about it.
+    #[tokio::test]
+    #[serial]
+    async fn a_restore_is_still_refused_while_an_adapter_is_provably_on_loopback() -> Result<()> {
+        reset_dns_state().await;
+        test_hooks::set_live_dns_on_loopback(true);
+        atomic_write(
+            &snapshot_path(),
+            &serde_json::to_vec_pretty(&DnsSnapshot {
+                version: SNAPSHOT_VERSION,
+                taken_at: 1,
+                adapters: vec![adapter("{A}", Some("1.1.1.1"))],
+            })?,
+        )
+        .await?;
+
+        let error = restore_protected()
+            .await
+            .expect_err("a machine still on loopback may not release protection");
+        let message = format!("{error:#}");
+        assert!(message.contains("registry_match=true"), "{message}");
+        assert!(message.contains("still_on_loopback=yes"), "{message}");
+        assert!(
+            message.contains("consecutive_live_apply_failures="),
+            "the diagnosis that made the real failure readable must survive: {message}"
+        );
+        assert!(
+            message.contains("--emergency-disarm") && message.contains("Restore Network"),
+            "a refusal must name both documented ways out: {message}"
+        );
+        assert!(
+            tokio::fs::metadata(snapshot_path()).await.is_ok(),
+            "a refused restore keeps its snapshot for the retry"
+        );
+        reset_dns_state().await;
         Ok(())
     }
 

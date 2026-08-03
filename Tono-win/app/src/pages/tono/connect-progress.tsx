@@ -8,19 +8,20 @@ import { useQuery } from '@/services/query-client'
 import { useThemeMode } from '@/services/states'
 import {
   formatTonoActionError,
+  formatTonoDiagnostics,
+  formatTonoElapsed,
   subscribeTonoStatus,
-  tonoAuditLogPath,
   tonoConnectProgress,
+  tonoDiagnosticsReport,
   tonoDisconnect,
   tonoRetryNow,
+  tonoUploadDiagnostics,
   type TonoConnectStep,
-  type TonoKillSwitch,
   type TonoUiState,
 } from '@/services/tono'
 import { GlassCard } from '@/tono-ui/GlassCard'
 import { TONO_COLORS, TONO_MONO_STACK, tonoText } from '@/tono-ui/theme'
 import { TonoConfirmDialog } from '@/tono-ui/TonoAccountCard'
-import { version } from '@root/package.json'
 
 /**
  * The connect-progress card (Mac Build 29 parity): the eight FSM stages with
@@ -48,9 +49,8 @@ const hex = (color: string, alpha: number) =>
     .padStart(2, '0')
     .toUpperCase()}`
 
-/** "Xs or X.Xs" per the Mac format. */
-const formatElapsed = (ms: number) =>
-  ms >= 10000 ? `${Math.round(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`
+/** "Xs or X.Xs" per the Mac format (shared with the diagnostics renderer). */
+const formatElapsed = formatTonoElapsed
 
 const useConnectProgress = (active: boolean) => {
   const { data: progress, refetch } = useQuery({
@@ -127,15 +127,21 @@ const StepIcon = ({ state }: { state: TonoConnectStep['state'] }) => {
 
 interface ConnectProgressCardProps {
   uiState: TonoUiState
-  selectedServer: string | null
-  killSwitch: TonoKillSwitch | null
   onRefreshStatus: () => Promise<unknown>
 }
 
+/**
+ * The diagnostics upload is strictly user-initiated: idle → the user reads
+ * what will be sent → confirms → one in-flight request → a reference code
+ * that replaces the button. There is no path back to `idle` from `sent`
+ * without remounting the card, which is the client half of the abuse
+ * defence: the button cannot be pressed twice in a row, and cannot be held
+ * down while a request is in flight.
+ */
+type UploadPhase = 'idle' | 'confirming' | 'uploading' | 'sent'
+
 export const ConnectProgressCard = ({
   uiState,
-  selectedServer,
-  killSwitch,
   onRefreshStatus,
 }: ConnectProgressCardProps) => {
   const { t } = useTranslation()
@@ -150,6 +156,10 @@ export const ConnectProgressCard = ({
   const [restoreOpen, setRestoreOpen] = useState(false)
   const [restoreError, setRestoreError] = useState<string | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
+  const [uploadPhase, setUploadPhase] = useState<UploadPhase>('idle')
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const [referenceCode, setReferenceCode] = useState<string | null>(null)
+  const [codeCopied, setCodeCopied] = useState(false)
 
   const nextRetryAtMs = progress?.nextRetryAtMs ?? null
 
@@ -184,43 +194,50 @@ export const ConnectProgressCard = ({
     await onRefreshStatus()
   })
 
+  // Copy details renders the *same* structured report the upload sends
+  // (`tono_diagnostics_report` is the local, nothing-leaves-the-machine half
+  // of `tono_upload_diagnostics`), so the two can never disagree about what
+  // the payload contains — which is what makes the disclosure below honest.
   const handleCopyDetails = useLockFn(async () => {
-    const logPath = await tonoAuditLogPath()
-      .then((info) => info.path)
-      .catch(() => '(unavailable)')
-    const lines = [
-      `Tono v${version} diagnostics`,
-      `Server: ${selectedServer ?? '(none)'}`,
-      `UI state: ${uiState}`,
-      `Kill switch: ${
-        killSwitch
-          ? !killSwitch.wanted && !killSwitch.live
-            ? `inactive (reported mode=${killSwitch.mode}, wanted=false, live=false)`
-            : `${killSwitch.mode} (wanted=${killSwitch.wanted}, live=${killSwitch.live})`
-          : '(unknown)'
-      }`,
-      `Failed stage: ${progress?.failedStage ?? '(none)'}`,
-      `Error: ${progress?.error ?? '(none)'}`,
-      `Retry attempt: ${progress?.retryAttempt ?? 0}`,
-      `Total elapsed: ${
-        progress?.totalElapsedMs != null
-          ? formatElapsed(progress.totalElapsedMs)
-          : '(n/a)'
-      }`,
-      'Steps:',
-      ...(progress?.steps ?? []).map(
-        (step) =>
-          `  - ${step.key}: ${step.state}${
-            step.elapsedMs != null ? ` (${formatElapsed(step.elapsedMs)})` : ''
-          }`,
-      ),
-      `Audit log: ${logPath}`,
-    ]
+    let text: string
     try {
-      await navigator.clipboard.writeText(lines.join('\n'))
+      text = formatTonoDiagnostics(await tonoDiagnosticsReport())
+    } catch (error) {
+      console.warn('[ConnectProgress] diagnostics report failed:', error)
+      showNotice.error('tono.progress.copyFailed')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(text)
       showNotice.success('tono.progress.copied')
     } catch (error) {
       console.warn('[ConnectProgress] copy to clipboard failed:', error)
+      showNotice.error('tono.progress.copyFailed')
+    }
+  })
+
+  const handleUpload = useLockFn(async () => {
+    setUploadPhase('uploading')
+    setUploadError(null)
+    try {
+      const receipt = await tonoUploadDiagnostics()
+      setReferenceCode(receipt.referenceCode)
+      setUploadPhase('sent')
+    } catch (error) {
+      setUploadError(formatTonoActionError(error, t))
+      // Back to the confirm dialog, which keeps the error visible next to the
+      // action that produced it and lets the user retry deliberately.
+      setUploadPhase('confirming')
+    }
+  })
+
+  const handleCopyCode = useLockFn(async () => {
+    if (!referenceCode) return
+    try {
+      await navigator.clipboard.writeText(referenceCode)
+      setCodeCopied(true)
+    } catch (error) {
+      console.warn('[ConnectProgress] copy reference code failed:', error)
       showNotice.error('tono.progress.copyFailed')
     }
   })
@@ -229,6 +246,13 @@ export const ConnectProgressCard = ({
   if (!visible || !progress) {
     return null
   }
+
+  const secondaryBackground = dark
+    ? 'rgba(255,255,255,0.07)'
+    : 'rgba(235,240,250,0.72)'
+  const secondaryBorder = `1px solid ${
+    dark ? 'rgba(255,255,255,0.1)' : 'rgba(56,72,108,0.1)'
+  }`
 
   const remainSec =
     nextRetryAtMs != null
@@ -431,6 +455,7 @@ export const ConnectProgressCard = ({
         style={{
           display: 'flex',
           alignItems: 'center',
+          flexWrap: 'wrap',
           gap: 8,
           marginTop: 14,
         }}
@@ -444,7 +469,9 @@ export const ConnectProgressCard = ({
               setRestoreOpen(true)
             }}
             style={{
-              flex: 1,
+              // The escape hatch keeps the full row; the two diagnostics
+              // actions share the next one.
+              flexBasis: '100%',
               padding: '9px 14px',
               fontSize: 12,
               color: '#fff',
@@ -459,19 +486,115 @@ export const ConnectProgressCard = ({
           className="tono-button"
           onClick={handleCopyDetails}
           style={{
-            flex: uiState === 'protectedOffline' ? undefined : 1,
+            flex: 1,
             padding: '9px 14px',
             fontSize: 12,
             color: text.primary,
-            background: dark
-              ? 'rgba(255,255,255,0.07)'
-              : 'rgba(235,240,250,0.72)',
-            border: `1px solid ${dark ? 'rgba(255,255,255,0.1)' : 'rgba(56,72,108,0.1)'}`,
+            background: secondaryBackground,
+            border: secondaryBorder,
           }}
         >
           {t('tono.progress.copyDetails')}
         </button>
+        {referenceCode == null && (
+          <button
+            type="button"
+            className="tono-button"
+            data-testid="tono-upload-diagnostics"
+            onClick={() => {
+              setUploadError(null)
+              setUploadPhase('confirming')
+            }}
+            // In flight: no second request, no queue of confirmations.
+            disabled={uploadPhase === 'uploading'}
+            style={{
+              flex: 1,
+              padding: '9px 14px',
+              fontSize: 12,
+              color: text.primary,
+              background: secondaryBackground,
+              border: secondaryBorder,
+              opacity: uploadPhase === 'uploading' ? 0.6 : 1,
+            }}
+          >
+            {uploadPhase === 'uploading'
+              ? t('tono.progress.upload.uploading')
+              : t('tono.progress.upload.action')}
+          </button>
+        )}
       </div>
+
+      {/* The receipt replaces the button: after a successful upload the user
+          is given a code to quote, not another chance to press send. */}
+      {referenceCode != null && (
+        <div
+          data-testid="tono-upload-reference"
+          style={{
+            marginTop: 12,
+            padding: '10px 12px',
+            borderRadius: 10,
+            background: hex(TONO_COLORS.latencyGood, 0.12),
+          }}
+        >
+          <div style={{ fontSize: 11, color: text.secondary, marginBottom: 6 }}>
+            {t('tono.progress.upload.successHint')}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <code
+              style={{
+                flex: 1,
+                fontSize: 15,
+                fontWeight: 700,
+                letterSpacing: 1,
+                fontFamily: TONO_MONO_STACK,
+                color: text.primary,
+                userSelect: 'text',
+                wordBreak: 'break-all',
+              }}
+            >
+              {referenceCode}
+            </code>
+            <button
+              type="button"
+              className="tono-button"
+              onClick={handleCopyCode}
+              style={{
+                padding: '6px 12px',
+                fontSize: 12,
+                flexShrink: 0,
+                color: text.primary,
+                background: secondaryBackground,
+                border: secondaryBorder,
+              }}
+            >
+              {codeCopied
+                ? t('tono.progress.upload.codeCopied')
+                : t('tono.progress.upload.copyCode')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* What will be sent, before it is sent. */}
+      {(uploadPhase === 'confirming' || uploadPhase === 'uploading') && (
+        <TonoConfirmDialog
+          dark={dark}
+          title={t('tono.progress.upload.confirmTitle')}
+          message={t('tono.progress.upload.confirmMessage')}
+          error={uploadError}
+          confirmLabel={
+            uploadPhase === 'uploading'
+              ? t('tono.progress.upload.uploading')
+              : t('tono.progress.upload.confirmSend')
+          }
+          cancelLabel={t('shared.actions.cancel')}
+          onConfirm={handleUpload}
+          onCancel={() => {
+            if (uploadPhase === 'uploading') return
+            setUploadPhase('idle')
+          }}
+        />
+      )}
 
       {restoreOpen && (
         <TonoConfirmDialog

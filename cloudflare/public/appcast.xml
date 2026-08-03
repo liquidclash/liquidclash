@@ -1,0 +1,26 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Tono</title>
+        <item>
+            <title>0.0.1</title>
+            <pubDate>Sat, 01 Aug 2026 17:54:04 -0600</pubDate>
+            <link>https://github.com/raydocs/liquidclash/releases/tag/tono-0.0.1-build37</link>
+            <sparkle:version>37</sparkle:version>
+            <sparkle:shortVersionString>0.0.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.3</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[## Tono Build 37 七天测试版
+
+- Claude App、Claude Code 和 Anthropic 官方域名继续优先走美国代理。
+- 原生微信按准确应用路径和经过审核的精确域名/IP直连。
+- Bilibili、腾讯视频、爱奇艺、优酷仅开放 16 个精确 hostname；没有后缀、通配符或 GEOIP 中国直连。
+- 视频网页试验和全部国内精确直连均可从云端立即回滚。
+- 使用实验性自适应 gVisor TCP buffer Mihomo。
+
+这是可回滚实验，不能承诺零封号风险。更新后请始终从“应用程序”文件夹运行 Tono。
+]]></description>
+            <enclosure url="https://github.com/raydocs/liquidclash/releases/download/tono-0.0.1-build37/Tono-0.0.1-build37-arm64.dmg" length="20523223" type="application/octet-stream" sparkle:edSignature="WP0cbCcxEA07pPJi8I63nefPIYu/+u+f+W1cIMXvF83q9+uy/reJArQ8Ki+wtL1owFcKvmP2BdrCSKrpYT63Dg=="/>
+        </item>
+    </channel>
+</rss>

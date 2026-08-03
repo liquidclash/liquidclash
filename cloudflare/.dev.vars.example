@@ -1,0 +1,8 @@
+JWT_SECRET="generate-at-least-32-random-bytes"
+ADMIN_API_TOKEN="generate-a-separate-random-token"
+HOME_AGENT_TOKEN="generate-a-separate-random-token"
+TAILSCALE_OAUTH_CLIENT_ID="k..."
+TAILSCALE_OAUTH_CLIENT_SECRET="tskey-client-..."
+RESEND_API_KEY="re_replace-with-a-test-key"
+DIRECT_SIGNUP_ALLOWLIST="test-user@example.com"
+CATALOG_ENCRYPTION_KEY="generate-32-random-bytes-and-encode-as-base64url"

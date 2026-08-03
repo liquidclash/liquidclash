@@ -205,6 +205,8 @@ mod app_init {
             tono::commands::tono_audit_log_path,
             tono::commands::tono_connect_progress,
             tono::commands::tono_retry_now,
+            tono::commands::tono_diagnostics_report,
+            tono::commands::tono_upload_diagnostics,
         ]
     }
 }

@@ -1,0 +1,19 @@
+{
+  "name": "tono-control-plane",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.18.8",
+    "@cloudflare/workers-types": "^5.20260728.1",
+    "typescript": "^5.9.2",
+    "vitest": "4.1.10",
+    "wrangler": "^4.26.1"
+  }
+}

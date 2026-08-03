@@ -9,6 +9,7 @@ pub mod catalog_sync;
 pub mod commands;
 pub mod connection;
 pub mod credentials;
+pub mod diagnostics;
 pub mod policy_sync;
 pub mod state;
 pub mod steps;

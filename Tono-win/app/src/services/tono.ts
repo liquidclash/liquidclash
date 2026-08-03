@@ -99,6 +99,24 @@ const STABLE_ERROR_KEYS: Array<{ prefix: string; key: string }> = [
     key: 'tono.dashboard.errors.releaseReconciling',
   },
   { prefix: 'TONO_SERVICE_TOO_OLD', key: 'tono.dashboard.errors.serviceTooOld' },
+  // Diagnostics upload (`diagnostics_upload_error` in tono/commands.rs).
+  {
+    prefix: 'TONO_DIAG_SIGNED_OUT',
+    key: 'tono.progress.upload.errors.signedOut',
+  },
+  {
+    prefix: 'TONO_DIAG_RATE_LIMITED',
+    key: 'tono.progress.upload.errors.rateLimited',
+  },
+  {
+    prefix: 'TONO_DIAG_UNREACHABLE',
+    key: 'tono.progress.upload.errors.unreachable',
+  },
+  {
+    prefix: 'TONO_DIAG_UNAVAILABLE',
+    key: 'tono.progress.upload.errors.unavailable',
+  },
+  { prefix: 'TONO_DIAG_FAILED', key: 'tono.progress.upload.errors.failed' },
 ]
 
 /**
@@ -217,6 +235,128 @@ export const tonoConnectProgress = () =>
   call<TonoConnectProgress>('tono_connect_progress')
 
 export const tonoRetryNow = () => call<void>('tono_retry_now')
+
+/** "Xs" or "X.Xs", the Mac diagnostics format. */
+export const formatTonoElapsed = (ms: number) =>
+  ms >= 10000 ? `${Math.round(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`
+
+// ---- Diagnostics (user-initiated upload) ----
+//
+// `TonoDiagnosticsReport` mirrors `tono_core::auth::DiagnosticsReport`, which
+// is the single definition of the upload payload — see the wire-shape comment
+// above it. The whole struct is a hand-written whitelist assembled in Rust;
+// the WebView never contributes a field, and it never posts the report itself
+// (`tono_upload_diagnostics` rebuilds it backend-side before sending).
+
+export interface TonoDiagnosticsStep {
+  key: string
+  /** "pending" | "current" | "completed" | "failed" */
+  state: string
+  elapsedMs: number | null
+}
+
+export interface TonoDiagnosticsReport {
+  schemaVersion: number
+  reportedAtMs: number
+  appVersion: string
+  osVersion: string
+  osArch: string
+  serviceProtocol: string | null
+  serviceBuild: string | null
+  uiState: string
+  accountState: string
+  selectedServer: string | null
+  catalogRevision: number | null
+  killSwitchMode: string | null
+  killSwitchWanted: boolean | null
+  killSwitchLive: boolean | null
+  killSwitchLastError: string | null
+  dnsEnabled: boolean | null
+  dnsLastError: string | null
+  failedStage: string | null
+  error: string | null
+  retryAttempt: number
+  totalElapsedMs: number | null
+  steps: TonoDiagnosticsStep[]
+  /** Fixed class tokens ("hyperV", "wsl", …), never adapter names. */
+  virtualAdapters: string[]
+  auditLogPath: string
+  /** SYSTEM/Admins-only; the app cannot read it, only name it. */
+  serviceLogPath: string
+}
+
+export interface TonoDiagnosticsReceipt {
+  referenceCode: string
+  receivedAt: number | null
+}
+
+/** The exact payload an upload would send. Local only — nothing is sent. */
+export const tonoDiagnosticsReport = () =>
+  call<TonoDiagnosticsReport>('tono_diagnostics_report')
+
+/**
+ * Upload one report and return its support reference code.
+ *
+ * Only ever called from an explicit user confirmation. There is no automatic,
+ * silent, or on-crash caller, by design — this is a VPN.
+ */
+export const tonoUploadDiagnostics = () =>
+  call<TonoDiagnosticsReceipt>('tono_upload_diagnostics')
+
+/**
+ * Render a report as the plain text "Copy details" puts on the clipboard.
+ *
+ * Deliberately the *same object* the upload sends, so what the user can read
+ * and what leaves the machine can never drift apart.
+ */
+export const formatTonoDiagnostics = (
+  report: TonoDiagnosticsReport,
+): string => {
+  const killSwitch =
+    report.killSwitchMode == null
+      ? '(unknown)'
+      : report.killSwitchWanted === false && report.killSwitchLive === false
+        ? `inactive (reported mode=${report.killSwitchMode}, wanted=false, live=false)`
+        : `${report.killSwitchMode} (wanted=${report.killSwitchWanted}, live=${report.killSwitchLive})`
+  return [
+    `Tono v${report.appVersion} diagnostics`,
+    `OS: ${report.osVersion} (${report.osArch})`,
+    `Service protocol: ${report.serviceProtocol ?? '(unknown)'}${
+      report.serviceBuild ? ` (build ${report.serviceBuild})` : ''
+    }`,
+    `Server: ${report.selectedServer ?? '(none)'}`,
+    `UI state: ${report.uiState}`,
+    `Account state: ${report.accountState}`,
+    `Kill switch: ${killSwitch}`,
+    `Kill switch last error: ${report.killSwitchLastError ?? '(none)'}`,
+    `Protected DNS: ${
+      report.dnsEnabled == null ? '(unknown)' : report.dnsEnabled
+    }`,
+    `DNS last error: ${report.dnsLastError ?? '(none)'}`,
+    `Virtual adapters: ${
+      report.virtualAdapters.length > 0
+        ? report.virtualAdapters.join(', ')
+        : '(none)'
+    }`,
+    `Failed stage: ${report.failedStage ?? '(none)'}`,
+    `Error: ${report.error ?? '(none)'}`,
+    `Retry attempt: ${report.retryAttempt}`,
+    `Total elapsed: ${
+      report.totalElapsedMs != null
+        ? formatTonoElapsed(report.totalElapsedMs)
+        : '(n/a)'
+    }`,
+    'Steps:',
+    ...report.steps.map(
+      (step) =>
+        `  - ${step.key}: ${step.state}${
+          step.elapsedMs != null ? ` (${formatTonoElapsed(step.elapsedMs)})` : ''
+        }`,
+    ),
+    `Audit log: ${report.auditLogPath}`,
+    `Service log (admin only): ${report.serviceLogPath}`,
+  ].join('\n')
+}
 
 // One backend listener, shared by every subscriber (the layout guard plus the
 // current page), reference-counted: the first subscriber registers it, the last
