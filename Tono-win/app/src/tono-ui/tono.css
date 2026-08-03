@@ -1,9 +1,6 @@
-/**
- * Global CSS for the Tono shell and pages: layout classes, the spinner
- * keyframes, and shared form/control styles. Anything theme- or state-aware
- * (colors, tints) stays inline in the components.
- */
-export const TONO_CSS = `
+/* Tono shell/page layout. Build-time stylesheet (vite) — loaded via <link> so the
+   layout never depends on runtime <style> injection surviving in the webview. */
+
 .tono-root {
   position: relative;
   width: 100vw;
@@ -314,4 +311,3 @@ export const TONO_CSS = `
     transform: none !important;
   }
 }
-`

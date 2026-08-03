@@ -24,10 +24,10 @@ import { useThemeMode } from '@/services/states'
 import getSystem from '@/utils/get-system'
 
 import { MeshBackground } from './MeshBackground'
-import { TONO_CSS } from './styles'
 import { TONO_FONT_STACK, tonoText } from './theme'
 import { TonoSidebar } from './TonoSidebar'
 
+import './tono.css'
 import 'dayjs/locale/ru'
 import 'dayjs/locale/zh-cn'
 
@@ -95,7 +95,6 @@ const TonoLayout = () => {
   return (
     <ThemeProvider theme={theme}>
       <NoticeManager position={verge?.notice_position} />
-      <style>{TONO_CSS}</style>
       <div
         className={`tono-root ${OS}`}
         style={{ fontFamily: TONO_FONT_STACK, color: text.primary }}

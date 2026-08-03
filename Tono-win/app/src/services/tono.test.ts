@@ -9,6 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: listenMock }))
 
 import {
+  connectRejectionNeedsServerChoice,
   subscribeTonoStatus,
   tonoAuditEnabled,
   tonoAuditLogPath,
@@ -93,5 +94,31 @@ describe('subscribeTonoStatus', () => {
     // The last teardown unlistens.
     unsubSecond()
     expect(unlisten).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('connectRejectionNeedsServerChoice', () => {
+  it('matches every backend guard string that the server picker answers', () => {
+    // Verbatim guard_snapshot rejections from app/src-tauri/src/tono/connection.rs.
+    for (const message of [
+      'select a server first',
+      'the selected server is not in the catalog',
+      'the exit catalog is not available yet',
+      'the selected node left the catalog; pick a server again',
+    ]) {
+      expect(connectRejectionNeedsServerChoice(new Error(message))).toBe(true)
+    }
+  })
+
+  it('leaves other rejections to the inline error path', () => {
+    for (const message of [
+      'TONO_SERVICE_BUSY: repair pending',
+      'a connection transition is already in flight',
+      'not signed in',
+      '',
+    ]) {
+      expect(connectRejectionNeedsServerChoice(new Error(message))).toBe(false)
+    }
+    expect(connectRejectionNeedsServerChoice(undefined)).toBe(false)
   })
 })

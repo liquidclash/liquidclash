@@ -123,6 +123,25 @@ export const formatTonoActionError = (
   return raw
 }
 
+/**
+ * Whether a connect rejection means "no usable server is selected" — the
+ * guard strings from the backend's `guard_snapshot` (no selection, selection
+ * gone from the catalog, catalog not yet available). The dashboard answers
+ * these by opening the server picker instead of printing an error the user
+ * cannot act on from where they are.
+ */
+export const connectRejectionNeedsServerChoice = (error: unknown): boolean => {
+  const raw = (
+    error instanceof Error ? error.message : String(error ?? '')
+  ).toLowerCase()
+  return (
+    raw.includes('select a server') ||
+    raw.includes('pick a server') ||
+    raw.includes('not in the catalog') ||
+    raw.includes('catalog is not available')
+  )
+}
+
 const call = <T>(command: string, args?: Record<string, unknown>): Promise<T> =>
   invoke<T>(command, args).catch((error: unknown) => {
     throw toError(error)

@@ -7,6 +7,7 @@ import { useTonoStatus } from '@/hooks/use-tono'
 import { useTrafficData } from '@/hooks/use-traffic-data'
 import { useThemeMode } from '@/services/states'
 import {
+  connectRejectionNeedsServerChoice,
   formatTonoActionError,
   tonoConnect,
   tonoDisconnect,
@@ -240,6 +241,7 @@ const DashboardPage = () => {
   const { t } = useTranslation()
   const dark = useThemeMode() !== 'light'
   const text = tonoText(dark)
+  const navigate = useNavigate()
   const { status, mutateTonoStatus } = useTonoStatus()
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -256,6 +258,14 @@ const DashboardPage = () => {
       await tonoConnect()
       await mutateTonoStatus()
     } catch (error) {
+      // A rejection because no usable server is selected is not an error to
+      // read — it is a navigation: land the user on the picker they need.
+      // (The real-machine failure mode: with the picker never visited, every
+      // connect click was silently rejected and looked like a dead button.)
+      if (connectRejectionNeedsServerChoice(error)) {
+        navigate('/servers')
+        return
+      }
       setActionError(formatTonoActionError(error, t))
     }
   })
@@ -318,25 +328,6 @@ const DashboardPage = () => {
           </span>
         </div>
       )}
-      {actionError && (
-        <div
-          style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}
-        >
-          <span
-            style={{
-              fontSize: 13,
-              fontWeight: 500,
-              color: TONO_COLORS.error,
-              borderRadius: 10,
-              padding: '8px 12px',
-              background: hex(TONO_COLORS.error, 0.12),
-            }}
-          >
-            {actionError}
-          </span>
-        </div>
-      )}
-
       {/* Center stack */}
       <div className="tono-dashboard__content">
         <div
@@ -384,6 +375,25 @@ const DashboardPage = () => {
             onDisconnect={handleDisconnect}
           />
         </div>
+        {/* Right where the user is looking after clicking Connect — a strip at
+            the top of the window was easy to miss (and off-screen in zoomed
+            real-machine sessions). */}
+        {actionError && (
+          <span
+            style={{
+              fontSize: 13,
+              fontWeight: 500,
+              color: TONO_COLORS.error,
+              borderRadius: 10,
+              padding: '8px 12px',
+              background: hex(TONO_COLORS.error, 0.12),
+              maxWidth: 520,
+              textAlign: 'center',
+            }}
+          >
+            {actionError}
+          </span>
+        )}
         <ConnectProgressCard
           uiState={uiState}
           selectedServer={status?.selectedServer ?? null}
