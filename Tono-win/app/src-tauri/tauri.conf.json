@@ -1,5 +1,5 @@
 {
-  "version": "2.5.4",
+  "version": "0.0.2",
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "bundle": {
     "active": true,
@@ -21,7 +21,9 @@
       "resources/tono-service-uninstall.exe"
     ],
     "publisher": "Raydocs",
-    "externalBin": ["sidecar/verge-mihomo"],
+    "externalBin": [
+      "sidecar/verge-mihomo"
+    ],
     "copyright": "GNU General Public License v3.0",
     "category": "DeveloperTool",
     "shortDescription": "Tono",
@@ -39,7 +41,10 @@
   "identifier": "com.raydocs.tono",
   "app": {
     "security": {
-      "capabilities": ["desktop-capability", "migrated"],
+      "capabilities": [
+        "desktop-capability",
+        "migrated"
+      ],
       "assetProtocol": {
         "enable": false,
         "scope": {

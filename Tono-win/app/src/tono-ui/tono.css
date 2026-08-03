@@ -117,6 +117,12 @@
 .tono-advanced__items {
   padding-left: 12px;
 }
+.tono-sidebar__version {
+  padding: 8px 11px 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
 
 /* Spinner */
 .tono-spin {

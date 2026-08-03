@@ -284,7 +284,21 @@ const DashboardPage = () => {
   const [down, downUnit] = parseTraffic(traffic?.down ?? 0)
 
   return (
-    <div className="tono-page tono-dashboard">
+    // Structural layout inline as well as in the stylesheet (see TonoSidebar):
+    // without it a machine whose stylesheet never applied showed the connect
+    // card jammed into the window's left edge.
+    <div
+      className="tono-page tono-dashboard"
+      style={{
+        minHeight: '100%',
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        padding: '48px 40px 36px',
+        height: '100vh',
+        paddingTop: 42,
+      }}
+    >
       {status?.catalogRequiresChoice && (
         <div
           style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}
@@ -329,7 +343,21 @@ const DashboardPage = () => {
         </div>
       )}
       {/* Center stack */}
-      <div className="tono-dashboard__content">
+      <div
+        className="tono-dashboard__content"
+        style={{
+          flex: '1 1 auto',
+          width: '100%',
+          minHeight: 0,
+          boxSizing: 'border-box',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 18,
+          padding: '24px 0',
+        }}
+      >
         <div
           style={{
             display: 'flex',
