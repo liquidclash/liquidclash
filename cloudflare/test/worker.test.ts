@@ -1602,27 +1602,69 @@ describe('Worker routes with D1 and mocked Tailscale', () => {
     })).status).toBe(401);
   });
 
+  // Pinned verbatim from the client's single definition of the wire contract
+  // (`crates/tono-core/src/auth.rs`, `DiagnosticsReport`), which is already
+  // shipped. Do NOT edit this object to make the server pass: if the two ever
+  // drift, this fixture is the alarm and the server is what moves.
+  const shippedClientReport = {
+    schemaVersion: 1,
+    reportedAtMs: 1712345678901,
+    appVersion: '0.0.3',
+    osVersion: 'Windows 11 Pro 23H2',
+    osArch: 'x86_64',
+    serviceProtocol: '2.9',
+    serviceBuild: '2.6.2',
+    uiState: 'protectedOffline',
+    accountState: 'ready',
+    selectedServer: 'US West 1',
+    catalogRevision: 12,
+    killSwitchMode: 'blocked',
+    killSwitchWanted: true,
+    killSwitchLive: false,
+    killSwitchLastError: 'WFP filter add failed (0x80320013)',
+    dnsEnabled: true,
+    dnsLastError: 'resolver handshake timed out',
+    failedStage: 'securingDNS',
+    error: 'connect failed after 2 retries',
+    retryAttempt: 2,
+    totalElapsedMs: 4600,
+    steps: [{ key: 'preparing', state: 'completed', elapsedMs: 1200 }],
+    virtualAdapters: ['hyperV', 'wsl'],
+    auditLogPath: '%USERPROFILE%\\AppData\\Roaming\\Tono\\traffic-audit.jsonl',
+    serviceLogPath: 'C:\\ProgramData\\Tono\\logs\\tono-service.log',
+  };
+
+  // Overrides patch the report, not the envelope: the envelope is `{report}`.
   const diagnosticsPayload = (overrides: Record<string, unknown> = {}) => ({
-    clientVersion: '2.5.4',
-    osVersion: 'Windows 11 26100.1742',
-    report: {
-      connected: false,
-      killSwitchArmed: true,
-      tunPresent: false,
-      protectedDNSConfigured: false,
-      selectedExit: 'managed-hk-01',
-      connectionStage: 'tunnel',
-      lastErrorCategory: 'tunnel',
-      lastErrorCode: 'WINTUN_ADAPTER_MISSING',
-      reconnectAttempt: 3,
-      occurredAt: Math.floor(Date.now() / 1000) - 30,
-      userNote: 'Cannot connect since this morning.',
-      events: [
-        { at: Math.floor(Date.now() / 1000) - 40, level: 'warn', category: 'tunnel', message: 'adapter create failed' },
-        { at: Math.floor(Date.now() / 1000) - 35, level: 'error', message: 'giving up after 3 attempts' },
-      ],
-    },
-    ...overrides,
+    report: { ...shippedClientReport, ...overrides },
+  });
+
+  it('accepts the exact payload the shipped client sends, verbatim', async () => {
+    const account = await createAccount('diagnostics-contract');
+    // The literal body from `auth.rs`, envelope included, byte for byte.
+    const response = await api('diagnostics/reports', json(
+      { report: shippedClientReport },
+      account.accessToken,
+    ));
+    expect(response.status).toBe(201);
+    const body = await response.json() as any;
+    // The client requires a non-empty referenceCode and tolerates receivedAt.
+    expect(body.referenceCode).toMatch(/^[2-9A-HJ-NP-Z]{8}$/);
+    expect(typeof body.receivedAt).toBe('number');
+
+    const stored = await env.DB.prepare(
+      'SELECT * FROM diagnostics_reports WHERE reference_code = ?',
+    ).bind(body.referenceCode).first<any>();
+    // Every field survives, unchanged and in the contract's own key order:
+    // a drift on either side breaks this equality loudly.
+    expect(stored.report_json).toBe(JSON.stringify(shippedClientReport));
+    // The columns come from inside the report; there is no second copy on the
+    // envelope any more.
+    expect(stored.client_version).toBe('0.0.3');
+    expect(stored.os_version).toBe('Windows 11 Pro 23H2');
+    expect((await api('diagnostics/reports', json({
+      clientVersion: '0.0.3', osVersion: 'Windows 11 Pro 23H2', report: shippedClientReport,
+    }, account.accessToken))).status).toBe(400);
   });
 
   it('accepts a user-initiated diagnostics upload and returns only a spoken reference code', async () => {
@@ -1631,16 +1673,18 @@ describe('Worker routes with D1 and mocked Tailscale', () => {
     const response = await api('diagnostics/reports', json(payload, account.accessToken));
     expect(response.status).toBe(201);
     const body = await response.json() as any;
-    // The code is the entire response: no payload is echoed back to the client.
-    expect(Object.keys(body)).toEqual(['referenceCode']);
+    // The code plus a display-only receipt time is the entire response: no
+    // payload is echoed back to the client.
+    expect(Object.keys(body).sort()).toEqual(['receivedAt', 'referenceCode']);
     expect(body.referenceCode).toMatch(/^[2-9A-HJ-NP-Z]{8}$/);
+    expect(Math.abs(body.receivedAt - Math.floor(Date.now() / 1000))).toBeLessThan(60);
 
     const stored = await env.DB.prepare(
       'SELECT * FROM diagnostics_reports WHERE reference_code = ?',
     ).bind(body.referenceCode).first<any>();
     expect(stored.user_id).toBe(account.user.id);
-    expect(stored.client_version).toBe('2.5.4');
-    expect(stored.os_version).toBe('Windows 11 26100.1742');
+    expect(stored.client_version).toBe('0.0.3');
+    expect(stored.os_version).toBe('Windows 11 Pro 23H2');
     expect(JSON.parse(stored.report_json)).toEqual(payload.report);
 
     // An accepted report is immutable evidence; retention deletes, nothing rewrites.
@@ -1650,11 +1694,45 @@ describe('Worker routes with D1 and mocked Tailscale', () => {
 
     // Only whitelisted fields survive; anything else is refused, not dropped.
     const extra = await api('diagnostics/reports', json(
-      diagnosticsPayload({ report: { connected: false, wifiSSID: 'home-network' } }),
+      diagnosticsPayload({ wifiSSID: 'home-network' }),
       account.accessToken,
     ));
     expect(extra.status).toBe(400);
     expect((await extra.json() as any).error.code).toBe('VALIDATION_ERROR');
+
+    // A required field is required; the nullable ones may be null or absent.
+    const { appVersion, ...missingAppVersion } = shippedClientReport;
+    expect((await api('diagnostics/reports', json(
+      { report: missingAppVersion }, account.accessToken,
+    ))).status).toBe(400);
+
+    const nulled = await api('diagnostics/reports', json(diagnosticsPayload({
+      serviceProtocol: null, serviceBuild: null, selectedServer: null,
+      catalogRevision: null, killSwitchMode: null, killSwitchWanted: null,
+      killSwitchLive: null, killSwitchLastError: null, dnsEnabled: null,
+      dnsLastError: null, failedStage: null, error: null, totalElapsedMs: null,
+      steps: [{ key: 'preparing', state: 'current', elapsedMs: null }],
+      virtualAdapters: [],
+    }), account.accessToken));
+    expect(nulled.status).toBe(201);
+    const nulledStored = await env.DB.prepare(
+      'SELECT report_json FROM diagnostics_reports WHERE reference_code = ?',
+    ).bind((await nulled.json() as any).referenceCode).first<any>();
+    // Null and absent mean the same thing: neither is stored.
+    expect(JSON.parse(nulledStored.report_json)).toEqual({
+      schemaVersion: 1,
+      reportedAtMs: 1712345678901,
+      appVersion: '0.0.3',
+      osVersion: 'Windows 11 Pro 23H2',
+      osArch: 'x86_64',
+      uiState: 'protectedOffline',
+      accountState: 'ready',
+      retryAttempt: 2,
+      steps: [{ key: 'preparing', state: 'current' }],
+      virtualAdapters: [],
+      auditLogPath: shippedClientReport.auditLogPath,
+      serviceLogPath: shippedClientReport.serviceLogPath,
+    });
 
     expect((await api('diagnostics/reports', json(payload))).status).toBe(401);
   });
@@ -1662,42 +1740,71 @@ describe('Worker routes with D1 and mocked Tailscale', () => {
   it('rejects an oversized diagnostics upload instead of truncating it', async () => {
     const account = await createAccount('diagnostics-oversized');
     const overBodyCap = await api('diagnostics/reports', json(
-      diagnosticsPayload({
-        report: { userNote: 'x'.repeat(100), connectionStage: 'y'.repeat(40 * 1024) },
-      }),
+      diagnosticsPayload({ serviceLogPath: 'y'.repeat(40 * 1024) }),
       account.accessToken,
     ));
     expect(overBodyCap.status).toBe(413);
     expect((await overBodyCap.json() as any).error.code).toBe('PAYLOAD_TOO_LARGE');
 
     // Within the body cap, the per-field bounds refuse rather than truncate.
-    const tooManyEvents = await api('diagnostics/reports', json(
+    const tooManySteps = await api('diagnostics/reports', json(
       diagnosticsPayload({
-        report: {
-          events: Array.from({ length: 51 }, () => ({
-            at: Math.floor(Date.now() / 1000), level: 'error', message: 'z',
-          })),
-        },
+        steps: Array.from({ length: 33 }, (_, index) => ({
+          key: `step-${index}`, state: 'completed', elapsedMs: 10,
+        })),
       }),
       account.accessToken,
     ));
-    expect(tooManyEvents.status).toBe(400);
+    expect(tooManySteps.status).toBe(400);
 
-    const longMessage = await api('diagnostics/reports', json(
-      diagnosticsPayload({
-        report: {
-          events: [{ at: Math.floor(Date.now() / 1000), level: 'error', message: 'z'.repeat(201) }],
-        },
-      }),
+    const badStepState = await api('diagnostics/reports', json(
+      diagnosticsPayload({ steps: [{ key: 'preparing', state: 'skipped', elapsedMs: 1 }] }),
       account.accessToken,
     ));
-    expect(longMessage.status).toBe(400);
+    expect(badStepState.status).toBe(400);
 
-    const longNote = await api('diagnostics/reports', json(
-      diagnosticsPayload({ report: { userNote: 'w'.repeat(501) } }),
+    const longStepKey = await api('diagnostics/reports', json(
+      diagnosticsPayload({ steps: [{ key: 'k'.repeat(61), state: 'failed', elapsedMs: 1 }] }),
       account.accessToken,
     ));
-    expect(longNote.status).toBe(400);
+    expect(longStepKey.status).toBe(400);
+
+    const longError = await api('diagnostics/reports', json(
+      diagnosticsPayload({ error: 'w'.repeat(501) }),
+      account.accessToken,
+    ));
+    expect(longError.status).toBe(400);
+
+    const longOsVersion = await api('diagnostics/reports', json(
+      diagnosticsPayload({ osVersion: 'w'.repeat(81) }),
+      account.accessToken,
+    ));
+    expect(longOsVersion.status).toBe(400);
+
+    // The adapter vocabulary is fixed: unknown classes and repeats are refused.
+    const unknownAdapter = await api('diagnostics/reports', json(
+      diagnosticsPayload({ virtualAdapters: ['hyperV', 'parallels'] }),
+      account.accessToken,
+    ));
+    expect(unknownAdapter.status).toBe(400);
+
+    const repeatedAdapter = await api('diagnostics/reports', json(
+      diagnosticsPayload({ virtualAdapters: ['wsl', 'wsl'] }),
+      account.accessToken,
+    ));
+    expect(repeatedAdapter.status).toBe(400);
+
+    const wildRetry = await api('diagnostics/reports', json(
+      diagnosticsPayload({ retryAttempt: 1001 }),
+      account.accessToken,
+    ));
+    expect(wildRetry.status).toBe(400);
+
+    const wildElapsed = await api('diagnostics/reports', json(
+      diagnosticsPayload({ totalElapsedMs: 24 * 60 * 60 * 1000 + 1 }),
+      account.accessToken,
+    ));
+    expect(wildElapsed.status).toBe(400);
 
     const rows = await env.DB.prepare(
       'SELECT COUNT(*) AS total FROM diagnostics_reports WHERE user_id = ?',
@@ -1739,9 +1846,9 @@ describe('Worker routes with D1 and mocked Tailscale', () => {
     expect((await found.json() as any).report).toMatchObject({
       referenceCode,
       userId: account.user.id,
-      clientVersion: '2.5.4',
-      osVersion: 'Windows 11 26100.1742',
-      report: { lastErrorCategory: 'tunnel' },
+      clientVersion: '0.0.3',
+      osVersion: 'Windows 11 Pro 23H2',
+      report: { failedStage: 'securingDNS', virtualAdapters: ['hyperV', 'wsl'] },
     });
 
     // Support types the code back in however they heard it.

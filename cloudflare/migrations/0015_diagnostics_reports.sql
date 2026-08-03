@@ -17,10 +17,14 @@ CREATE TABLE diagnostics_reports (
       AND reference_code NOT GLOB '*[^2-9A-HJ-NP-Z]*'),
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   received_at INTEGER NOT NULL,
+  -- Denormalised out of report_json (`appVersion` / `osVersion`): the client
+  -- sends them only inside the report, and triage sorts by them often enough
+  -- to want columns rather than JSON extraction. Bounds match the Worker's.
   client_version TEXT NOT NULL CHECK(length(client_version) BETWEEN 1 AND 40),
   os_version TEXT NOT NULL CHECK(length(os_version) BETWEEN 1 AND 80),
-  -- Canonicalised, whitelisted structured report. The Worker rejects anything
-  -- larger rather than truncating; this bound is the storage backstop.
+  -- Canonicalised, whitelisted structured report, in the client's own key
+  -- order. The Worker rejects anything larger rather than truncating; this
+  -- bound is the storage backstop.
   report_json TEXT NOT NULL CHECK(length(report_json) <= 16384)
 );
 

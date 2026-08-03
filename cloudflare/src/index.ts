@@ -64,7 +64,9 @@ class ApiError extends Error {
 const now = () => Math.floor(Date.now() / 1000);
 const id = () => crypto.randomUUID();
 const deviceActions = ['diagnostic_snapshot', 'claude_traffic_snapshot', 'refresh_catalog', 'retry_protection'] as const;
-/** Shared failure vocabulary for device-action snapshots and diagnostics reports. */
+/** Failure vocabulary for device-action snapshots. (Diagnostics uploads carry
+ *  the client's own free-text `error`/`failedStage` instead; see
+ *  `canonicalDiagnosticsReport`.) */
 const errorCategories = ['preparation', 'helper', 'kill_switch', 'tunnel', 'policy', 'dns', 'exit_check', 'data_plane', 'other'];
 
 function fixedAction(value: unknown) {
@@ -708,7 +710,7 @@ async function rateLimitOidcStart(e: Env, req: Request, installationId: string) 
 // a silently trimmed report is worse than none for support.
 const DIAGNOSTICS_BODY_MAX_BYTES = 32 * 1024;
 // Backstop matching the column CHECK. The per-field bounds below already keep a
-// fully-populated report near 15 KiB, so this only catches a schema change that
+// fully-populated report under 8 KiB, so this only catches a schema change that
 // forgets to re-check the total.
 const DIAGNOSTICS_REPORT_MAX_BYTES = 16 * 1024;
 const DIAGNOSTICS_HOUR_SECONDS = 3_600;
@@ -736,86 +738,148 @@ function normalizedReferenceCode(value: unknown) {
   return parsed;
 }
 
+// The wire contract is owned by the client, which is already shipped:
+// `crates/tono-core/src/auth.rs` (`DiagnosticsReport`) is its single
+// definition and this intake mirrors it field for field. Serde emits every
+// field, writing `null` for an absent optional, so a nullable field arriving
+// as `null` and not arriving at all mean the same thing here: both drop out
+// of the canonical form. The non-nullable fields are required.
+const diagnosticsStepStates = ['pending', 'current', 'completed', 'failed'];
+/** Fixed vocabulary; an unknown adapter class is rejected, not stored. */
+const diagnosticsVirtualAdapters = [
+  'hyperV', 'wsl', 'vmware', 'virtualBox', 'docker', 'loopbackAdapter',
+];
+const DIAGNOSTICS_MAX_STEPS = 32;
+/** A connect attempt that "took" more than a day is a broken clock, not data. */
+const DIAGNOSTICS_MAX_ELAPSED_MS = 24 * 60 * 60 * 1000;
+/** 2100-01-01 in epoch ms. `reportedAtMs` is the *client* clock, and a skewed
+ *  clock is itself a failure this report exists to capture, so it is bounded
+ *  for storage sanity rather than checked against the server's clock. */
+const DIAGNOSTICS_MAX_REPORTED_AT_MS = 4_102_444_800_000;
+/** Required strings: [key, minLength, maxLength]. Only the two that are
+ *  promoted to columns must be non-empty (the column CHECKs say so); an empty
+ *  state name from a degraded client should not cost the whole upload. */
+const diagnosticsStrings: Array<[string, number, number]> = [
+  ['appVersion', 1, 40],
+  ['osVersion', 1, 80],
+  ['osArch', 0, 32],
+  ['uiState', 0, 40],
+  ['accountState', 0, 40],
+  ['auditLogPath', 0, 400],
+  ['serviceLogPath', 0, 400],
+];
+/** Nullable strings: [key, maxLength]. The error texts are redacted client-side. */
+const diagnosticsNullableStrings: Array<[string, number]> = [
+  ['serviceProtocol', 20],
+  ['serviceBuild', 40],
+  ['selectedServer', 100],
+  ['killSwitchMode', 40],
+  ['killSwitchLastError', 500],
+  ['dnsLastError', 500],
+  ['failedStage', 60],
+  ['error', 500],
+];
+const diagnosticsNullableBools = ['killSwitchWanted', 'killSwitchLive', 'dnsEnabled'];
+/** Numbers: [key, min, max, nullable]. */
+const diagnosticsNumbers: Array<[string, number, number, boolean]> = [
+  // Recorded rather than pinned to 1: a newer client must still be able to
+  // reach support, and support needs to tell payload generations apart.
+  ['schemaVersion', 1, 1_000, false],
+  ['reportedAtMs', 0, DIAGNOSTICS_MAX_REPORTED_AT_MS, false],
+  ['retryAttempt', 0, 1_000, false],
+  ['catalogRevision', 0, 1_000_000_000_000, true],
+  ['totalElapsedMs', 0, DIAGNOSTICS_MAX_ELAPSED_MS, true],
+];
+const diagnosticsKeys = [
+  'schemaVersion', 'reportedAtMs', 'appVersion', 'osVersion', 'osArch',
+  'serviceProtocol', 'serviceBuild', 'uiState', 'accountState', 'selectedServer',
+  'catalogRevision', 'killSwitchMode', 'killSwitchWanted', 'killSwitchLive',
+  'killSwitchLastError', 'dnsEnabled', 'dnsLastError', 'failedStage', 'error',
+  'retryAttempt', 'totalElapsedMs', 'steps', 'virtualAdapters',
+  'auditLogPath', 'serviceLogPath',
+];
+
+function diagnosticsInt(source: Row, key: string, min: number, max: number, nullable: boolean) {
+  const raw = source[key];
+  if (nullable && (raw === undefined || raw === null)) return undefined;
+  if (!Number.isSafeInteger(raw) || (raw as number) < min || (raw as number) > max) {
+    throw new ApiError(400, 'VALIDATION_ERROR', `Invalid ${key}`);
+  }
+  return raw as number;
+}
+
 /**
- * Whitelist the structured report. Every field is optional so the client can
- * upload whatever it managed to collect while failing, but nothing outside the
- * schema is stored and the payload is never echoed back to the uploader.
+ * Whitelist the structured report. Nothing outside the schema is stored, the
+ * bounds refuse rather than truncate, and the payload is never echoed back to
+ * the uploader. `appVersion`/`osVersion` are also lifted into their own
+ * columns by the caller, so their bounds match the column CHECKs exactly.
  */
 function canonicalDiagnosticsReport(value: unknown) {
-  const bools = [
-    'connected', 'connecting', 'disconnecting', 'protectionBlocked',
-    'killSwitchArmed', 'tunPresent', 'adapterPresent', 'protectedDNSConfigured',
-  ];
-  // No appVersion here: the client version is a top-level column, not a
-  // second name for the same value buried inside the blob.
-  const strings = ['build', 'selectedExit', 'connectionStage', 'lastErrorCode'];
-  rejectUnexpectedKeys(value, [
-    ...bools, ...strings,
-    'lastErrorCategory', 'reconnectAttempt', 'occurredAt', 'userNote', 'events',
-  ]);
+  rejectUnexpectedKeys(value, diagnosticsKeys);
   const source = value as Row;
-  const t = now();
+  const parsed: Row = {};
+  for (const [key, min, max] of diagnosticsStrings) {
+    parsed[key] = str(source[key], key, min, max);
+  }
+  for (const [key, max] of diagnosticsNullableStrings) {
+    if (source[key] === undefined || source[key] === null) continue;
+    parsed[key] = str(source[key], key, 0, max);
+  }
+  for (const key of diagnosticsNullableBools) {
+    if (source[key] === undefined || source[key] === null) continue;
+    if (typeof source[key] !== 'boolean') {
+      throw new ApiError(400, 'VALIDATION_ERROR', `Invalid ${key}`);
+    }
+    parsed[key] = source[key];
+  }
+  for (const [key, min, max, nullable] of diagnosticsNumbers) {
+    const parsedNumber = diagnosticsInt(source, key, min, max, nullable);
+    if (parsedNumber !== undefined) parsed[key] = parsedNumber;
+  }
+  if (!Array.isArray(source.steps) || source.steps.length > DIAGNOSTICS_MAX_STEPS) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid steps');
+  }
+  parsed.steps = source.steps.map((raw: unknown) => {
+    rejectUnexpectedKeys(raw, ['key', 'state', 'elapsedMs']);
+    const entry = raw as Row;
+    const key = str(entry.key, 'step key', 0, 60);
+    const state = str(entry.state, 'step state', 0, 20);
+    if (!diagnosticsStepStates.includes(state)) {
+      throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid step state');
+    }
+    const step: Row = { key, state };
+    const elapsedMs = diagnosticsInt(entry, 'elapsedMs', 0, DIAGNOSTICS_MAX_ELAPSED_MS, true);
+    if (elapsedMs !== undefined) step.elapsedMs = elapsedMs;
+    return step;
+  });
+  // Bounded by the vocabulary itself: repeating a class carries no information
+  // and is the shape a buggy collector produces, so it is refused.
+  if (!Array.isArray(source.virtualAdapters) ||
+      source.virtualAdapters.length > diagnosticsVirtualAdapters.length) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid virtualAdapters');
+  }
+  const seenAdapters = new Set<string>();
+  parsed.virtualAdapters = source.virtualAdapters.map((raw: unknown) => {
+    if (typeof raw !== 'string' || !diagnosticsVirtualAdapters.includes(raw) || seenAdapters.has(raw)) {
+      throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid virtualAdapters');
+    }
+    seenAdapters.add(raw);
+    return raw;
+  });
+  // Re-emit in the contract's own key order so stored reports diff cleanly.
   const report: Row = {};
-  for (const key of bools) {
-    if (source[key] === undefined) continue;
-    if (typeof source[key] !== 'boolean') throw new ApiError(400, 'VALIDATION_ERROR', `Invalid ${key}`);
-    report[key] = source[key];
-  }
-  for (const key of strings) {
-    if (source[key] === undefined) continue;
-    report[key] = str(source[key], key, 0, 100);
-  }
-  if (source.lastErrorCategory !== undefined) {
-    if (typeof source.lastErrorCategory !== 'string' || !errorCategories.includes(source.lastErrorCategory)) {
-      throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid lastErrorCategory');
-    }
-    report.lastErrorCategory = source.lastErrorCategory;
-  }
-  if (source.reconnectAttempt !== undefined) {
-    if (!Number.isSafeInteger(source.reconnectAttempt) || source.reconnectAttempt < 0 || source.reconnectAttempt > 1000) {
-      throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid reconnectAttempt');
-    }
-    report.reconnectAttempt = source.reconnectAttempt;
-  }
-  if (source.occurredAt !== undefined) {
-    if (!Number.isSafeInteger(source.occurredAt) || source.occurredAt < 0 || source.occurredAt > t + 300) {
-      throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid occurredAt');
-    }
-    report.occurredAt = source.occurredAt;
-  }
-  if (source.userNote !== undefined) {
-    report.userNote = str(source.userNote, 'userNote', 0, 500);
-  }
-  if (source.events !== undefined) {
-    if (!Array.isArray(source.events) || source.events.length > 50) {
-      throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid events');
-    }
-    report.events = source.events.map((raw: unknown) => {
-      rejectUnexpectedKeys(raw, ['at', 'level', 'category', 'message']);
-      const entry = raw as Row;
-      if (!Number.isSafeInteger(entry.at) || entry.at < 0 || entry.at > t + 300) {
-        throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid event at');
-      }
-      const level = str(entry.level, 'level', 4, 5);
-      if (!['info', 'warn', 'error'].includes(level)) {
-        throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid event level');
-      }
-      const event: Row = { at: entry.at, level };
-      if (entry.category !== undefined) {
-        if (typeof entry.category !== 'string' || !errorCategories.includes(entry.category)) {
-          throw new ApiError(400, 'VALIDATION_ERROR', 'Invalid event category');
-        }
-        event.category = entry.category;
-      }
-      event.message = str(entry.message, 'message', 0, 200);
-      return event;
-    });
+  for (const key of diagnosticsKeys) {
+    if (parsed[key] !== undefined) report[key] = parsed[key];
   }
   const json = JSON.stringify(report);
   if (new TextEncoder().encode(json).byteLength > DIAGNOSTICS_REPORT_MAX_BYTES) {
     throw new ApiError(413, 'PAYLOAD_TOO_LARGE', 'Diagnostics report is too large');
   }
-  return json;
+  return {
+    json,
+    appVersion: report.appVersion as string,
+    osVersion: report.osVersion as string,
+  };
 }
 
 async function rateLimitDiagnostics(e: Env, req: Request, uid: string) {
@@ -855,7 +919,7 @@ async function storeDiagnosticsReport(
          id, reference_code, user_id, received_at, client_version, os_version, report_json
        ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
     ).bind(id(), code, uid, receivedAt, clientVersion, osVersion, reportJson).run();
-    if (inserted.meta.changes) return code;
+    if (inserted.meta.changes) return { referenceCode: code, receivedAt };
   }
   throw new ApiError(503, 'DIAGNOSTICS_UNAVAILABLE', 'Could not allocate a reference code; try again');
 }
@@ -2494,14 +2558,15 @@ async function route(req: Request, e: Env, ctx: ExecutionContext): Promise<Respo
   if (p === '/api/v1/diagnostics/reports' && m === 'POST') {
     const a = await auth(req, e);
     const b = await body(req, DIAGNOSTICS_BODY_MAX_BYTES);
-    rejectUnexpectedKeys(b, ['clientVersion', 'osVersion', 'report']);
-    const clientVersion = str(b.clientVersion, 'clientVersion', 1, 40);
-    const osVersion = str(b.osVersion, 'osVersion', 1, 80);
-    const reportJson = canonicalDiagnosticsReport(b.report);
+    // The client sends `{report}` and nothing else; the version columns are
+    // lifted out of the report rather than repeated at the top level.
+    rejectUnexpectedKeys(b, ['report']);
+    const { json: reportJson, appVersion, osVersion } = canonicalDiagnosticsReport(b.report);
     await rateLimitDiagnostics(e, req, a.userId);
-    // The reference code is the entire response; the payload is never echoed.
+    // The reference code (plus the display-only receipt time) is the entire
+    // response; the payload is never echoed.
     return Response.json(
-      { referenceCode: await storeDiagnosticsReport(e, a.userId, clientVersion, osVersion, reportJson) },
+      await storeDiagnosticsReport(e, a.userId, appVersion, osVersion, reportJson),
       { status: 201 },
     );
   }
