@@ -149,6 +149,12 @@ pub fn validate_unix_identity(
 pub struct PeerIdentity {
     #[cfg(unix)]
     credentials: Option<(u32, u32)>,
+    /// The process the kernel recorded on the other end of the named pipe, if it named one.
+    ///
+    /// This is the only thing in a Windows request the caller does not get to write. Everything
+    /// else the Windows path examines lives at a path the caller chose.
+    #[cfg(windows)]
+    process_id: Option<u32>,
 }
 
 impl PeerIdentity {
@@ -163,11 +169,85 @@ impl PeerIdentity {
                     .zip(context.client_info.peer_credentials.gid),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            Self {
+                process_id: context.client_info.peer_credentials.pid,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = context;
             Self::default()
         }
+    }
+
+    /// The current process, for the Windows tests that call the authentication path directly.
+    #[cfg(all(test, windows, feature = "test"))]
+    fn current_process() -> Self {
+        Self {
+            process_id: Some(std::process::id()),
+        }
+    }
+}
+
+/// What the transport was able to establish about the process on the other end of the connection.
+///
+/// Every way of *failing* to identify the caller is its own case rather than a shared `None`, so
+/// that none of them can be silently folded into "checked, and fine" by a later edit.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsPeer {
+    /// The connecting process runs under the SID the request declared.
+    DeclaredOwner,
+    /// The connecting process was identified, and is some other principal.
+    OtherPrincipal,
+    /// The connection named no process at all.
+    Unnamed,
+    /// The process could not be opened: it exited, or the service was refused a handle to it.
+    Unopenable,
+    /// The process was opened, but its token — or the user inside it — could not be read.
+    TokenUnreadable,
+}
+
+/// Bind the connection to the declared owner, before any of the filesystem evidence is trusted.
+///
+/// Everything the Windows path checks after this — the root's owner SID, the token file's DACL,
+/// the 32 secret bytes — is read from a path the *caller* names, so all of it together proves only
+/// that whoever is asking can reach a directory that looks like the owner's. The token is the only
+/// real secret in that set, which made a copy of it — from a backup, a crash dump, a directory
+/// that was mis-ACLed for a while — sufficient on its own, from any session. This check is the one
+/// the caller cannot furnish the evidence for: the process id comes from the kernel's record of
+/// the pipe instance, and the SID comes from that process's own token.
+///
+/// It fails closed. Exactly one outcome returns `Ok` — a peer that was positively identified *and*
+/// is the declared owner. Not being able to say who called is refused as firmly as calling as
+/// somebody else, because a service that cannot name its peer cannot tell those two apart.
+#[cfg(any(windows, test))]
+fn require_declared_owner_peer(
+    declared: &OwnerIdentity,
+    peer: WindowsPeer,
+) -> Result<(), ServiceError> {
+    let OwnerIdentity::Windows { .. } = declared else {
+        return Err(ServiceError::unauthorized(
+            "owner identity does not match the Windows transport",
+        ));
+    };
+
+    match peer {
+        WindowsPeer::DeclaredOwner => Ok(()),
+        WindowsPeer::OtherPrincipal => Err(ServiceError::unauthorized(
+            "connecting process does not run as the declared owner",
+        )),
+        WindowsPeer::Unnamed => Err(ServiceError::unauthorized(
+            "connection does not identify the calling process",
+        )),
+        WindowsPeer::Unopenable => Err(ServiceError::unauthorized(
+            "calling process could not be opened for identification",
+        )),
+        WindowsPeer::TokenUnreadable => Err(ServiceError::unauthorized(
+            "calling process token could not be read",
+        )),
     }
 }
 
@@ -283,8 +363,7 @@ fn authenticate_owner(
 
     #[cfg(windows)]
     {
-        let _ = peer;
-        windows_auth::authenticate(credentials)
+        windows_auth::authenticate(peer, credentials)
     }
 }
 
@@ -343,12 +422,12 @@ fn authenticate_synthetic_test_owner(
 
 #[cfg(windows)]
 mod windows_auth {
-    use super::{AuthenticatedOwner, ServiceError};
+    use super::{AuthenticatedOwner, PeerIdentity, ServiceError, WindowsPeer};
     use crate::{OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, owner_key};
     use std::ffi::c_void;
     use std::io::Read as _;
     use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use std::path::{Path, PathBuf};
     use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
@@ -356,9 +435,9 @@ mod windows_auth {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid,
+        GetSecurityDescriptorControl, GetTokenInformation, IsValidSid, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_QUERY,
+        TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -366,11 +445,15 @@ mod windows_auth {
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType, OPEN_EXISTING, READ_CONTROL,
     };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     const TOKEN_BYTES: usize = 32;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
     pub(super) fn authenticate(
+        peer: PeerIdentity,
         credentials: &OwnerCredentials,
     ) -> Result<AuthenticatedOwner, ServiceError> {
         let OwnerIdentity::Windows { sid } = &credentials.identity else {
@@ -384,6 +467,14 @@ mod windows_auth {
             .and_then(decode_token)
             .ok_or_else(|| unauthorized("owner token is missing or malformed"))?;
         let declared_sid = LocalSid::from_string(sid)?;
+        // The transport gate, ahead of the filesystem evidence: everything below is read from a
+        // path the caller named and could therefore have arranged, so none of it is worth
+        // consulting until the connection itself has been bound to the declared owner. Placing it
+        // here also means an unidentifiable peer costs no filesystem work at all.
+        super::require_declared_owner_peer(
+            &credentials.identity,
+            classify_peer(peer, declared_sid.as_ptr()),
+        )?;
         let app_data_root = canonical_app_data_root(Path::new(&credentials.app_data_dir))?;
 
         let root = open_no_reparse(&app_data_root, true, READ_CONTROL)?;
@@ -408,6 +499,74 @@ mod windows_auth {
             identity: credentials.identity.clone(),
             app_data_root,
         })
+    }
+
+    /// Ask the kernel who opened this connection, and compare that to the declared owner.
+    ///
+    /// Returns a classification rather than an error because the caller refuses every one of these
+    /// outcomes anyway; keeping them apart is what stops "could not tell" from being written as an
+    /// `Option` that somebody later reads as "nothing to check".
+    ///
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` is the weakest right that still yields a token handle,
+    /// and the service runs as SYSTEM, so the open succeeds for any live peer. The one race left
+    /// is process-id reuse, which needs the peer to have exited while its pipe handle survived in
+    /// another process; a stale id then names either nothing (`Unopenable`) or an unrelated
+    /// process (`OtherPrincipal`), both of which are refused.
+    fn classify_peer(peer: PeerIdentity, declared_sid: PSID) -> WindowsPeer {
+        let Some(process_id) = peer.process_id else {
+            return WindowsPeer::Unnamed;
+        };
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if process.is_null() {
+            return WindowsPeer::Unopenable;
+        }
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
+            return WindowsPeer::TokenUnreadable;
+        }
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+
+        let mut required = 0_u32;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            )
+        };
+        if required == 0 {
+            return WindowsPeer::TokenUnreadable;
+        }
+        // A `TOKEN_USER` is followed in the same buffer by the SID it points at, so the buffer is
+        // allocated as pointer-sized words to give that SID the alignment the SID calls expect.
+        let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return WindowsPeer::TokenUnreadable;
+        }
+
+        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        if user.User.Sid.is_null() || unsafe { IsValidSid(user.User.Sid) } == 0 {
+            return WindowsPeer::TokenUnreadable;
+        }
+        if unsafe { EqualSid(user.User.Sid, declared_sid) } == 0 {
+            return WindowsPeer::OtherPrincipal;
+        }
+        WindowsPeer::DeclaredOwner
     }
 
     fn canonical_app_data_root(path: &Path) -> Result<PathBuf, ServiceError> {
@@ -680,6 +839,54 @@ mod windows_auth {
 }
 
 #[cfg(test)]
+mod peer_tests {
+    use super::{OwnerIdentity, ServiceErrorCode, WindowsPeer, require_declared_owner_peer};
+
+    fn declared_owner() -> OwnerIdentity {
+        OwnerIdentity::Windows {
+            sid: "S-1-5-21-1004336348-1177238915-682003330-1001".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_a_peer_proved_to_be_the_declared_owner_is_admitted() {
+        assert!(require_declared_owner_peer(&declared_owner(), WindowsPeer::DeclaredOwner).is_ok());
+    }
+
+    /// The whole point of the gate: every answer other than "it is the owner" is refused, and the
+    /// three ways of not knowing are refused on the same terms as knowing it is somebody else.
+    /// A stolen token presented from another session is `OtherPrincipal`; the rest are what the
+    /// service must do when it cannot tell, and none of them may fall back to trusting the token.
+    #[test]
+    fn an_unproved_peer_is_refused_exactly_as_a_wrong_one_is() {
+        for peer in [
+            WindowsPeer::OtherPrincipal,
+            WindowsPeer::Unnamed,
+            WindowsPeer::Unopenable,
+            WindowsPeer::TokenUnreadable,
+        ] {
+            let error = require_declared_owner_peer(&declared_owner(), peer)
+                .expect_err("a peer that was not proved to be the owner must be refused");
+
+            assert_eq!(error.code, ServiceErrorCode::UnauthorizedOwner);
+        }
+    }
+
+    /// The gate is not a free pass for a request that named the wrong kind of identity: a Unix
+    /// identity arriving on the Windows path has no SID for the peer to have matched.
+    #[test]
+    fn a_unix_identity_does_not_satisfy_the_windows_gate() {
+        let error = require_declared_owner_peer(
+            &OwnerIdentity::Unix { uid: 501, gid: 20 },
+            WindowsPeer::DeclaredOwner,
+        )
+        .expect_err("a Unix identity must not pass the Windows transport gate");
+
+        assert_eq!(error.code, ServiceErrorCode::UnauthorizedOwner);
+    }
+}
+
+#[cfg(test)]
 mod path_tests {
     use super::is_local_drive_path;
 
@@ -735,6 +942,7 @@ mod tests {
                 peer_credentials: PeerCredentials {
                     uid: Some(uid),
                     gid: Some(gid),
+                    pid: None,
                 },
             },
             timestamp: Instant::now(),
@@ -756,6 +964,7 @@ mod tests {
 
 #[cfg(all(test, windows, feature = "test"))]
 mod windows_tests {
+    use super::PeerIdentity;
     use super::windows_auth::authenticate;
     use crate::{OWNER_TOKEN_FILE_NAME, OwnerIdentity, ServiceErrorCode, test_owner_credentials};
     use std::os::windows::ffi::OsStrExt as _;
@@ -821,14 +1030,14 @@ mod windows_tests {
         let credentials = test_owner_credentials(&root)?;
 
         assert_eq!(
-            authenticate(&credentials)?.app_data_root,
+            authenticate(PeerIdentity::current_process(), &credentials)?.app_data_root,
             root.canonicalize()?
         );
 
         let mut wrong_token = credentials.clone();
         wrong_token.token = Some("00".repeat(32));
         assert_eq!(
-            authenticate(&wrong_token)
+            authenticate(PeerIdentity::current_process(), &wrong_token)
                 .expect_err("wrong owner token must be rejected")
                 .code,
             ServiceErrorCode::UnauthorizedOwner
@@ -839,9 +1048,46 @@ mod windows_tests {
             sid: "S-1-5-18".to_string(),
         };
         assert_eq!(
-            authenticate(&wrong_owner)
+            authenticate(PeerIdentity::current_process(), &wrong_owner)
                 .expect_err("wrong owner SID must be rejected")
                 .code,
+            ServiceErrorCode::UnauthorizedOwner
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// The transport gate, exercised against credentials that are otherwise perfect.
+    ///
+    /// Holding a copy of the 32 secret bytes is no longer enough: the request has to arrive from a
+    /// process running as the owner. A connection the service cannot attribute to any process is
+    /// refused rather than falling back to what the token alone would have proved.
+    #[test]
+    fn valid_credentials_are_refused_when_the_peer_is_not_proved() -> anyhow::Result<()> {
+        let root = test_root("peer");
+        let _ = std::fs::remove_dir_all(&root);
+        let credentials = test_owner_credentials(&root)?;
+
+        authenticate(PeerIdentity::current_process(), &credentials)?;
+
+        assert_eq!(
+            authenticate(PeerIdentity::default(), &credentials)
+                .expect_err("a connection that names no process must be rejected")
+                .code,
+            ServiceErrorCode::UnauthorizedOwner
+        );
+
+        // Not a multiple of four, so never a live process id: the peer exited, or never existed.
+        assert_eq!(
+            authenticate(
+                PeerIdentity {
+                    process_id: Some(u32::MAX)
+                },
+                &credentials
+            )
+            .expect_err("a peer that cannot be opened must be rejected")
+            .code,
             ServiceErrorCode::UnauthorizedOwner
         );
 
@@ -858,7 +1104,7 @@ mod windows_tests {
         std::fs::remove_file(&token_path)?;
         std::fs::create_dir(&token_path)?;
         assert_eq!(
-            authenticate(&directory_credentials)
+            authenticate(PeerIdentity::current_process(), &directory_credentials)
                 .expect_err("token directory must be rejected")
                 .code,
             ServiceErrorCode::UnauthorizedOwner
@@ -870,7 +1116,7 @@ mod windows_tests {
         let dacl_credentials = test_owner_credentials(&dacl_root)?;
         apply_everyone_dacl(&dacl_root.join(OWNER_TOKEN_FILE_NAME))?;
         assert_eq!(
-            authenticate(&dacl_credentials)
+            authenticate(PeerIdentity::current_process(), &dacl_credentials)
                 .expect_err("Everyone token DACL must be rejected")
                 .code,
             ServiceErrorCode::UnauthorizedOwner
@@ -888,7 +1134,7 @@ mod windows_tests {
         let mut link_credentials = dacl_credentials;
         link_credentials.app_data_dir = link_root.to_string_lossy().into_owned();
         assert_eq!(
-            authenticate(&link_credentials)
+            authenticate(PeerIdentity::current_process(), &link_credentials)
                 .expect_err("reparse-point app root must be rejected")
                 .code,
             ServiceErrorCode::UnauthorizedOwner

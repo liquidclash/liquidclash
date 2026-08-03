@@ -80,8 +80,19 @@ const MAX_LOG_FILES: usize = 32;
 /// already-supported lost-response case repaired late via session generations, and strictly
 /// safer than dropping a handler mid-transaction.
 const IPC_TRANSPORT_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Control-pipe DACL: full control for LocalSystem and Administrators, read/write for
+/// **interactive** logons only.
+///
+/// `IU` rather than `AU` (Authenticated Users) is deliberate. On a domain-joined machine
+/// Authenticated Users includes *network* logons, so any authenticated principal on the network
+/// could reach `\\host\pipe\tono-service` and speak to a LocalSystem service whose token check
+/// is filesystem-based and cannot tell a network logon from a local one. Nothing legitimate
+/// needs that: the only client is the desktop app, which by definition runs in the interactive
+/// session. Deny-NETWORK is added as well so a principal that is somehow both cannot slip past
+/// the allow ACE — deny entries are evaluated first.
 #[cfg(any(test, all(windows, not(feature = "test"))))]
-const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;AU)";
+const WINDOWS_CONTROL_PIPE_SDDL: &str =
+    "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;IU)";
 #[cfg(all(windows, feature = "test"))]
 const WINDOWS_TEST_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)";
 
@@ -1740,12 +1751,25 @@ mod owner_lifecycle_tests {
     }
 
     #[test]
-    fn windows_control_pipe_allows_authenticated_users_not_everyone() {
-        assert!(WINDOWS_CONTROL_PIPE_SDDL.contains(";;;AU)"));
+    fn windows_control_pipe_admits_interactive_logons_only() {
+        // Read/write for interactive logons, and nothing wider: Authenticated Users would
+        // include network logons on a domain machine, and Everyone needs no explanation.
+        assert!(WINDOWS_CONTROL_PIPE_SDDL.contains("0x0012019b;;;IU)"));
+        assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains(";;;AU)"));
         assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains(";;;WD)"));
-        assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains("GRGW;;;AU"));
-        assert!(WINDOWS_CONTROL_PIPE_SDDL.contains("0x0012019b;;;AU"));
-        assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains("0x0012019f;;;AU"));
+        // Network logons are denied outright, and the deny ACE must precede every allow ACE
+        // for Windows to evaluate it first.
+        let deny_network = WINDOWS_CONTROL_PIPE_SDDL
+            .find("(D;;GA;;;NU)")
+            .expect("network logons are denied");
+        let first_allow = WINDOWS_CONTROL_PIPE_SDDL
+            .find("(A;")
+            .expect("the descriptor grants somebody");
+        assert!(deny_network < first_allow);
+        // The pipe stays protected, so no inherited ACE can widen it.
+        assert!(WINDOWS_CONTROL_PIPE_SDDL.starts_with("D:P"));
+        // Clients get read/write, never the right to create a new pipe instance.
+        assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains("0x0012019f;;;IU"));
     }
 
     #[tokio::test]
