@@ -1,0 +1,16 @@
+proxies:
+  - name: US Reality
+    type: vless
+    server: 8.8.4.4
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000001
+    network: tcp
+    tls: true
+    udp: true
+    servername: us.example.com
+    client-fingerprint: chrome
+    flow: xtls-rprx-vision
+    reality-opts:
+      public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      short-id: 0123456789abcdef
+  - {name: JP Reality, type: vless, server: 1.1.1.1, port: 443, uuid: 00000000-0000-4000-8000-000000000002, network: tcp, tls: true, udp: true, servername: jp.example.com, client-fingerprint: chrome, flow: xtls-rprx-vision, reality-opts: {public-key: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB, short-id: fedcba9876543210}}

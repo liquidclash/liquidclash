@@ -34,3 +34,6 @@ LiquidClashHelper/
 # Rust build artifacts
 **/target/
 .rust-build/
+
+# Python
+__pycache__/

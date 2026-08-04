@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Tono</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>SUFeedURL</key>
+	<string>https://api.afk.ccwu.cc/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>uOGYz+x/v6Q8X73dlBY2BHZhBpV7jghAfum980nBiAQ=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>21600</integer>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
+	<key>TonoAPIBaseURL</key>
+	<string>https://api.afk.ccwu.cc</string>
+	<key>TonoAPIBootstrapAddresses</key>
+	<array>
+		<string>104.20.26.170</string>
+		<string>172.66.162.98</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.raydocs.tono</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>tono</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

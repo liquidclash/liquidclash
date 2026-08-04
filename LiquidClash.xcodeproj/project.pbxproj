@@ -6,14 +6,66 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		C0D000012F80000000000001 /* mihomo in Embed Executables */ = {isa = PBXBuildFile; fileRef = C0D000052F80000000000001 /* mihomo */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		C0D000042F80000000000001 /* liquidclash-helper in Embed Executables */ = {isa = PBXBuildFile; fileRef = C0D000082F80000000000001 /* liquidclash-helper */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		C0D0000B2F80000000000001 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = C0D0000D2F80000000000001 /* Sparkle */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		C0D0000A2F80000000000001 /* Embed Executables */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 7;
+			files = (
+				C0D000012F80000000000001 /* mihomo in Embed Executables */,
+				C0D000042F80000000000001 /* liquidclash-helper in Embed Executables */,
+			);
+			name = "Embed Executables";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
-		14F0D2082F78C04F000C4896 /* LiquidClash.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiquidClash.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		14F0D2082F78C04F000C4896 /* Tono.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Tono.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0D000052F80000000000001 /* mihomo */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; path = Tono/Resources/mihomo; sourceTree = "<group>"; };
+		C0D000082F80000000000001 /* liquidclash-helper */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; path = Tono/Resources/liquidclash-helper; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		14F0D20B2F78C04F000C4896 /* Exceptions for "Tono" folder in "LiquidClash" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+				membershipExceptions = (
+					":-",
+					Info.plist,
+					Resources/clash-fetcher,
+					Resources/country.mmdb,
+					Resources/geoip.dat,
+					Resources/geosite.dat,
+					Resources/liquidclash-helper,
+					Resources/liquidclash.helper.plist,
+					Resources/mihomo,
+					Resources/tailscale,
+					Resources/tailscaled,
+					Services/WebViewDownloader.swift,
+					Tools,
+					Tools/.cargo/config.toml,
+					Tools/Cargo.lock,
+					Tools/Cargo.toml,
+					Tools/src/main.rs,
+				);
+			target = 14F0D2072F78C04F000C4896 /* LiquidClash */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		14F0D20A2F78C04F000C4896 /* LiquidClash */ = {
+		14F0D20A2F78C04F000C4896 /* Tono */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = LiquidClash;
+			exceptions = (
+				14F0D20B2F78C04F000C4896 /* Exceptions for "Tono" folder in "LiquidClash" target */,
+			);
+			path = Tono;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -23,6 +75,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C0D0000B2F80000000000001 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -32,15 +85,25 @@
 		14F0D1FF2F78C04F000C4896 = {
 			isa = PBXGroup;
 			children = (
-				14F0D20A2F78C04F000C4896 /* LiquidClash */,
+				14F0D20A2F78C04F000C4896 /* Tono */,
+				C0D000092F80000000000001 /* Embedded Executables */,
 				14F0D2092F78C04F000C4896 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		C0D000092F80000000000001 /* Embedded Executables */ = {
+			isa = PBXGroup;
+				children = (
+					C0D000052F80000000000001 /* mihomo */,
+					C0D000082F80000000000001 /* liquidclash-helper */,
+				);
+			name = "Embedded Executables";
 			sourceTree = "<group>";
 		};
 		14F0D2092F78C04F000C4896 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				14F0D2082F78C04F000C4896 /* LiquidClash.app */,
+				14F0D2082F78C04F000C4896 /* Tono.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -55,19 +118,21 @@
 				14F0D2042F78C04F000C4896 /* Sources */,
 				14F0D2052F78C04F000C4896 /* Frameworks */,
 				14F0D2062F78C04F000C4896 /* Resources */,
+				C0D0000A2F80000000000001 /* Embed Executables */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				14F0D20A2F78C04F000C4896 /* LiquidClash */,
+				14F0D20A2F78C04F000C4896 /* Tono */,
 			);
 			name = LiquidClash;
 			packageProductDependencies = (
+				C0D0000D2F80000000000001 /* Sparkle */,
 			);
 			productName = LiquidClash;
-			productReference = 14F0D2082F78C04F000C4896 /* LiquidClash.app */;
+			productReference = 14F0D2082F78C04F000C4896 /* Tono.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -96,6 +161,9 @@
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 14F0D2092F78C04F000C4896 /* Products */;
+			packageReferences = (
+				C0D0000C2F80000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */,
+			);
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -248,22 +316,23 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = LiquidClash/LiquidClash.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Tono/LiquidClash.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 38;
+				DEVELOPMENT_TEAM = YY57758GS7;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = LiquidClash/Info.plist;
+				INFOPLIST_FILE = Tono/Info.plist;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.6;
-				PRODUCT_BUNDLE_IDENTIFIER = liquidclash.LiquidClash;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				MARKETING_VERSION = 0.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raydocs.tono;
+				PRODUCT_NAME = Tono;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -277,24 +346,28 @@
 		14F0D2172F78C050000C4896 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = LiquidClash/LiquidClash.entitlements;
+				CODE_SIGN_ENTITLEMENTS = "Tono/Tono-Release.entitlements";
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 38;
+				DEVELOPMENT_TEAM = YY57758GS7;
 				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = LiquidClash/Info.plist;
+				INFOPLIST_FILE = Tono/Info.plist;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.6;
-				PRODUCT_BUNDLE_IDENTIFIER = liquidclash.LiquidClash;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				MARKETING_VERSION = 0.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raydocs.tono;
+				PRODUCT_NAME = Tono;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -327,6 +400,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		C0D0000C2F80000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = exactVersion;
+				version = 2.9.4;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C0D0000D2F80000000000001 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0D0000C2F80000000000001 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 14F0D2002F78C04F000C4896 /* Project object */;
 }
