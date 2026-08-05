@@ -1034,6 +1034,8 @@ export const translationKeys = [
   'tono.nodes.cloudServers',
   'tono.nodes.empty',
   'tono.nodes.timeout',
+  'tono.nodes.unavailable',
+  'tono.nodes.unavailableHint',
   'tono.servers.title',
   'tono.servers.cloudGroup',
   'tono.servers.empty',

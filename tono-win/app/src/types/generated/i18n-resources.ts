@@ -1679,6 +1679,8 @@ export interface TranslationResources {
         testCurrent: string
         timeout: string
         title: string
+        unavailable: string
+        unavailableHint: string
       }
       pill: {
         statusProtected: string
