@@ -493,9 +493,65 @@ fn ensure_snapshotless_adapters_are_safe(adapters: &[AdapterDnsSnapshot]) -> Res
     Ok(())
 }
 
+/// After a failed connect, release can leave adapters on `198.18.0.2` while deleting
+/// `protected-dns.json`. The next Connect then hits [`ensure_snapshotless_adapters_are_safe`] and
+/// hard-fails. Heal by resetting those adapters to automatic (DHCP) — we have no better original
+/// to restore — then re-collect so enable can take a clean snapshot.
+async fn heal_orphaned_protected_dns_without_snapshot(
+    adapters: &[AdapterDnsSnapshot],
+) -> Result<Vec<AdapterDnsSnapshot>> {
+    let orphaned: Vec<_> = adapters
+        .iter()
+        .filter(|adapter| adapter_contains_current_protected_dns(adapter))
+        .cloned()
+        .collect();
+    if orphaned.is_empty() {
+        return Ok(adapters.to_vec());
+    }
+    tracing::warn!(
+        "dns: protected-dns.json is missing but {} adapter(s) still list {PROTECTED_DNS_V4}; \
+         resetting them to automatic (DHCP) so Connect can proceed",
+        orphaned.len()
+    );
+    let automatic = DnsSnapshot {
+        version: SNAPSHOT_VERSION,
+        taken_at: now_unix(),
+        adapters: orphaned
+            .iter()
+            .map(|adapter| AdapterDnsSnapshot {
+                interface_guid: adapter.interface_guid.clone(),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    match engine_apply_snapshot(&automatic).await {
+        Ok(results) => {
+            let failed = results.iter().filter(|(_, ok)| !*ok).count();
+            if failed > 0 {
+                tracing::warn!(
+                    "dns: orphaned-DNS heal applied with {failed} adapter failure(s); re-reading"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                "dns: orphaned-DNS heal apply failed ({error:#}); will re-check adapters"
+            );
+        }
+    }
+    if let Err(error) = engine_flush_cache().await {
+        tracing::warn!("dns: cache flush after orphaned-DNS heal failed: {error:#}");
+    }
+    collect_dns_adapters().await
+}
+
 async fn ensure_snapshotless_dns_is_safe() -> Result<()> {
     let current = collect_dns_adapters().await?;
-    ensure_snapshotless_adapters_are_safe(&current)
+    if ensure_snapshotless_adapters_are_safe(&current).is_ok() {
+        return Ok(());
+    }
+    let healed = heal_orphaned_protected_dns_without_snapshot(&current).await?;
+    ensure_snapshotless_adapters_are_safe(&healed)
 }
 
 /// Whether a value is still owned by Tono and may become unreachable when the core stops. This
@@ -1729,17 +1785,19 @@ async fn enable_unlocked(trigger: EnableTrigger) -> Result<DnsProtectionStatus> 
     // Always collect before the idempotence decision. Network-change reconnects call `enable`
     // again, and a newly installed/hot-plugged adapter must have its original DNS appended to the
     // durable snapshot before it is pointed at loopback.
-    let fresh = DnsSnapshot {
+    let mut fresh = DnsSnapshot {
         version: SNAPSHOT_VERSION,
         taken_at: now_unix(),
         adapters: collect_dns_adapters().await?,
     };
     if !snapshot_present {
         // A recovery file can be deleted independently of the registry (AV quarantine, manual
-        // cleanup, disk corruption). Never turn the TUN endpoint left behind by that event into
-        // the new "original" and make every later disconnect restore to a dead resolver. The
-        // collector has already removed the currently validated WinTUN adapter, so every target
-        // left here belongs to a resolver client that requires a real recovery record.
+        // cleanup, disk corruption, failed-connect release). Never turn the TUN endpoint left
+        // behind into the new "original". If adapters still list 198.18.0.2 with no snapshot,
+        // heal them to DHCP first so Connect is not permanently bricked after a prior failure.
+        if ensure_snapshotless_adapters_are_safe(&fresh.adapters).is_err() {
+            fresh.adapters = heal_orphaned_protected_dns_without_snapshot(&fresh.adapters).await?;
+        }
         record_outcome(ensure_snapshotless_adapters_are_safe(&fresh.adapters))?;
     }
     // Health and replay decisions cover adapters that are live now, not historical snapshot
