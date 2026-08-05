@@ -3,7 +3,7 @@
 **Date:** 2026-08-02  
 **Author of this handoff:** Grok (prior agent)  
 **Repo:** `/Users/rw/Downloads/Project/liquidclash`  
-**Focus tree:** `Tono-win/` (Windows Tauri App + LocalSystem Service + tono-core)
+**Focus tree:** `tono-win/` (Windows Tauri App + LocalSystem Service + tono-core)
 
 ---
 
@@ -132,7 +132,7 @@ These **block user testing**, not more unit tests:
 
 ### Commands (quick)
 ```bash
-cd Tono-win
+cd tono-win
 # packaging gate
 (cd app && node scripts/windows-release-preflight.mjs --config-only)
 (cd app && node --test scripts/windows-packaging.test.mjs)
@@ -142,7 +142,7 @@ cargo test --manifest-path crates/tono-core/Cargo.toml --lib
 cargo test --manifest-path service/Cargo.toml --lib --features 'standalone,client,test'
 (cd app/src-tauri && cargo test --lib tono::connection)
 
-# full Windows release (needs pinned toolchain under Tono-win/.toolchain)
+# full Windows release (needs pinned toolchain under tono-win/.toolchain)
 # from repo root:
 # ./scripts/build-windows-release.sh 2.5.4
 ```

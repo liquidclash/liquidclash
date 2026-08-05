@@ -3,8 +3,8 @@ set -euo pipefail
 
 repo_root=${0:A:h:h}
 mac_target="$repo_root/Tono/Resources/mihomo"
-windows_target="$repo_root/Tono-win/app/src-tauri/sidecar/verge-mihomo-x86_64-pc-windows-msvc.exe"
-windows_alpha_target="$repo_root/Tono-win/app/src-tauri/sidecar/verge-mihomo-alpha-x86_64-pc-windows-msvc.exe"
+windows_target="$repo_root/tono-win/app/src-tauri/sidecar/verge-mihomo-x86_64-pc-windows-msvc.exe"
+windows_alpha_target="$repo_root/tono-win/app/src-tauri/sidecar/verge-mihomo-alpha-x86_64-pc-windows-msvc.exe"
 patch_file="$repo_root/scripts/mihomo-adaptive/gvisor-adaptive-buffer.patch"
 mode=${1:---install-adaptive}
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=${0:A:h:h}
-windows_root="$repo_root/Tono-win"
+windows_root="$repo_root/tono-win"
 app_root="$windows_root/app"
 toolchain_root="$windows_root/.toolchain"
 version=${1:-}
@@ -14,7 +14,7 @@ fi
 if [[ ! -x "$toolchain_root/cargo/bin/cargo" ||
       ! -x "$toolchain_root/cargo/bin/cargo-xwin" ||
       ! -x "$toolchain_root/bin/pnpm" ]]; then
-  echo "the pinned Tono-win toolchain is incomplete" >&2
+  echo "the pinned tono-win toolchain is incomplete" >&2
   exit 1
 fi
 

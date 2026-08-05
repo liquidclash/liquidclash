@@ -7,7 +7,7 @@
 > 后快速重连会被旧 release 拆除的新 P0 竞态。现有 Test 5 安装包不包含这些后续修复。
 
 日期：2026-08-02  
-审查对象：`Tono-win` 本地工作树、GitHub `tono-windows-2.5.4-test5` 发布物及其源码快照  
+审查对象：`tono-win` 本地工作树、GitHub `tono-windows-2.5.4-test5` 发布物及其源码快照  
 结论类型：源码修复、静态复审、单元/集成测试、Windows 交叉编译；尚未进行真实 Windows/WFP 运行验证
 
 ## 1. 结论

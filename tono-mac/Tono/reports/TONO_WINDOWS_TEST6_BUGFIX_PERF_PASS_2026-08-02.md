@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-02
 **Author:** Claude (this pass), following `CLAUDE_HANDOFF_WINDOWS_TEST6_2026-08-02.md`
-**Base:** `3786195` (clean HEAD verified). All changes below are **uncommitted** working-tree edits scoped strictly to `Tono-win/` — none of the unrelated dirty paths (LiquidClash deletions, macOS `Tono/`, Cloudflare) were touched.
+**Base:** `3786195` (clean HEAD verified). All changes below are **uncommitted** working-tree edits scoped strictly to `tono-win/` — none of the unrelated dirty paths (LiquidClash deletions, macOS `Tono/`, Cloudflare) were touched.
 
 ---
 
@@ -85,11 +85,11 @@ All of the above is now **committed and built**:
 | Docs commit | `480be36` |
 | Gate-fix commit | `36b70c2` fix(windows): parse real 7zz NSIS listings in the release preflight |
 | Tag | `tono-windows-2.5.4-test6` → `36b70c2` (clean tree at tag time; **local only, not pushed**) |
-| Installer | `Tono-win/dist-windows/Tono_2.5.4_x64-setup.exe`, 30,852,322 bytes (Test 5 was 35.4 MB) |
+| Installer | `tono-win/dist-windows/Tono_2.5.4_x64-setup.exe`, 30,852,322 bytes (Test 5 was 35.4 MB) |
 | Installer SHA-256 | `ef92f8bce4c4fdea9db4e44dcfd68d570f5bacb179892bcc6bf4b46eb97a4ece` |
 | tono-service.exe SHA-256 | `26852af3462596443105a60c6d8abbf4dc756e0005b8cac4c804ef042fec834b` |
 | verge-mihomo SHA-256 | `a064b52f2e4c476189edc7e078f22a45e16252d265afe9be1ee90afe0fec9969` |
-| Manifest | `Tono-win/dist-windows/Tono-Windows-2.5.4-test6-release-manifest.json` |
+| Manifest | `tono-win/dist-windows/tono-windows-2.5.4-test6-release-manifest.json` |
 
 **Payload proof (7zz, 18 entries):** exactly one `verge-mihomo.exe`; no `verge-mihomo-alpha`; no `clash-verge-service*`, `set_dns.sh`, `unset_dns.sh`; `Tono.exe` + `tono-service{,-install,-uninstall}.exe` all present. Full `release:preflight <tag> <installer> <manifest>` **passed** (clean tree, tag==commit, version triple-match, all three SHA cross-checks).
 

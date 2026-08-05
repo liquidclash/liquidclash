@@ -1,7 +1,7 @@
 # Tono Windows P0–P4 完成复审与 Test 6 发布门报告
 
 日期：2026-08-02  
-审查对象：`/Users/rw/Downloads/Project/liquidclash/Tono-win` 当前共享工作树  
+审查对象：`/Users/rw/Downloads/Project/liquidclash/tono-win` 当前共享工作树  
 结论范围：源码修复、静态并发复审、自动测试、Windows x64 交叉检查与 PE release 构建；不包含真实 Windows/WFP 运行结论
 
 ## 1. 执行结论

@@ -32,7 +32,7 @@ cd liquidclash
 git checkout main          # 交接基线 HEAD: 0eb6879
 ```
 
-产品在 **`Tono-win/`** 目录下，自成一体。仓库里还有 macOS 的东西（`LiquidClash/` 的 Xcode 工程、`Tono/` 的 macOS 应用），**跟你无关，别动**。
+产品在 **`tono-win/`** 目录下，自成一体。仓库里还有 macOS 的东西（`LiquidClash/` 的 Xcode 工程、`Tono/` 的 macOS 应用），**跟你无关，别动**。
 
 `Tono/reports/` 是文档目录，值得看的：
 
@@ -48,25 +48,25 @@ git checkout main          # 交接基线 HEAD: 0eb6879
 
 | 组件 | 说明 |
 |---|---|
-| **Rust** | `Tono-win/app/rust-toolchain.toml` 钉的是 `1.95.0`；实际用 1.97.1 编译过。工作区 `edition = 2024`、`rust-version = 1.85` |
+| **Rust** | `tono-win/app/rust-toolchain.toml` 钉的是 `1.95.0`；实际用 1.97.1 编译过。工作区 `edition = 2024`、`rust-version = 1.85` |
 | **MSVC** | Visual Studio Build Tools + "使用 C++ 的桌面开发" 工作负载（链接器） |
 | **Node + pnpm** | `pnpm@11.3.0`（`app/package.json` 的 `packageManager` 钉死）。用 `corepack enable` |
 | **WebView2** | Win11 自带；Win10 需装 Runtime |
 | **7-Zip** | 载荷门要用，`7z` 或 `7zz` 在 PATH 里 |
 | **NSIS** | 不用手装，Tauri 打包时自带 |
 
-`Tono-win/.toolchain/` 是 **macOS 的交叉编译工具链**（cargo-xwin + xwin SDK 缓存 + mac 版 pnpm），**你在 Windows 上不需要它，原生工具链更简单**。
+`tono-win/.toolchain/` 是 **macOS 的交叉编译工具链**（cargo-xwin + xwin SDK 缓存 + mac 版 pnpm），**你在 Windows 上不需要它，原生工具链更简单**。
 
 ### vendor 的 IPC 库
 
-`Tono-win/vendor/kode-bridge` 是我们自己维护的副本（原先依赖第三方仓库的移动分支，上游随时可能改动地基）。它 `edition = 2021`、有自己的 lint 表，在工作区里是 `exclude` 而不是 member。**所有本地改动都带 `// Tono:` 注释标记**，将来同步上游能一眼找出来。
+`tono-win/vendor/kode-bridge` 是我们自己维护的副本（原先依赖第三方仓库的移动分支，上游随时可能改动地基）。它 `edition = 2021`、有自己的 lint 表，在工作区里是 `exclude` 而不是 member。**所有本地改动都带 `// Tono:` 注释标记**，将来同步上游能一眼找出来。
 
 ---
 
 ## 3. 先跑通验证
 
 ```powershell
-cd Tono-win
+cd tono-win
 
 # 三个 Rust 套件
 cargo test --manifest-path crates/tono-core/Cargo.toml --lib                             # 当前 147

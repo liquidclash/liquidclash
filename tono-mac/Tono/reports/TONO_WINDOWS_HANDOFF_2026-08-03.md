@@ -84,7 +84,7 @@
 
 ## 1. Windows 开发环境需要什么
 
-当前 macOS 侧用的是 `Tono-win/.toolchain` 里的交叉工具链（cargo-xwin + xwin SDK 缓存 + 一个 mac 版 pnpm + makensis.exe）。**那套东西在 Windows 上都不需要**，原生反而更简单。
+当前 macOS 侧用的是 `tono-win/.toolchain` 里的交叉工具链（cargo-xwin + xwin SDK 缓存 + 一个 mac 版 pnpm + makensis.exe）。**那套东西在 Windows 上都不需要**，原生反而更简单。
 
 | 组件 | 版本/说明 |
 |---|---|
@@ -96,7 +96,7 @@
 | 7-Zip | 载荷门要用（`7z`/`7zz` 任一在 PATH 里） |
 | Git | — |
 
-**注意 vendor 的 IPC 库**：`Tono-win/vendor/kode-bridge` 是我们自己维护的副本（原先依赖第三方仓库的移动分支），`edition = 2021`、有自己的 lint 表和工具链下限，在工作区里是 `exclude` 而不是 member。所有本地改动都带 `// Tono:` 注释标记，将来同步上游能一眼找出。
+**注意 vendor 的 IPC 库**：`tono-win/vendor/kode-bridge` 是我们自己维护的副本（原先依赖第三方仓库的移动分支），`edition = 2021`、有自己的 lint 表和工具链下限，在工作区里是 `exclude` 而不是 member。所有本地改动都带 `// Tono:` 注释标记，将来同步上游能一眼找出。
 
 ### Windows 原生构建脚本
 
