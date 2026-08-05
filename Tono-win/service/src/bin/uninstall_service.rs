@@ -77,6 +77,18 @@ const DNS_STILL_ON_LOOPBACK_MARKER: &str = "TONO_DNS_STILL_ON_LOOPBACK";
 #[cfg(any(windows, test))]
 const WFP_REMOVED_CONTINUE_MARKER: &str = "TONO_WFP_REMOVED";
 
+/// Customer logs show this exact status when Tono never installed a WFP provider. That is a
+/// **clean** machine, not an armed kill switch. Matched by substring so every layer's wrapping
+/// still classifies correctly.
+#[cfg(any(windows, test))]
+fn error_means_no_tono_wfp_provider(error: &Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("0x80320005")
+        || message.contains("0x8032_0005")
+        || message.contains("PROVIDER_NOT_FOUND")
+        || message.contains("provider does not exist")
+}
+
 /// Environment variable that opts this process into the uninstall-only DNS escalation ladder.
 /// Must match `windows_kill_switch::UNINSTALL_LADDER_ENV`. Set in this process image only, so
 /// the Service and the App never inherit it.
@@ -384,6 +396,14 @@ fn windows_cleanup() -> CleanupOutcome {
                 .block_on(clash_verge_service_ipc::residual_filters_present())
             {
                 Ok(present) => present,
+                // 0x80320005 = FWP_E_PROVIDER_NOT_FOUND: no Tono provider → not residual, CLEAN.
+                // Treating this as "unknown, force disarm" was the result-3 loop on customer PCs.
+                Err(error) if error_means_no_tono_wfp_provider(&error) => {
+                    println!(
+                        "WFP reports no Tono provider (clean machine; {error:#}); nothing to disarm."
+                    );
+                    false
+                }
                 Err(error) => {
                     eprintln!(
                         "Could not probe residual Tono WFP filters ({error:#}); running the full \
@@ -500,28 +520,37 @@ fn windows_cleanup() -> CleanupOutcome {
                 Some(error)
             }
             CleanupOutcome::StillProtected(error) => {
-                let residual = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .ok()
-                    .and_then(|runtime| {
-                        runtime
-                            .block_on(clash_verge_service_ipc::residual_filters_present())
-                            .ok()
-                    });
-                match residual {
-                    Some(false) => {
-                        eprintln!(
-                            "Disarm reported failure ({error:#}), but no residual Tono WFP \
-                             filters remain; treating the machine as unblocked so \
-                             install/uninstall can continue."
-                        );
-                        Some(anyhow::anyhow!(
-                            "{WFP_REMOVED_CONTINUE_MARKER}: disarm reported an error but residual \
-                             WFP filters are absent: {error:#}"
-                        ))
+                // Hard guarantee for the customer log: provider-absent is CLEAN, not armed.
+                if error_means_no_tono_wfp_provider(&error) {
+                    println!(
+                        "Disarm reported WFP provider-not-found (0x80320005): no Tono kill switch \
+                         is installed. Treating the machine as clean so install/uninstall continues."
+                    );
+                    None
+                } else {
+                    let residual = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()
+                        .and_then(|runtime| {
+                            runtime
+                                .block_on(clash_verge_service_ipc::residual_filters_present())
+                                .ok()
+                        });
+                    match residual {
+                        Some(false) => {
+                            eprintln!(
+                                "Disarm reported failure ({error:#}), but no residual Tono WFP \
+                                 filters remain; treating the machine as unblocked so \
+                                 install/uninstall can continue."
+                            );
+                            Some(anyhow::anyhow!(
+                                "{WFP_REMOVED_CONTINUE_MARKER}: disarm reported an error but residual \
+                                 WFP filters are absent: {error:#}"
+                            ))
+                        }
+                        _ => return CleanupOutcome::StillProtected(error),
                     }
-                    _ => return CleanupOutcome::StillProtected(error),
                 }
             }
             other => return other,
@@ -721,6 +750,20 @@ mod tests {
         assert_eq!(DNS_RESTORED_AUTOMATIC_MARKER, "TONO_DNS_RESTORED_AUTOMATIC");
         assert_eq!(DNS_STILL_ON_LOOPBACK_MARKER, "TONO_DNS_STILL_ON_LOOPBACK");
         assert_eq!(WFP_REMOVED_CONTINUE_MARKER, "TONO_WFP_REMOVED");
+    }
+
+    /// The exact customer failure string must classify as "no Tono provider" (clean), not armed.
+    #[test]
+    fn customer_0x80320005_log_line_means_clean_not_armed() {
+        let error = anyhow::anyhow!(
+            "FwpmProviderGetByKey0 failed: WFP error 0x80320005"
+        );
+        assert!(
+            super::error_means_no_tono_wfp_provider(&error),
+            "customer residual/disarm log must be treated as clean"
+        );
+        let wrapped = error.context("could not prove that orphaned Tono WFP filters are absent");
+        assert!(super::error_means_no_tono_wfp_provider(&wrapped));
     }
 
     /// The invariant, asserted over the whole outcome space rather than per case: every outcome

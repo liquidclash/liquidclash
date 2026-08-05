@@ -1415,15 +1415,28 @@ pub async fn restore_on_service_start() -> Result<()> {
 /// uninstall can leave provider-scoped filters behind after deleting `kill-switch.json` and the
 /// SCM record. The next Service start deliberately treats that combination as armed. Therefore
 /// an uninstaller may only skip the real disarm when this probe also proves that no Tono filter
-/// exists. Errors stay on the fail-closed side and are surfaced to the caller.
+/// exists.
+///
+/// **Provider-absent is not an error:** `FwpmProviderGetByKey0` returning `0x80320005`
+/// (`FWP_E_PROVIDER_NOT_FOUND`) means there is no Tono provider and therefore no residual
+/// filters. Reporting that as `Err` made Chinese clean-machine installs fail with result 3.
 #[cfg(all(windows, not(feature = "test")))]
 pub async fn residual_filters_present() -> Result<bool> {
     let _operation = WFP_OPERATION.lock().await;
-    engine_call(
+    match engine_call(
         "uninstall residual filter check",
         crate::core::wfp::any_filters_exist,
     )
     .await
+    {
+        Ok(present) => Ok(present),
+        Err(error)
+            if crate::core::wfp::error_text_means_provider_absent(&format!("{error:#}")) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(all(windows, not(feature = "test"))))]

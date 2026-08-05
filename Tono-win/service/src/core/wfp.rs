@@ -46,18 +46,29 @@ use windows_sys::core::GUID;
 
 // WFP error codes from fwpmu.h / winerror.h. windows-sys does not expose FWP_E_*.
 //
-// **These values were wrong before 0.0.15** (PROVIDER was 0x80320002 = CONDITION_NOT_FOUND,
-// SUBLAYER was 0x80320004 = LAYER_NOT_FOUND). On a clean machine FwpmProviderGetByKey0 returns
-// FWP_E_PROVIDER_NOT_FOUND = 0x80320005; treating that as a hard error made residual probes and
-// emergency_disarm fail with result 3 even though no Tono provider/filters existed — the Chinese
-// customer log that blocked install over a never-armed machine.
-//
-// MSDN order: CALLOUT=1, CONDITION=2, FILTER=3, LAYER=4, PROVIDER=5, PROVIDER_CONTEXT=6,
-// SUBLAYER=7, NOT_FOUND=8, ALREADY_EXISTS=9.
+// MSDN (must stay exact — a wrong PROVIDER constant turned clean Chinese installs into result 3):
+//   FILTER_NOT_FOUND=0x80320003, PROVIDER_NOT_FOUND=0x80320005, SUBLAYER_NOT_FOUND=0x80320007,
+//   ALREADY_EXISTS=0x80320009.
 const FWP_E_FILTER_NOT_FOUND: u32 = 0x8032_0003;
 const FWP_E_PROVIDER_NOT_FOUND: u32 = 0x8032_0005;
 const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x8032_0007;
 const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
+
+/// True when a `Fwpm*` status means "Tono's provider is not installed" (machine has no Tono WFP
+/// objects under our provider key). Uses the raw hex so a future constant typo cannot re-brick
+/// uninstall: `0x80320005` is the only value customer logs show for this case.
+#[inline]
+fn wfp_status_means_provider_absent(status: u32) -> bool {
+    status == 0x8032_0005 || status == FWP_E_PROVIDER_NOT_FOUND
+}
+
+/// Error text from this module (and wrappers) that means the same as provider-absent.
+pub(crate) fn error_text_means_provider_absent(message: &str) -> bool {
+    message.contains("0x80320005")
+        || message.contains("0x8032_0005")
+        || message.contains("PROVIDER_NOT_FOUND")
+        || message.contains("provider does not exist")
+}
 /// `RPC_C_AUTHN_WINNT`: negotiate the machine's own authentication for the local BFE RPC.
 const RPC_C_AUTHN_WINNT: u32 = 10;
 
@@ -754,19 +765,21 @@ pub(crate) fn remove_legacy_sublayers() -> Result<usize> {
 fn provider_exists(engine: &Engine) -> Result<bool> {
     let key = to_sys(TONO_WFP_PROVIDER_KEY);
     let mut provider = std::ptr::null_mut();
-    // SAFETY: valid engine handle; valid out-pointer.
+    // SAFETY: valid engine handle; valid out-pointer. Returns WIN32/`HRESULT`-shaped `u32`.
     let status = unsafe { FwpmProviderGetByKey0(engine.0, &key, &mut provider) };
-    match status {
-        0 => {
-            // SAFETY: engine-allocated on success.
-            unsafe { free_block(provider) };
-            Ok(true)
-        }
-        FWP_E_PROVIDER_NOT_FOUND => Ok(false),
-        other => Err(anyhow!(
-            "FwpmProviderGetByKey0 failed: WFP error {other:#010x}"
-        )),
+    if status == 0 {
+        // SAFETY: engine-allocated on success.
+        unsafe { free_block(provider) };
+        return Ok(true);
     }
+    // FWP_E_PROVIDER_NOT_FOUND (0x80320005): no Tono provider → no residual filters. Must never
+    // be reported as Err — that is the install result-3 brick on clean machines.
+    if wfp_status_means_provider_absent(status) {
+        return Ok(false);
+    }
+    Err(anyhow!(
+        "FwpmProviderGetByKey0 failed: WFP error {status:#010x}"
+    ))
 }
 
 fn apply_plan(engine: &Engine, plan: &model::ChangePlan, app_id: Option<&AppId>) -> Result<()> {
@@ -907,18 +920,25 @@ pub(crate) fn remove_all_filters() -> Result<()> {
 /// Whether any Tono filter exists — the residual-object check for fail-closed startup.
 pub(crate) fn any_filters_exist() -> Result<bool> {
     let engine = Engine::open()?;
-    if !provider_exists(&engine)? {
-        return Ok(false);
+    match provider_exists(&engine) {
+        Ok(false) => Ok(false),
+        Ok(true) => Ok(!enumerate_our_filter_keys(&engine)?.is_empty()),
+        // Belt-and-suspenders: if a wrapper re-shapes the status, still treat provider-absent
+        // as "no residual filters" so install/uninstall cannot brick a clean machine.
+        Err(error) if error_text_means_provider_absent(&format!("{error:#}")) => Ok(false),
+        Err(error) => Err(error),
     }
-    Ok(!enumerate_our_filter_keys(&engine)?.is_empty())
 }
 
 /// The escape hatch: delete filters → legacy sublayers → sublayer → provider, scoped by the
 /// Tono provider key. Nothing outside the provider is touched.
 pub(crate) fn emergency_disarm() -> Result<()> {
     let engine = Engine::open()?;
-    if !provider_exists(&engine)? {
-        return Ok(());
+    match provider_exists(&engine) {
+        Ok(false) => return Ok(()),
+        Ok(true) => {}
+        Err(error) if error_text_means_provider_absent(&format!("{error:#}")) => return Ok(()),
+        Err(error) => return Err(error),
     }
     remove_all_filters()?;
     // Older builds may have used other sublayer GUIDs: sweep them too, or their filters

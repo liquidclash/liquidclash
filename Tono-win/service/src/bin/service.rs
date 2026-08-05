@@ -117,9 +117,21 @@ fn run_emergency_disarm() -> Result<()> {
     }
 
     let rt = tokio::runtime::Runtime::new()?;
+    // Opt into the uninstall DNS ladder so ProgramData tombstone failures cannot abort disarm.
+    // SAFETY: single-threaded; this process is the elevated recovery CLI only.
+    unsafe { std::env::set_var("TONO_UNINSTALL_DNS_LADDER", "1") };
     let outcome = rt.block_on(async {
-        let Some(_owner_guard) = clash_verge_service_ipc::acquire_service_owner().await? else {
-            return Ok(false);
+        // Owner lock is preferred but not required: Chinese machines fail
+        // ensure_private_service_directory with ERROR_INVALID_OWNER (1307) and would otherwise
+        // never reach WFP removal. The service is stopped (or absent) when users run this.
+        let _owner_guard = match clash_verge_service_ipc::acquire_service_owner().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!(
+                    "Could not take the service owner lock ({error:#}); continuing emergency disarm."
+                );
+                None
+            }
         };
         clash_verge_service_ipc::emergency_disarm_windows_kill_switch()
             .await
