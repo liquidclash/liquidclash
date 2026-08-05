@@ -63,16 +63,52 @@ fn ensure_private_directory_with_recovery(
 ) -> Result<()> {
     let descriptor = LocalDescriptor::from_sddl(sddl)?;
     let wide = wide_path(path)?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: 0,
-    };
-    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0
-        && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
-    {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to create private service directory {path:?}"));
+
+    // **Do not pass a SECURITY_DESCRIPTOR that names LocalSystem as owner into CreateDirectoryW
+    // from an elevated administrator token.** SDDL `O:SY...` makes CreateDirectory return
+    // ERROR_INVALID_OWNER (1307) on many Chinese customer machines — install then dies at
+    // `ProgramData\Tono\users` even after WFP cleanup succeeded. Create with default security,
+    // then apply the private DACL and best-effort owner migration.
+    //
+    // Fallback: if a parent already exists and plain create fails for another reason, try once
+    // with the full descriptor (service-as-SYSTEM path where O:SY is assignable).
+    const ERROR_INVALID_OWNER: u32 = 1307;
+    let created = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null()) };
+    if created == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_ALREADY_EXISTS {
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: 0,
+            };
+            let retry = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
+            if retry == 0 {
+                let retry_err = unsafe { GetLastError() };
+                if retry_err != ERROR_ALREADY_EXISTS {
+                    // Last resort: 1307 on create with O:SY — still try open+ACL if the dir
+                    // actually appeared, else fail with a clear message.
+                    if retry_err == ERROR_INVALID_OWNER || err == ERROR_INVALID_OWNER {
+                        // Directory may exist from a partial prior attempt; open path below.
+                        if !path.is_dir() {
+                            return Err(std::io::Error::from_raw_os_error(ERROR_INVALID_OWNER as i32))
+                                .with_context(|| {
+                                    format!(
+                                        "failed to create private service directory {path:?} \
+                                         (cannot assign LocalSystem as owner from this token; \
+                                         create without owner and apply DACL failed)"
+                                    )
+                                });
+                        }
+                    } else {
+                        return Err(std::io::Error::from_raw_os_error(retry_err as i32))
+                            .with_context(|| {
+                                format!("failed to create private service directory {path:?}")
+                            });
+                    }
+                }
+            }
+        }
     }
 
     let handle = unsafe {
@@ -102,7 +138,14 @@ fn ensure_private_directory_with_recovery(
     }
     #[cfg(not(feature = "test"))]
     if migrate_owner {
-        ensure_local_system_owner(handle.0, path)?;
+        // Soft-fail: BA ownership + private DACL is enough for Service (LocalSystem) and
+        // elevated install/uninstall helpers. Hard-failing on 1307 bricked install after
+        // successful WFP cleanup on Chinese customer machines.
+        if let Err(error) = ensure_local_system_owner(handle.0, path) {
+            eprintln!(
+                "Owner migration for {path:?} skipped ({error:#}); applying private DACL only."
+            );
+        }
     } else if !installer_owner_is_trusted(handle.0)? {
         drop(handle);
         if allow_empty_recreation {
