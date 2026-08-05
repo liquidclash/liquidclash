@@ -9,6 +9,8 @@ use std::{sync::Arc, time::Duration};
 use tauri::AppHandle;
 use tono_core::{CatalogError, InstallOutcome, node::ValidatedNode};
 
+use clash_verge_logging::{Type, logging};
+
 use crate::{
     process::AsyncHandler,
     tono::{
@@ -34,6 +36,7 @@ pub fn seed_from_cache(inner: &mut TonoInner) {
         tono_core::CatalogTracker::from_installed(cached.response.revision, cached.response.sha256.clone());
     inner.nodes = cached.nodes;
     enforce_selection_survival(inner);
+    let _ = ensure_usable_selection(inner);
 }
 
 /// If the selected node is not in the current catalog, flag that the user
@@ -102,6 +105,7 @@ async fn sync_once_inner(state: &Arc<TonoState>, app: &AppHandle, auth_generatio
                 inner.catalog_tracker = effect.tracker;
                 inner.nodes = effect.nodes;
                 enforce_selection_survival(&mut inner);
+                let _ = ensure_usable_selection(&mut inner);
                 state.audit().log(crate::tono::audit::AuditEvent::SyncOk {
                     revision: response.revision,
                     node_count,
@@ -208,11 +212,86 @@ async fn spawn_periodic_inner(state: &Arc<TonoState>, app: &AppHandle, auth_gene
     inner.tasks.catalog_sync = Some(handle);
 }
 
-/// Region ordering for the server list: US first, then JP, then everything
-/// else, each group name-sorted (case-insensitive, Unicode-aware).
+/// Catalog display names that Chinese networks currently cannot reach. They stay in the
+/// list (so the user sees why the previous default disappeared) but sort last and are
+/// not auto-selected. Update this list when a node is unblocked or a new exit is walled.
+const BLOCKED_EXIT_NAMES: &[&str] = &["US-VLESS-Reality"];
+
+/// Preferred default when the user has no selection, or their selection is blocked.
+/// First match that is present in the catalog wins.
+const PREFERRED_DEFAULT_EXIT_NAMES: &[&str] = &[
+    "Salt Lake City · Summit",
+    "Salt Lake City - Summit",
+    "Buffalo · Niagara",
+    "Buffalo - Niagara",
+    "Los Angeles · Harbor",
+    "Los Angeles - Harbor",
+    "JP-VLESS-Reality",
+];
+
+/// Whether this catalog display name is known blocked (GFW / dead exit).
+pub fn is_exit_blocked(name: &str) -> bool {
+    let name = name.trim();
+    BLOCKED_EXIT_NAMES
+        .iter()
+        .any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
+
+/// Pick the best usable exit: preferred list first, then first unblocked name in sort order.
+pub fn default_usable_exit(nodes: &[ValidatedNode]) -> Option<String> {
+    for preferred in PREFERRED_DEFAULT_EXIT_NAMES {
+        if let Some(node) = nodes.iter().find(|node| {
+            !is_exit_blocked(&node.name)
+                && (node.name == *preferred
+                    || node.name.replace('·', "-").replace('–', "-")
+                        == preferred.replace('·', "-").replace('–', "-"))
+        }) {
+            return Some(node.name.clone());
+        }
+    }
+    sort_server_names(nodes)
+        .into_iter()
+        .find(|name| !is_exit_blocked(name))
+}
+
+/// If selection is missing or points at a blocked exit, move the user to a usable default
+/// and persist. Returns the name that was applied (if any).
+pub fn ensure_usable_selection(inner: &mut TonoInner) -> Option<String> {
+    let needs_replacement = match inner.selected_node.as_deref() {
+        None => true,
+        Some(name) if is_exit_blocked(name) => true,
+        Some(name) if !inner.nodes.iter().any(|node| node.name == name) => true,
+        Some(_) => false,
+    };
+    if !needs_replacement {
+        return None;
+    }
+    let Some(replacement) = default_usable_exit(&inner.nodes) else {
+        return None;
+    };
+    inner.selected_node = Some(replacement.clone());
+    inner.catalog_requires_choice = false;
+    if let Err(error) = crate::tono::state::save_selection(&inner.catalog_dir, &replacement) {
+        logging!(
+            warn,
+            Type::Service,
+            "Tono: failed to persist default exit after blocked-node migration: {error}"
+        );
+    }
+    Some(replacement)
+}
+
+/// Region ordering for the server list: usable nodes first (US → JP → other), blocked last.
+/// Within each group, name-sorted (case-insensitive, Unicode-aware).
 pub fn sort_server_names(nodes: &[ValidatedNode]) -> Vec<String> {
     let mut names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
-    names.sort_by_key(|name| (region_rank(name), name.to_lowercase()));
+    names.sort_by_key(|name| {
+        (
+            if is_exit_blocked(name) { 1_u8 } else { 0 },
+            region_rank(name),
+            name.to_lowercase(),
+        )
+    });
     names
 }
 
@@ -236,7 +315,9 @@ pub fn region_rank(name: &str) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_and_persist, region_rank, sort_server_names};
+    use super::{
+        default_usable_exit, install_and_persist, is_exit_blocked, region_rank, sort_server_names,
+    };
     use std::net::Ipv4Addr;
     use std::path::{Path, PathBuf};
     use tono_core::catalog::{CatalogCache, catalog_digest};
@@ -291,6 +372,35 @@ mod tests {
                 "UK Reality 01",
             ]
         );
+    }
+
+    #[test]
+    fn blocked_exit_sorts_last_and_is_not_default() {
+        let nodes = vec![
+            node("US-VLESS-Reality"),
+            node("Salt Lake City · Summit"),
+            node("JP Reality 02"),
+            node("US West 01"),
+        ];
+        assert!(is_exit_blocked("US-VLESS-Reality"));
+        assert!(!is_exit_blocked("Salt Lake City · Summit"));
+        // Usable first: US token → JP token → other cities; blocked always last.
+        assert_eq!(
+            sort_server_names(&nodes),
+            vec![
+                "US West 01",
+                "JP Reality 02",
+                "Salt Lake City · Summit",
+                "US-VLESS-Reality",
+            ]
+        );
+        // Preferred default still picks Salt Lake even though sort rank is "other".
+        assert_eq!(
+            default_usable_exit(&nodes).as_deref(),
+            Some("Salt Lake City · Summit")
+        );
+        // With only the blocked node, no usable default.
+        assert_eq!(default_usable_exit(&[node("US-VLESS-Reality")]), None);
     }
 
     #[test]

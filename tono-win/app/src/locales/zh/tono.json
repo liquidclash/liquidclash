@@ -143,7 +143,9 @@
     "testCurrent": "测试当前节点",
     "cloudServers": "云服务器",
     "empty": "暂无可用节点",
-    "timeout": "超时"
+    "timeout": "超时",
+    "unavailable": "不可用",
+    "unavailableHint": "该节点当前不可用（线路被干扰），请选择其他服务器。"
   },
   "servers": {
     "title": "服务器",

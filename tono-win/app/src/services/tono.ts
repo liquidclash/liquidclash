@@ -47,6 +47,8 @@ export interface TonoServer {
   server: string
   port: number
   selected: boolean
+  /** False when the exit is known blocked (e.g. GFW); still listed for status. */
+  available: boolean
 }
 
 export interface TonoKillSwitchEndpoint {

@@ -42,16 +42,22 @@ const ServersPage = () => {
     queryFn: tonoServers,
   })
 
-  const handleSelect = useLockFn(async (name: string, selected: boolean) => {
-    if (selected) return
-    setSelectError(null)
-    try {
-      await tonoSelectServer(name)
-      await Promise.all([mutateServers(), mutateTonoStatus()])
-    } catch (error) {
-      setSelectError(error instanceof Error ? error.message : String(error))
-    }
-  })
+  const handleSelect = useLockFn(
+    async (name: string, selected: boolean, available: boolean) => {
+      if (selected) return
+      if (!available) {
+        setSelectError(t('tono.nodes.unavailableHint'))
+        return
+      }
+      setSelectError(null)
+      try {
+        await tonoSelectServer(name)
+        await Promise.all([mutateServers(), mutateTonoStatus()])
+      } catch (error) {
+        setSelectError(error instanceof Error ? error.message : String(error))
+      }
+    },
+  )
 
   const handleTestCurrent = useLockFn(async () => {
     if (!selected) return
@@ -137,12 +143,16 @@ const ServersPage = () => {
           {(servers ?? []).map((server) => {
             const latency =
               measuredLatency[server.name] ?? readNodeLatency(server.name)
+            const available = server.available !== false
             return (
               <button
                 key={server.name}
                 type="button"
                 className="tono-server-card"
-                onClick={() => void handleSelect(server.name, server.selected)}
+                disabled={!available}
+                onClick={() =>
+                  void handleSelect(server.name, server.selected, available)
+                }
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -152,7 +162,12 @@ const ServersPage = () => {
                   borderRadius: 16,
                   fontFamily: 'inherit',
                   textAlign: 'left',
-                  cursor: server.selected ? 'default' : 'pointer',
+                  cursor: !available
+                    ? 'not-allowed'
+                    : server.selected
+                      ? 'default'
+                      : 'pointer',
+                  opacity: available ? 1 : 0.55,
                   color: text.primary,
                   background: server.selected
                     ? hex(TONO_COLORS.accent, 0.15)
@@ -218,15 +233,23 @@ const ServersPage = () => {
                     flexShrink: 0,
                     padding: '4px 7px',
                     borderRadius: 7,
-                    color:
-                      latency !== null ? latencyColor(latency) : text.tertiary,
-                    background:
-                      latency !== null
+                    color: !available
+                      ? TONO_COLORS.error
+                      : latency !== null
+                        ? latencyColor(latency)
+                        : text.tertiary,
+                    background: !available
+                      ? hex(TONO_COLORS.error, 0.12)
+                      : latency !== null
                         ? hex(latencyColor(latency), 0.11)
                         : 'transparent',
                   }}
                 >
-                  {latency !== null ? `${latency}ms` : '—'}
+                  {!available
+                    ? t('tono.nodes.unavailable')
+                    : latency !== null
+                      ? `${latency}ms`
+                      : '—'}
                 </span>
               </button>
             )

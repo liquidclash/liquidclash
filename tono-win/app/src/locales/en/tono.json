@@ -143,7 +143,9 @@
     "testCurrent": "Test Current",
     "cloudServers": "Cloud Servers",
     "empty": "No servers available",
-    "timeout": "Timeout"
+    "timeout": "Timeout",
+    "unavailable": "Unavailable",
+    "unavailableHint": "This server is currently unavailable (network blocked). Pick another exit."
   },
   "servers": {
     "title": "Servers",

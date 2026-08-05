@@ -121,7 +121,7 @@ pub struct TonoDevice {
     pub current: bool,
 }
 
-/// TS: `interface TonoServer { name: string; server: string; port: number; selected: boolean }`
+/// TS: `interface TonoServer { name: string; server: string; port: number; selected: boolean; available: boolean }`
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TonoServer {
@@ -129,6 +129,8 @@ pub struct TonoServer {
     pub server: String,
     pub port: u16,
     pub selected: bool,
+    /// False when the exit is known blocked (e.g. GFW); still listed so users see status.
+    pub available: bool,
 }
 
 /// Stable wire key for a connect stage (`TonoStatus.stage`).
@@ -520,6 +522,7 @@ pub async fn tono_servers(state: tauri::State<'_, Arc<TonoState>>) -> Result<Vec
                     server: node.server.to_string(),
                     port: node.port,
                     selected: inner.selected_node.as_deref() == Some(node.name.as_str()),
+                    available: !catalog_sync::is_exit_blocked(&node.name),
                 })
         })
         .collect())
@@ -542,6 +545,9 @@ pub async fn tono_select_server(
         let mut inner = state.lock().await;
         if !inner.nodes.iter().any(|node| node.name == name) {
             return Err("unknown server".to_string());
+        }
+        if catalog_sync::is_exit_blocked(&name) {
+            return Err("this server is currently unavailable (network blocked)".to_string());
         }
         let previous = inner.selected_node.clone();
         let changed = previous.as_deref() != Some(name.as_str());
