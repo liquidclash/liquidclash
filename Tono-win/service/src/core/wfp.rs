@@ -44,10 +44,19 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
 };
 use windows_sys::core::GUID;
 
-// WFP error codes (fwpmu.h); windows-sys does not expose the FWP_E_* constants.
-const FWP_E_PROVIDER_NOT_FOUND: u32 = 0x8032_0002;
+// WFP error codes from fwpmu.h / winerror.h. windows-sys does not expose FWP_E_*.
+//
+// **These values were wrong before 0.0.15** (PROVIDER was 0x80320002 = CONDITION_NOT_FOUND,
+// SUBLAYER was 0x80320004 = LAYER_NOT_FOUND). On a clean machine FwpmProviderGetByKey0 returns
+// FWP_E_PROVIDER_NOT_FOUND = 0x80320005; treating that as a hard error made residual probes and
+// emergency_disarm fail with result 3 even though no Tono provider/filters existed — the Chinese
+// customer log that blocked install over a never-armed machine.
+//
+// MSDN order: CALLOUT=1, CONDITION=2, FILTER=3, LAYER=4, PROVIDER=5, PROVIDER_CONTEXT=6,
+// SUBLAYER=7, NOT_FOUND=8, ALREADY_EXISTS=9.
 const FWP_E_FILTER_NOT_FOUND: u32 = 0x8032_0003;
-const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x8032_0004;
+const FWP_E_PROVIDER_NOT_FOUND: u32 = 0x8032_0005;
+const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x8032_0007;
 const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
 /// `RPC_C_AUTHN_WINNT`: negotiate the machine's own authentication for the local BFE RPC.
 const RPC_C_AUTHN_WINNT: u32 = 10;

@@ -178,13 +178,26 @@ fn ensure_local_system_owner(handle: *mut std::ffi::c_void, path: &Path) -> Resu
 
     // An elevated administrator token contains SeRestorePrivilege but leaves it disabled. Merely
     // opening the file with WRITE_OWNER is therefore insufficient for assigning LocalSystem as
-    // owner: SetSecurityInfo returns ERROR_INVALID_OWNER (1307). That exact path made the
-    // uninstall helper fail before removing WFP, because its atomic kill-switch tombstone is
-    // created under the administrator token and inherits Builtin Administrators ownership.
-    // Enable the privilege only for this assignment and restore the token state on drop; the
-    // long-running service must not keep a broader token than it needs.
-    let _restore_privilege = RestorePrivilegeGuard::enable()
-        .context("enabling SeRestorePrivilege for LocalSystem owner migration")?;
+    // owner: SetSecurityInfo returns ERROR_INVALID_OWNER (1307). Enable the privilege only for
+    // this assignment and restore the token state on drop.
+    //
+    // Some customer tokens (restricted elevation, corporate policy) cannot enable
+    // SeRestorePrivilege or still get 1307. Builtin Administrators ownership with the private
+    // DACL (SY+BA full access) is still safe for Service and elevated helpers — failing the
+    // whole install/uninstall over owner migration alone is what produced Chinese result-3
+    // deadlocks when ProgramData\Tono\users could not be claimed. Soft-fail and let apply_dacl
+    // run.
+    const ERROR_INVALID_OWNER: u32 = 1307;
+    let _restore_privilege = match RestorePrivilegeGuard::enable() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!(
+                "Could not enable SeRestorePrivilege for LocalSystem owner migration on {path:?} \
+                 ({error:#}); keeping the current owner and applying the private DACL only."
+            );
+            return Ok(());
+        }
+    };
     let status = unsafe {
         SetSecurityInfo(
             handle,
@@ -197,6 +210,13 @@ fn ensure_local_system_owner(handle: *mut std::ffi::c_void, path: &Path) -> Resu
         )
     };
     if status != 0 {
+        if status == ERROR_INVALID_OWNER {
+            eprintln!(
+                "Could not assign LocalSystem as owner of {path:?} (Windows error {status}); \
+                 keeping the current owner and applying the private DACL only."
+            );
+            return Ok(());
+        }
         bail!(
             "failed to migrate service path {path:?} to LocalSystem ownership: Windows error {status}"
         );
