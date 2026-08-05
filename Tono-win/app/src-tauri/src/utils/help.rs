@@ -3,11 +3,11 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clash_verge_logging::{Type, logging};
 use nanoid::nanoid;
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::AsyncWriteExt as _;
 use serde_yaml_ng::{Mapping, Value};
 #[cfg(target_os = "windows")]
 use std::path::Path;
 use std::{path::PathBuf, str::FromStr};
+use tokio::io::AsyncWriteExt as _;
 
 /// read data from yaml as struct T
 pub async fn read_yaml<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {

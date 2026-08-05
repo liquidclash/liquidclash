@@ -102,7 +102,7 @@ where
             proposed_session_token: token.clone(),
             macos_proxy: None,
             kill_switch: None,
-        windows_kill_switch: None,
+            windows_kill_switch: None,
         },
     )
     .await?;

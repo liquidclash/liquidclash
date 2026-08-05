@@ -33,6 +33,75 @@ export const FORBIDDEN_PAYLOAD_NAME_PATTERNS = Object.freeze([
   /^unset_dns\.sh$/i,
 ])
 
+// Exact paths emitted by pre-0.0.6 Windows bundles but deliberately absent from the current
+// payload allowlist. Because generated NSIS removal only knows the *current* manifest, the custom
+// template must delete these names explicitly on upgrade and uninstall.
+export const KNOWN_LEGACY_WINDOWS_PAYLOAD = Object.freeze([
+  'verge-mihomo-alpha.exe',
+  'resources/clash-verge-service',
+  'resources/clash-verge-service-install',
+  'resources/clash-verge-service-uninstall',
+  'resources/clash-verge-service.exe',
+  'resources/clash-verge-service-install.exe',
+  'resources/clash-verge-service-uninstall.exe',
+  'resources/set_dns.sh',
+  'resources/unset_dns.sh',
+])
+
+/**
+ * Validate the custom template's migration half of the stable-only payload contract.
+ * A clean new installer is not enough: an upgrade has to remove junk copied by an older one,
+ * and the uninstaller has to do the same when no upgrade ever ran.
+ *
+ * @param {string} source installer.nsi source
+ * @returns {string | null}
+ */
+export function validateNsisLegacyCleanup(source) {
+  const text = String(source)
+  for (const relative of KNOWN_LEGACY_WINDOWS_PAYLOAD) {
+    const windowsPath = relative.replaceAll('/', '\\')
+    const statement = `Delete /REBOOTOK "$INSTDIR\\${windowsPath}"`
+    if (!text.includes(statement)) {
+      return `installer.nsi does not remove legacy payload path: ${relative}`
+    }
+  }
+  const uses = text.match(/!insertmacro\s+RemoveKnownLegacyPayload/g)?.length ?? 0
+  if (uses < 2) {
+    return 'RemoveKnownLegacyPayload must run on both upgrade/install and uninstall'
+  }
+  if (!text.includes('RMDir /REBOOTOK "$INSTDIR"')) {
+    return 'installer.nsi must schedule the product root after locked legacy payload deletion'
+  }
+  const installSection = text.match(/Section Install\b([\s\S]*?)SectionEnd/)?.[1] ?? ''
+  if (
+    !/!insertmacro\s+RemoveVergeService[\s\S]*!insertmacro\s+StartVergeService/.test(
+      installSection,
+    )
+  ) {
+    return 'fresh/repair install must clean orphaned WFP state before starting TonoService'
+  }
+  return null
+}
+
+/**
+ * Reject feature unification that makes WebView JavaScript dispatch synchronous
+ * in a production build. `tauri-plugin-devtools` enables Tauri's `tracing`
+ * feature even when its runtime registration is behind `debug_assertions`.
+ *
+ * @param {string} featureTree output of `cargo tree -e features -i tauri-runtime-wry`
+ * @returns {string | null}
+ */
+export function validateReleaseFeatureTree(featureTree) {
+  const tree = String(featureTree)
+  if (/tauri-runtime-wry feature "tracing"/.test(tree)) {
+    return 'default release features enable tauri-runtime-wry/tracing; Windows WebView dispatch would become synchronous'
+  }
+  if (/tauri-plugin-devtools/.test(tree)) {
+    return 'default release features include tauri-plugin-devtools; keep it optional behind tauri-dev'
+  }
+  return null
+}
+
 /**
  * @param {unknown} externalBin
  * @returns {string | null} error message, or null when valid

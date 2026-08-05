@@ -47,9 +47,7 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
     let mut windows_kill_switch = crate::core::windows_kill_switch::status_snapshot().await;
     // The endpoint list names the exit node the active owner selected. Every other owner-specific
     // detail in this aggregate is already withheld from a non-active owner; this one was not.
-    if !is_active
-        && let Some(status) = windows_kill_switch.as_mut()
-    {
+    if !is_active && let Some(status) = windows_kill_switch.as_mut() {
         status.endpoints.clear();
     }
     #[cfg(windows)]

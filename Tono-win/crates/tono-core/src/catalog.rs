@@ -146,7 +146,10 @@ impl CatalogTracker {
     /// strictly newer. Equal revision with a different digest is
     /// `invalidResponse`; equal revision with the same digest is an
     /// idempotent no-op.
-    pub fn install(&mut self, catalog: &ExitCatalogResponse) -> Result<InstallOutcome, CatalogError> {
+    pub fn install(
+        &mut self,
+        catalog: &ExitCatalogResponse,
+    ) -> Result<InstallOutcome, CatalogError> {
         let nodes = validate_catalog(catalog)?;
         if catalog.revision < self.current_revision {
             return Err(CatalogError::StaleRevision);
@@ -200,7 +203,8 @@ pub struct UnixCacheSafetyCheck;
 #[cfg(unix)]
 impl CacheSafetyCheck for UnixCacheSafetyCheck {
     fn check_path(&self, path: &Path) -> Result<(), CatalogError> {
-        let metadata = fs::symlink_metadata(path).map_err(|err| CatalogError::Io(err.to_string()))?;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|err| CatalogError::Io(err.to_string()))?;
         if metadata.file_type().is_symlink() {
             return Err(CatalogError::Io("cache path is a symlink".to_string()));
         }
@@ -209,15 +213,21 @@ impl CacheSafetyCheck for UnixCacheSafetyCheck {
 
     fn check_open(&self, file: &fs::File) -> Result<(), CatalogError> {
         use std::os::unix::fs::MetadataExt;
-        let metadata = file.metadata().map_err(|err| CatalogError::Io(err.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|err| CatalogError::Io(err.to_string()))?;
         if !metadata.file_type().is_file() {
             return Err(CatalogError::Io("cache is not a regular file".to_string()));
         }
         if metadata.uid() != nix::unistd::getuid().as_raw() {
-            return Err(CatalogError::Io("cache is owned by another uid".to_string()));
+            return Err(CatalogError::Io(
+                "cache is owned by another uid".to_string(),
+            ));
         }
         if metadata.mode() & 0o077 != 0 {
-            return Err(CatalogError::Io("cache permissions are too open".to_string()));
+            return Err(CatalogError::Io(
+                "cache permissions are too open".to_string(),
+            ));
         }
         let size = metadata.size();
         if size == 0 || size > MAX_CACHE_FILE_BYTES {
@@ -283,7 +293,8 @@ impl CatalogCache {
     /// "only verified copies reach disk" invariant holds by construction.
     pub fn store(&self, catalog: &ExitCatalogResponse) -> Result<(), CatalogError> {
         validate_catalog(catalog)?;
-        let body = serde_json::to_string(catalog).map_err(|err| CatalogError::Io(err.to_string()))?;
+        let body =
+            serde_json::to_string(catalog).map_err(|err| CatalogError::Io(err.to_string()))?;
         // Symmetric with `load`: a body the cache would refuse to read back
         // must never be written (L1).
         if body.len() as u64 > MAX_CACHE_FILE_BYTES {
@@ -291,7 +302,10 @@ impl CatalogCache {
                 "serialized catalog exceeds the 2 MiB cache limit".to_string(),
             ));
         }
-        let dir = self.path.parent().ok_or_else(|| CatalogError::Io("cache path has no parent".to_string()))?;
+        let dir = self
+            .path
+            .parent()
+            .ok_or_else(|| CatalogError::Io("cache path has no parent".to_string()))?;
         fs::create_dir_all(dir).map_err(|err| CatalogError::Io(err.to_string()))?;
         let temp = dir.join(format!(
             ".{CACHE_FILE_NAME}.tmp-{}-{}",
@@ -306,7 +320,9 @@ impl CatalogCache {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = options.open(&temp).map_err(|err| CatalogError::Io(err.to_string()))?;
+            let mut file = options
+                .open(&temp)
+                .map_err(|err| CatalogError::Io(err.to_string()))?;
             file.write_all(body.as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|err| CatalogError::Io(err.to_string()))?;
@@ -424,7 +440,10 @@ mod tests {
 
     #[test]
     fn rejects_oversized_yaml() {
-        let yaml = format!("proxies:\n{NODE_YAML}#{}", "x".repeat(MAX_CATALOG_YAML_BYTES));
+        let yaml = format!(
+            "proxies:\n{NODE_YAML}#{}",
+            "x".repeat(MAX_CATALOG_YAML_BYTES)
+        );
         let catalog = catalog_with_yaml(0, &yaml);
         assert_eq!(
             validate_catalog(&catalog).unwrap_err(),
@@ -461,7 +480,12 @@ mod tests {
     #[test]
     fn rejects_catalog_with_failing_node() {
         // A private-IP node mixed into an otherwise fine catalog.
-        let yaml = format!("proxies:\n{NODE_YAML}{}", NODE_YAML.replace("8.8.8.8", "10.0.0.8").replace("US Reality 01", "Evil"));
+        let yaml = format!(
+            "proxies:\n{NODE_YAML}{}",
+            NODE_YAML
+                .replace("8.8.8.8", "10.0.0.8")
+                .replace("US Reality 01", "Evil")
+        );
         let catalog = catalog_with_yaml(0, &yaml);
         assert_eq!(
             validate_catalog(&catalog).unwrap_err(),
@@ -489,7 +513,13 @@ mod tests {
         // Trailing whitespace/newline is tolerated by the trimmed compare.
         let nodes = validate_catalog(&catalog_with_yaml(0, "proxies: []\n")).unwrap();
         assert!(nodes.is_empty());
-        for bad in ["proxies:", "proxies: null", "proxies: {}\n", "# empty\n", ""] {
+        for bad in [
+            "proxies:",
+            "proxies: null",
+            "proxies: {}\n",
+            "# empty\n",
+            "",
+        ] {
             assert_eq!(
                 validate_catalog(&catalog_with_yaml(0, bad)).unwrap_err(),
                 CatalogError::InvalidResponse,
@@ -525,7 +555,10 @@ mod tests {
         let outcome = tracker.install(&valid_catalog(3)).unwrap();
         assert!(matches!(outcome, InstallOutcome::Installed(ref nodes) if nodes.len() == 1));
         assert_eq!(tracker.current_revision(), 3);
-        assert_eq!(tracker.current_digest(), Some(valid_catalog(3).sha256.as_str()));
+        assert_eq!(
+            tracker.current_digest(),
+            Some(valid_catalog(3).sha256.as_str())
+        );
     }
 
     #[test]
@@ -555,7 +588,10 @@ mod tests {
         tracker.install(&valid_catalog(5)).unwrap();
         let conflicting = catalog_with_yaml(
             5,
-            &format!("proxies:\n{}", NODE_YAML.replace("US Reality 01", "Other Name")),
+            &format!(
+                "proxies:\n{}",
+                NODE_YAML.replace("US Reality 01", "Other Name")
+            ),
         );
         assert_eq!(
             tracker.install(&conflicting).unwrap_err(),
@@ -623,7 +659,10 @@ mod tests {
         let mut bad = valid_catalog(1);
         bad.sha256 = catalog_digest("forged");
         assert!(cache.store(&bad).is_err());
-        assert!(!cache.path().exists(), "invalid download must never reach disk");
+        assert!(
+            !cache.path().exists(),
+            "invalid download must never reach disk"
+        );
     }
 
     #[cfg(unix)]
@@ -705,7 +744,10 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )
         .unwrap();
-        assert!(cache.load().is_none(), "tampered cache must fail revalidation");
+        assert!(
+            cache.load().is_none(),
+            "tampered cache must fail revalidation"
+        );
     }
 
     #[cfg(unix)]
@@ -832,12 +874,18 @@ mod tests {
             cache.store(&valid_catalog(1)),
             Err(CatalogError::Io(_))
         ));
-        assert!(!cache.path().exists(), "a failed hook must not publish the cache");
+        assert!(
+            !cache.path().exists(),
+            "a failed hook must not publish the cache"
+        );
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
             .collect();
-        assert!(leftovers.is_empty(), "temp file must be cleaned up: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp file must be cleaned up: {leftovers:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -854,7 +902,10 @@ mod tests {
             serde_json::to_string(&catalog).unwrap().len() as u64 > MAX_CACHE_FILE_BYTES,
             "fixture must actually exceed the cache cap"
         );
-        assert!(cache.store(&catalog).is_err(), "oversized body must not be written");
+        assert!(
+            cache.store(&catalog).is_err(),
+            "oversized body must not be written"
+        );
         assert!(!cache.path().exists());
         // Just below the cap the same shape stores and loads fine.
         let padding = "\n".repeat(MAX_CATALOG_YAML_BYTES - "proxies: []".len() - 512);

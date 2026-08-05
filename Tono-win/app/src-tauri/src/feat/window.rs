@@ -192,11 +192,7 @@ pub async fn quit() -> clash_verge_signal::ShutdownOutcome {
         )),
     };
     if let Some(error) = release_error {
-        logging!(
-            error,
-            Type::Service,
-            "Tono: 无法证明退出前已恢复网络保护: {error}"
-        );
+        logging!(error, Type::Service, "Tono: 无法证明退出前已恢复网络保护: {error}");
         if !ask_to_quit_without_release(&error).await {
             handle::Handle::global().clear_is_exiting();
             // A refused Quit is the only outcome that leaves the app running against the user's

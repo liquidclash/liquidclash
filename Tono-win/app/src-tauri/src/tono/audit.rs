@@ -153,6 +153,12 @@ pub enum AuditEvent {
         web_tcp: usize,
         udp: usize,
     },
+    /// Optional DIRECT acceleration could not be activated. No DIRECT
+    /// permits were installed, so the protected tunnel remains the only
+    /// usable path.
+    PolicyActivationSkipped {
+        reason: String,
+    },
     PolicySyncFail {
         error: String,
     },
@@ -203,6 +209,9 @@ impl AuditEvent {
             HealthProbeFail { probe, error } => HealthProbeFail {
                 probe,
                 error: redact(&error),
+            },
+            PolicyActivationSkipped { reason } => PolicyActivationSkipped {
+                reason: redact(&reason),
             },
             PolicySyncFail { error } => PolicySyncFail { error: redact(&error) },
             DiagnosticsUploadFail { error } => DiagnosticsUploadFail { error: redact(&error) },
@@ -663,6 +672,9 @@ mod tests {
             AuditEvent::NodeSwitch {
                 from: "a token=abc".to_string(),
                 to: "b token=abc".to_string(),
+            },
+            AuditEvent::PolicyActivationSkipped {
+                reason: "GET https://resolver.test/dns-query?token=abc failed".to_string(),
             },
         ];
         for event in events {

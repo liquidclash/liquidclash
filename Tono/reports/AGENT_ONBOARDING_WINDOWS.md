@@ -1,8 +1,10 @@
 # 新 Agent 上手说明 — Tono Windows
 
-你接手的是一个 Windows VPN 客户端。**先读这份，再读 [`TONO_WINDOWS_HANDOFF_2026-08-03.md`](./TONO_WINDOWS_HANDOFF_2026-08-03.md)**（同目录，那份是完整技术交接：未解决问题的分析、踩过的坑、产品决策）。
+你接手的是一个 Windows VPN 客户端。**先读这份，再读 [`TONO_WINDOWS_HANDOFF_2026-08-03.md`](./TONO_WINDOWS_HANDOFF_2026-08-03.md)**（同目录，那份是完整技术交接：当前真机结论、历史问题分析、踩过的坑、产品决策）。
 
 **你应该在一台真实的 Windows 机器上工作。** 原因见下面第 0 节——这不是偏好问题。
+
+> **2026-08-03 续测状态：** 当前未提交工作树已经生成本地安装包 0.0.10（Service 2.6.3），但尚未用它覆盖当前安装，不能发客户。0.0.6 的中国真机曾在 `checkingExit` 收到 Mihomo `/delay` 的 504；0.0.7 又证明 controller 和 App 验证同时依赖同一个 Google URL。现在合成 delay 只作提示，App/TUN 验证并发竞速 Google、Cloudflare、Apple 三个独立 TLS 来源；最后一轮还并行经过本次 Mihomo 的临时 loopback mixed listener，只用于把“节点/内核不可达”和“Windows TUN 路由坏”分开，绝不以代理成功冒充 Connected。0.0.9 覆盖安装另复现了一个更危险的 P0：断开状态下 Service 重启把晚出现的持久 WFP 残留误判为 ownerless emergency block，整机被封网。0.0.10 通过 `wanted:false` 一次性墓碑和安装前状态迁移修复；真实 WFP release 编译与非网络回归已通过，仍需受控覆盖安装真机验证。GitHub 上的 `tono-windows-0.0.5` 仍是旧发布包，继续保持 pre-release、不要发给客户。完整证据与剩余范围见 handoff §0A。
 
 ---
 
@@ -27,7 +29,7 @@
 ```powershell
 git clone https://github.com/raydocs/liquidclash.git
 cd liquidclash
-git checkout main          # 当前 HEAD: 412614e
+git checkout main          # 交接基线 HEAD: 0eb6879
 ```
 
 产品在 **`Tono-win/`** 目录下，自成一体。仓库里还有 macOS 的东西（`LiquidClash/` 的 Xcode 工程、`Tono/` 的 macOS 应用），**跟你无关，别动**。
@@ -67,31 +69,54 @@ git checkout main          # 当前 HEAD: 412614e
 cd Tono-win
 
 # 三个 Rust 套件
-cargo test --manifest-path crates/tono-core/Cargo.toml --lib                          # 应为 157
-cargo test --manifest-path service/Cargo.toml --lib --features "standalone,client,test"  # 应为 238
-cd app/src-tauri; cargo test --lib; cd ../..                                          # 应为 428
+cargo test --manifest-path crates/tono-core/Cargo.toml --lib                             # 当前 147
+cargo test --manifest-path service/Cargo.toml --features "standalone,client,test" --all-targets -- --test-threads=1 # 当前 233 lib + bin/integration
+cargo test --manifest-path app/src-tauri/Cargo.toml --lib `
+  --features windows-integration-test                                                   # 当前 433
 
 # 前端
 cd app
 pnpm install
 pnpm vitest run          # 应为 96
 pnpm tsc --noEmit        # 应无输出
-node --test scripts/windows-packaging.test.mjs   # 应为 5 pass
+node --test scripts/windows-packaging.test.mjs   # 当前 7 pass
 cd ..
 ```
 
 全绿说明环境没问题。**注意：全绿不代表产品能用**——见第 0 节。
 
+### 中国高延迟真机档位
+
+真机 App 必须用 `windows-integration-test` feature 构建。这个 feature **默认给每个明确标记的远程操作注入 1000ms 延迟**，覆盖账号/目录 API、云策略 DNS、出口探测和最终 TUN 数据面；生产构建编译成 no-op，不受影响。这样美国测试机不会只验证低延迟快乐路径。
+
+```powershell
+cargo build --release --manifest-path app/src-tauri/Cargo.toml `
+  --features windows-integration-test --bin Tono
+
+# 诊断时可关闭；也可设为 0–5000ms 的其他档位
+$env:TONO_WINDOWS_INTEGRATION_LATENCY_MS = "0"
+```
+
+默认档位下还必须跑完整连接 → 实际网页流量 → 断开 → DNS 恢复闭环。云策略域名查询最多 4 个并发、瞬时错误重试 3 次、解析总阶段 35 秒；不要为了让测试变绿而放宽生产安全判定。
+
+出口验证的判定顺序不能倒置：Mihomo `/proxies/Tono-Exit/delay` 在 `unified-delay` 下会做双请求，跨境链路可能返回 504；它只能作为辅助测量。真正决定是否允许 Connected 的是 WFP live 状态加全新的 App HTTPS 请求经系统 DNS/WinTUN 成功。该请求不能再绑定一个公共站点：当前竞速 Google 204、Cloudflare 204、Apple 200 三个独立 TLS 来源，任一精确响应即是正证据，全部失败才判失败，并在诊断里逐来源保留 timeout/connect/TLS 原因。后台周期健康检查沿用同一多来源真实 TUN 数据面，不能因为合成 `/delay` 或单一站点抖动而拆隧道。
+
 ---
 
 ## 4. 构建安装包
 
-`scripts/build-windows-release.sh` 是 zsh + `cargo xwin`，**Windows 上跑不了，需要重写成 PowerShell**。它按顺序做的事：
+Windows 原生构建入口已经是仓库根目录的 `scripts/build-windows-release.ps1`：
+
+```powershell
+.\scripts\build-windows-release.ps1 -Version 0.0.10
+```
+
+它按顺序做的事：
 
 1. `pnpm release-version <版本号>` — 同步 `package.json` / `tauri.conf.json` / `Cargo.toml` 三处版本
 2. `pnpm release:preflight --config-only` — 打包配置门
-3. 构建 mihomo 内核
-4. **⚠️ 计算内核 SHA-256 并注入 `TONO_CORE_SHA256` 环境变量**
+3. 验证仓库中固定的稳定 Mihomo 内核存在
+4. **⚠️ 对本次实际打包的内核计算 SHA-256，并注入 `TONO_CORE_SHA256` 环境变量**
 5. 构建三个服务二进制 → 安装到 `app/src-tauri/resources/`
 6. `cargo tauri build`
 7. 7zz 载荷冒烟检查
@@ -120,15 +145,34 @@ Get-Content C:\ProgramData\Tono\logs\tono-service.log -Tail 200
 Get-Content "$env:APPDATA\com.raydocs.tono\logs\latest.log" -Tail 200
 ```
 
-### 第二步：定位 P0-A（连不上）
+### 第二步：复现已通过的 P0-A 闭环（不要再按 0.0.5 的旧假设排查）
 
-现象：卡在 `securingDNS`，`fake-ip verification failed: system DNS lookup exceeded 2s`。DNS **已经**指向 `127.0.0.1`，但那里没有应答。
+0.0.5 的现象是卡在 `securingDNS`，`fake-ip verification failed: system DNS lookup exceeded 2s`。真机已经把根因收敛：在 `strict-route` + `dns-hijack` + WFP 下，系统解析器打到 `127.0.0.1:53` 会超时；同一时刻显式查询 Tono TUN 端点 `198.18.0.2` 会在几十毫秒内返回 fake IP。
 
-两个候选，上面的数据能直接分辨：
-1. 内核的 DNS 监听没绑上（53 端口被占）
-2. 绑上了但答不了 —— 生成的配置里 `respect-rules: true`，DNS 查询要走规则引擎，上游 DoH 又被钉在走隧道；如果隧道此刻不通，就是**解析等隧道、隧道等解析的死锁**
+当前工作树的 Service 已改为：IPv4 网卡 DNS 指向 `198.18.0.2`，IPv6 使用静态空列表；恢复路径同时识别当前端点和旧版 `127.0.0.1` / `::1`。真机验证必须看到：
 
-### 第三步：定位 P0-B（假死）
+1. 连接保护阶段 `Get-DnsClientServerAddress` 显示 `198.18.0.2`；
+2. `Resolve-DnsName -Server 198.18.0.2` 返回 `198.18/16`；
+3. 断开后物理网卡恢复原始 DNS（本机基线是 `192.168.31.1`）；
+4. `protected-dns.json` 缺失但网卡仍含 `198.18.0.2` 时，连接和拆 WFP 都必须拒绝，绝不能把 Tono 地址存成“用户原始 DNS”。
+
+本机已实际看到前三项，并完成 8 MB、512 KB/s 的持续下载；界面同步显示 525–544 KB/s，core PID 未变化。第 4 项由 Service 测试覆盖，但仍需要补成不带 `feature=test` 的管理员真机集成测试。另一个已修复的真机坑是：Tono 自己的 WinTUN 网卡也合法持有 `198.18.0.2`，DNS 安全检查必须按当前 WFP 验证过的 tunnel LUID 排除它，不能把它误判成丢失快照的物理网卡。
+
+### 第三步：固定复测“第二次连接仍是本地 IP”
+
+旧 WFP 规则只装在 `ALE_AUTH_CONNECT_V4/V6`，只会审查新流。Chromium 在断开状态建立的 HTTP/3/QUIC UDP 会话可跨过下一次 Connect：界面、fake-IP 和新进程 curl 都显示已保护，但同一浏览器连接仍从物理网卡发包，真实出口 IP 仍是本地 IP。这不是页面缓存；同一浏览器进程的新标签页也会复用连接池。
+
+当前规则表 v7（namespace `…9e06…`）在保留 ALE app-id 授权的同时增加 `OUTBOUND_TRANSPORT_V4/V6`：物理接口逐包默认拒绝，WinTUN LUID、核心的精确 VPS tuple、启动 API 和批准的 DIRECT tuple 才有对应许可。每次真机回归都必须按这个顺序：
+
+1. Disconnect 后在 Chromium 打开 IP 检测页，确认本地 IP；
+2. Connect 到 Locked，**不关闭浏览器进程**，刷新同一标签页；
+3. 同一旧标签页、同进程新标签页和新 `curl.exe` 必须全部显示 VPS IP；
+4. Disconnect 后三者恢复本地 IP，DNS 恢复且 core 退出；
+5. 再完整重复一次，专门覆盖第二次连接。
+
+本机基线：本地 `172.83.4.82`，Buffalo · Niagara VPS `23.94.79.123`；两轮都通过。单元测试 `outbound_transport_terminates_preexisting_physical_flows` 只钉规则模型，不能替代上面的真实 Chromium 回归。
+
+### 第四步：继续压测 P0-B（本轮未复现假死）
 
 0.0.5 已埋主线程泵探针，**看应用日志就能判定**：
 
@@ -138,11 +182,13 @@ Get-Content "$env:APPDATA\com.raydocs.tono\logs\latest.log" -Tail 200
 | 无停顿但有 `WebView STALLED` | 渲染进程卡住 |
 | 两条都没有 | 泵是活的，假死来自进程之外 |
 
-### 第四步：P0-C（卸载）
+当前工作树在连接、两次持续下载和断开期间均保持 `Responding=true`，但睡眠/唤醒、切换网卡、WM_ENDSESSION 和长时间运行还没完成，因此不能删掉这些探针。
+
+### 第五步：P0-C（卸载）
 
 先强制结束 `Tono.exe` 再卸载，确认是不是被假死连累。如果还不行，要卸载器的确切报错文字。
 
-### 第五步：补真机集成测试
+### 第六步：补真机集成测试
 
 见第 0 节。这是让后续所有工作提速的基础设施。
 
@@ -152,7 +198,7 @@ Get-Content "$env:APPDATA\com.raydocs.tono\logs\latest.log" -Tail 200
 
 这是 fail-closed 产品，防火墙规则**持久化、开机自恢复**，**重启电脑救不了网络**。三条路，按顺序：
 
-1. **界面里点「断开连接」** — 已确认可用：应用与服务走 Windows 命名管道（本地进程通信，不经过 TCP/IP），防火墙只作用在网络连接层，持久化兜底规则明确放行环回。**全网被拦死时这个按钮照样能用。**
+1. **界面里点「断开连接」** — 已确认可用：应用与服务走 Windows 命名管道（本地进程通信，不经过 TCP/IP），本规则集管的是 IP 流量路径且明确放行环回。**全网被拦死时这个按钮照样能用。**
 2. **开始菜单 →「Tono — 恢复网络 (Restore Network)」**，点一下弹 UAC
 3. **管理员 PowerShell**：
    ```powershell
@@ -170,8 +216,10 @@ Get-Content "$env:APPDATA\com.raydocs.tono\logs\latest.log" -Tail 200
 1. **Fail-closed**：防火墙装上之后，只有「断开 / 登出 / 退出」能解除。崩溃、被杀、睡眠、网络变化、目录问题、API 故障，**一律不解除**。
 2. **绝不取消可能已提交的变更请求**：变更类 IPC 只发一次、不重放；响应丢失靠代际号 + 事后修复收敛。
 3. **DNS 必须先证明恢复，才能拆防火墙**（唯一例外是卸载路径的降级阶梯，见 handoff）。
+   如果恢复快照丢失而网卡仍含 `198.18.0.2`，必须报 `TONO_DNS_SNAPSHOT_MISSING` 并保持门关闭；否则断开会把机器留在死 DNS。
 4. **卸载绝不能在防火墙规则还装着时完成**。"拆了防火墙继续卸载"可以；"卸掉应用留着防火墙"绝对不行。
 5. **别把"拒绝服务"当成 fail-closed**。曾经的规则是"除非能证明网络已恢复，否则不许卸载"——结果造出一个卸不掉的软件，而它要防的危险在拒绝发生之前就已经发生了。
+6. **不能只在 ALE 层做切换安全**。ALE 是新流授权面，不会保证已建立 TCP/QUIC 流在 Connect 后重新分类。所有“从物理出口切到 TUN”的安全边界都必须同时有 outbound-transport 逐包默认拒绝；否则 Connected 只对新进程成立。
 
 ### 上一轮踩的坑（handoff §6 有完整版，这里挑最容易重犯的）
 
@@ -193,8 +241,7 @@ Get-Content "$env:APPDATA\com.raydocs.tono\logs\latest.log" -Tail 200
 ## 9. 已知的产品边界（不是 bug，但要知道）
 
 - **WSL2 / Docker / Hyper-V 的流量在 NDIS 层桥接，不经过主机的 WFP 连接层** —— 很可能完全绕过隧道。验证：连接状态下 `wsl -e curl -s -m 5 https://ifconfig.me`，返回真实公网 IP 即为泄漏。**这是 WFP 方案的固有边界**，但如果目标用户装了 WSL 或 Docker，这是最可能的实际泄漏来源。
-- 只在连接层拦截，所以**入站已建立连接的出站数据不受管辖**。
-- 上防火墙那一刻**已存在的连接不会被重置**。
+- Windows 主机自身的普通出站流量现由 ALE + outbound-transport 双层覆盖；已建立 TCP/QUIC 的物理包会被逐包阻断并迫使客户端经 TUN 重连。**不要把这个结论外推到 WSL/Hyper-V 虚拟交换机路径**。
 - 第三方安全软件若使用 WFP 的否决标志，可以压过我们的拦截（我们没用该标志）。
 
 ---

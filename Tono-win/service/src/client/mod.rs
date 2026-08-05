@@ -495,7 +495,8 @@ pub async fn restrict_kill_switch_bootstrap(
     .await
 }
 
-/// `POST /dns/enable`: snapshot adapter DNS and point resolvers at loopback. Session-gated.
+/// `POST /dns/enable`: snapshot adapter DNS and point resolvers at Tono's protected TUN DNS
+/// endpoint. Session-gated.
 pub async fn enable_protected_dns(
     credentials: &OwnerCredentials,
     session: &OwnerSessionProof,
@@ -548,7 +549,7 @@ pub async fn release_kill_switch(
     .await
 }
 
-/// `GET /dns/status`: whether the service currently holds adapters on loopback DNS.
+/// `GET /dns/status`: whether the service currently holds adapters on protected DNS.
 pub async fn get_protected_dns_status(
     credentials: &OwnerCredentials,
 ) -> Result<Response<DnsProtectionStatus>> {

@@ -12,7 +12,9 @@ import {
   WINDOWS_RESOURCE_BUNDLE_ENTRIES,
   parseNsisListing,
   validateExternalBin,
+  validateNsisLegacyCleanup,
   validatePayloadEntries,
+  validateReleaseFeatureTree,
   validateResourcesWhitelist,
 } from './windows-packaging.mjs'
 
@@ -23,6 +25,10 @@ import {
  *   pnpm release:preflight --config-only
  *     Validate packaging config + on-disk inputs before a long Windows build.
  *
+ *   pnpm release:preflight --payload-only <installer.exe>
+ *     Inspect a locally built installer without requiring a clean immutable release tag. This
+ *     is the post-build gate for real-machine test packages; it does not grant release provenance.
+ *
  *   pnpm release:preflight <immutable-tag> <installer.exe> [release-manifest.json]
  *     Full post-build gate: clean tree, tag, versions, hashes, and real NSIS
  *     payload inspection (stable-only Mihomo, no Unix helpers).
@@ -32,6 +38,11 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const appRoot = path.resolve(scriptDir, '..')
 const windowsRoot = path.resolve(appRoot, '..')
 const tauriConfPath = path.resolve(appRoot, 'src-tauri/tauri.conf.json')
+const cargoManifestPath = path.resolve(appRoot, 'src-tauri/Cargo.toml')
+const nsisTemplatePath = path.resolve(
+  appRoot,
+  'src-tauri/packages/windows/installer.nsi',
+)
 const resourcesDir = path.resolve(appRoot, 'src-tauri/resources')
 const sidecarDir = path.resolve(appRoot, 'src-tauri/sidecar')
 
@@ -73,6 +84,11 @@ export const assertPackagingConfig = () => {
   const resourcesError = validateResourcesWhitelist(tauriConfig.bundle?.resources)
   if (resourcesError) fail(resourcesError)
 
+  const legacyCleanupError = validateNsisLegacyCleanup(
+    readFileSync(nsisTemplatePath, 'utf8'),
+  )
+  if (legacyCleanupError) fail(legacyCleanupError)
+
   for (const name of WINDOWS_RESOURCE_ALLOWLIST) {
     requireFile(`resource ${name}`, path.join(resourcesDir, name))
   }
@@ -109,6 +125,27 @@ export const assertPackagingConfig = () => {
   }
 
   return { tauriConfig, stableMihomo }
+}
+
+const assertReleaseFeatureIsolation = () => {
+  let featureTree
+  try {
+    featureTree = run('cargo', [
+      'tree',
+      '--manifest-path',
+      cargoManifestPath,
+      '-e',
+      'features',
+      '-i',
+      'tauri-runtime-wry',
+    ])
+  } catch (error) {
+    fail(
+      `failed to inspect the default Rust feature tree: ${error instanceof Error ? error.message : error}`,
+    )
+  }
+  const featureError = validateReleaseFeatureTree(featureTree)
+  if (featureError) fail(featureError)
 }
 
 const findSevenZip = () => {
@@ -190,14 +227,22 @@ const assertNsisPayload = (installer) => {
 
 const args = process.argv.slice(2)
 const configOnly = args.includes('--config-only')
-const positional = args.filter((arg) => arg !== '--config-only')
+const payloadOnly = args.includes('--payload-only')
+const positional = args.filter(
+  (arg) => arg !== '--config-only' && arg !== '--payload-only',
+)
+
+if (configOnly && payloadOnly) {
+  fail('--config-only and --payload-only are mutually exclusive')
+}
 
 // Always enforce packaging config. This is the cheap Test 6 gate that was still open after
 // the runtime P0–P4 work: Test 5 shipped dual Mihomo + Unix helpers because the bundle map
 // was a whole directory and externalBin historically listed alpha.
 const packaging = assertPackagingConfig()
+assertReleaseFeatureIsolation()
 console.error(
-  `[release-preflight] packaging config OK (stable-only ${STABLE_EXTERNAL_BIN} + Windows resource whitelist)`,
+  `[release-preflight] packaging config OK (stable-only ${STABLE_EXTERNAL_BIN} + Windows resource whitelist + async release WebView dispatch)`,
 )
 
 if (configOnly) {
@@ -217,10 +262,66 @@ if (configOnly) {
   process.exit(0)
 }
 
+if (payloadOnly) {
+  const [installerArgument, ...unexpected] = positional
+  if (!installerArgument || unexpected.length) {
+    fail('usage: pnpm release:preflight --payload-only <installer.exe>')
+  }
+
+  const installer = path.resolve(process.cwd(), installerArgument)
+  const service = path.resolve(appRoot, 'src-tauri/resources/tono-service.exe')
+  const mihomo = path.resolve(
+    appRoot,
+    'src-tauri/sidecar/verge-mihomo-x86_64-pc-windows-msvc.exe',
+  )
+  for (const [label, file] of [
+    ['installer', installer],
+    ['service', service],
+    ['mihomo', mihomo],
+  ]) {
+    requireFile(label, file)
+  }
+
+  const payload = assertNsisPayload(installer)
+  console.error(
+    '[release-preflight] local NSIS payload OK (no alpha, no Unix helpers, required binaries present)',
+  )
+  console.log(
+    JSON.stringify(
+      {
+        mode: 'payload-only',
+        provenance: 'local-test-package-only',
+        payload,
+        artifacts: {
+          installer: {
+            path: installer,
+            size: statSync(installer).size,
+            sha256: sha256(installer),
+          },
+          service: {
+            path: service,
+            size: statSync(service).size,
+            sha256: sha256(service),
+          },
+          mihomo: {
+            path: mihomo,
+            size: statSync(mihomo).size,
+            sha256: sha256(mihomo),
+          },
+        },
+      },
+      null,
+      2,
+    ),
+  )
+  process.exit(0)
+}
+
 const [tag, installerArgument, manifestArgument] = positional
 if (!tag || !installerArgument) {
   fail(
     'usage: pnpm release:preflight --config-only\n' +
+      '       pnpm release:preflight --payload-only <installer.exe>\n' +
       '       pnpm release:preflight <immutable-tag> <installer.exe> [release-manifest.json]',
   )
 }

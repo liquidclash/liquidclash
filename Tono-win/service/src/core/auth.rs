@@ -893,7 +893,9 @@ mod path_tests {
     #[test]
     fn only_local_drive_letter_roots_are_accepted() {
         assert!(is_local_drive_path(r"C:\Users\Alice\AppData\Roaming\app"));
-        assert!(is_local_drive_path(r"\\?\C:\Users\Alice\AppData\Roaming\app"));
+        assert!(is_local_drive_path(
+            r"\\?\C:\Users\Alice\AppData\Roaming\app"
+        ));
         // The parked-worker vector, plus the two other spellings of "somebody else answers".
         assert!(!is_local_drive_path(r"\\10.255.255.1\share"));
         assert!(!is_local_drive_path(r"\\?\UNC\10.255.255.1\share"));

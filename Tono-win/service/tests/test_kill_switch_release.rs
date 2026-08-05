@@ -5,8 +5,7 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     OwnerCredentials, OwnerSessionProof, RuntimeBundle, ServiceErrorCode, StartClashRequest,
-    StopClashOptions,
-    get_kill_switch_status as client_get_kill_switch_status,
+    StopClashOptions, get_kill_switch_status as client_get_kill_switch_status,
     get_protected_dns_status as client_get_protected_dns_status,
     release_kill_switch as client_release_kill_switch,
     restore_protected_dns as client_restore_protected_dns,

@@ -10,9 +10,12 @@ pub mod commands;
 pub mod connection;
 pub mod credentials;
 pub mod diagnostics;
+mod integration_profile;
 pub mod policy_sync;
 pub mod state;
 pub mod steps;
 pub mod transport;
+#[cfg(windows)]
+mod windows_dns;
 
 pub use state::TonoState;

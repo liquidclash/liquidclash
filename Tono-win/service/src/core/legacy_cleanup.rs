@@ -73,7 +73,9 @@ async fn await_bounded(
 ) -> Result<(), ServiceError> {
     match tokio::time::timeout(LEGACY_CLEANUP_TIMEOUT, task).await {
         Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(cleanup_error(format!("legacy cleanup task failed: {error}"))),
+        Ok(Err(error)) => Err(cleanup_error(format!(
+            "legacy cleanup task failed: {error}"
+        ))),
         Err(_) => Err(cleanup_error(
             "legacy cleanup did not finish before its deadline; it will be retried",
         )),

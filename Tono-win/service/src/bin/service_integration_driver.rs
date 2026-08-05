@@ -5,7 +5,8 @@ use anyhow::Context as _;
 use clash_verge_service_ipc::test_owner_credentials;
 use clash_verge_service_ipc::{
     IpcConfig, MIN_REQUIRED_SERVICE_REVISION, OwnerSessionProof, ProtocolVersion, RuntimeBundle,
-    StartClashRequest, get_status, get_version, set_config, start_clash, stop_clash,
+    StartClashRequest, get_clash_logs, get_kill_switch_status, get_protected_dns_status,
+    get_status, get_version, set_config, start_clash, stop_clash,
 };
 #[cfg(not(feature = "test"))]
 use clash_verge_service_ipc::{OwnerCredentials, OwnerIdentity};
@@ -20,7 +21,9 @@ const IPC_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: tono-service-integration-driver <probe|ready|ping|start|stop>");
+        eprintln!(
+            "usage: tono-service-integration-driver <probe|ready|ping|diagnose|logs|watch-logs|start|stop>"
+        );
         std::process::exit(1);
     }
 
@@ -28,14 +31,143 @@ async fn main() -> anyhow::Result<()> {
         "probe" => probe_protocol().await?,
         "ready" => wait_protocol_ready().await?,
         "ping" => wait_ipc_ready().await?,
+        "diagnose" => diagnose_flow().await?,
+        "logs" => logs_flow().await?,
+        "watch-logs" => watch_logs_flow().await?,
         "start" => start_flow().await?,
         "stop" => stop_flow().await?,
         _ => {
-            eprintln!("usage: tono-service-integration-driver <probe|ready|ping|start|stop>");
+            eprintln!(
+                "usage: tono-service-integration-driver <probe|ready|ping|diagnose|logs|watch-logs|start|stop>"
+            );
             std::process::exit(1);
         }
     }
 
+    Ok(())
+}
+
+/// Print the bounded in-memory core log maintained by the Service. This stays behind the same
+/// owner authentication as every other diagnostic request and avoids weakening the protected
+/// ProgramData ACL merely to debug a failed real-machine connect.
+async fn logs_flow() -> anyhow::Result<()> {
+    wait_protocol_ready().await?;
+    let response = get_clash_logs(&owner_credentials()?).await?;
+    if response.code != 0 {
+        anyhow::bail!(
+            "service rejected core log request: {} ({})",
+            response.message,
+            response.code
+        );
+    }
+    for line in response.data.unwrap_or_default() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Wait for the next real owner session and capture its in-memory core log before rollback makes
+/// the authenticated session unavailable. This is intentionally a test-driver primitive: a
+/// sub-second startup failure otherwise disappears before a human can issue a second command.
+async fn watch_logs_flow() -> anyhow::Result<()> {
+    wait_protocol_ready().await?;
+    let credentials = owner_credentials()?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut active_seen = false;
+    let mut last_len = 0;
+
+    while Instant::now() < deadline {
+        match get_clash_logs(&credentials).await {
+            Ok(response) if response.code == 0 => {
+                active_seen = true;
+                let logs = response.data.unwrap_or_default();
+                if logs.len() < last_len {
+                    last_len = 0;
+                }
+                for line in logs.iter().skip(last_len) {
+                    println!("{line}");
+                }
+                last_len = logs.len();
+            }
+            _ if active_seen => return Ok(()),
+            _ => {}
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    if active_seen {
+        Ok(())
+    } else {
+        anyhow::bail!("no active owner session appeared within 20 seconds")
+    }
+}
+
+/// Print the live service state needed for Windows triage without exposing endpoint addresses or
+/// owner/session secrets. This is intentionally read-only: it issues only protocol/status GETs.
+async fn diagnose_flow() -> anyhow::Result<()> {
+    wait_protocol_ready().await?;
+    let credentials = owner_credentials()?;
+    let version = get_version().await?;
+    let service = get_status(&credentials).await?;
+    let dns = get_protected_dns_status(&credentials).await?;
+    let kill_switch = get_kill_switch_status(&credentials).await?;
+
+    let service_data = service.data.as_ref().map(|status| {
+        serde_json::json!({
+            "snapshot_generation": status.snapshot_generation,
+            "active_operation": status.active_operation,
+            "is_active": status.is_active,
+            "active_generation": status.active_generation,
+            "service_state": status.service_state,
+            "core_pid": status.core_pid,
+            "core_started_at": status.core_started_at,
+            "last_core_exit_reason": status.last_core_exit_reason,
+            "restart_count": status.restart_count,
+            "last_recovery_at": status.last_recovery_at,
+            "desired_core_should_be_running": status.desired_core_should_be_running,
+            "desired_generation": status.desired_generation,
+            "desired_updated_at": status.desired_updated_at,
+            "desired_state_unknown": status.desired_state_unknown,
+            "network_events": status.network_events,
+        })
+    });
+    let kill_switch_data = kill_switch.data.as_ref().map(|status| {
+        serde_json::json!({
+            "wanted": status.wanted,
+            "verified": status.verified,
+            "live": status.live,
+            "mode": status.mode,
+            "tunnel_permit_rendered": status.tunnel_permit_rendered,
+            "endpoint_count": status.endpoints.len(),
+            "last_error": status.last_error,
+        })
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": {
+                "code": version.code,
+                "message": version.message,
+                "data": version.data,
+            },
+            "service": {
+                "code": service.code,
+                "message": service.message,
+                "data": service_data,
+            },
+            "dns": {
+                "code": dns.code,
+                "message": dns.message,
+                "data": dns.data,
+            },
+            "kill_switch": {
+                "code": kill_switch.code,
+                "message": kill_switch.message,
+                "data": kill_switch_data,
+            },
+        }))?
+    );
     Ok(())
 }
 

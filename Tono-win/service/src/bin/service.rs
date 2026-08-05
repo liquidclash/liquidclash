@@ -26,9 +26,9 @@ use {
         service_dispatcher,
     },
     std::ffi::OsString,
+    std::sync::Arc,
     std::sync::OnceLock,
     std::sync::atomic::{AtomicBool, Ordering},
-    std::sync::Arc,
     std::time::Duration,
 };
 
@@ -131,10 +131,7 @@ fn run_emergency_disarm() -> Result<()> {
             print_disarm_result(
                 "网络保护已解除，可以正常上网了。",
                 "Protection removed; your network is restored.",
-                &[
-                    "可以关闭此窗口。",
-                    "You can close this window.",
-                ],
+                &["可以关闭此窗口。", "You can close this window."],
             );
             Ok(())
         }

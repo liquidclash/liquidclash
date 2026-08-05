@@ -25,11 +25,11 @@ pub const REQUIRED_NETWORK: &str = "tcp";
 /// hijack a rule target such as DIRECT. (Contract reserves `Tono-Exit`; the
 /// built-ins are defense in depth on top of the macOS parity set.)
 ///
-/// The two DIRECT group names matter as much as `Tono-Exit`: with a cloud
-/// policy in force they are emitted as `proxy-groups` entries *and* as rule
-/// targets, and Mihomo has a single proxy namespace — a catalog node sharing
-/// one of those names either breaks every connect or steers the DIRECT rules
-/// at the crafted node instead of the interface-bound group.
+/// The two DIRECT outbound names matter as much as `Tono-Exit`: with a cloud
+/// policy in force they are emitted as physical-interface-bound `proxies`
+/// entries and as rule targets. Mihomo has a single proxy namespace, so a
+/// catalog node sharing one of those names could steer DIRECT rules at the
+/// crafted node instead of the owned outbound.
 const RESERVED_NODE_NAMES: [&str; 7] = [
     "Tono-Exit",
     crate::config::DIRECT_GROUP_NAME,
@@ -107,7 +107,10 @@ impl ValidatedNode {
         put("name", Value::String(self.name.clone()));
         put("type", Value::String("vless".to_string()));
         put("server", Value::String(self.server.to_string()));
-        put("port", Value::Number(serde_yaml_ng::Number::from(self.port)));
+        put(
+            "port",
+            Value::Number(serde_yaml_ng::Number::from(self.port)),
+        );
         put("uuid", Value::String(self.uuid.clone()));
         put("tls", Value::Bool(true));
         put("servername", Value::String(self.servername.clone()));
@@ -290,10 +293,7 @@ pub fn admit_node(value: &serde_yaml_ng::Value) -> Result<ValidatedNode, NodeRej
 /// Admit a whole catalog `proxies:` sequence and enforce the set-level rules:
 /// node count cap, duplicate names, reserved names (§3/§4).
 pub fn admit_nodes(values: &[serde_yaml_ng::Value]) -> Result<Vec<ValidatedNode>, NodeRejection> {
-    let nodes: Vec<ValidatedNode> = values
-        .iter()
-        .map(admit_node)
-        .collect::<Result<_, _>>()?;
+    let nodes: Vec<ValidatedNode> = values.iter().map(admit_node).collect::<Result<_, _>>()?;
     validate_node_set(&nodes)?;
     Ok(nodes)
 }
@@ -337,7 +337,9 @@ fn normalize_sni_host(raw: &str) -> Option<String> {
             || label.len() > 63
             || label.starts_with('-')
             || label.ends_with('-')
-            || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         {
             return None;
         }
@@ -499,7 +501,10 @@ ws-opts: { path: /ignored }
             .filter(|line| !line.starts_with("tls:"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(admit_yaml(&without_tls).unwrap_err(), NodeRejection::TlsDisabled);
+        assert_eq!(
+            admit_yaml(&without_tls).unwrap_err(),
+            NodeRejection::TlsDisabled
+        );
         assert_eq!(
             admit_yaml(&passing_yaml_with("tls: true", "tls: false")).unwrap_err(),
             NodeRejection::TlsDisabled
@@ -525,7 +530,10 @@ ws-opts: { path: /ignored }
             .filter(|line| !line.starts_with("uuid:"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(admit_yaml(&without_uuid).unwrap_err(), NodeRejection::BadUuid);
+        assert_eq!(
+            admit_yaml(&without_uuid).unwrap_err(),
+            NodeRejection::BadUuid
+        );
     }
 
     #[test]
@@ -593,7 +601,10 @@ ws-opts: { path: /ignored }
             .filter(|line| !line.starts_with("sni:"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(admit_yaml(&without_sni).unwrap_err(), NodeRejection::SniInvalid);
+        assert_eq!(
+            admit_yaml(&without_sni).unwrap_err(),
+            NodeRejection::SniInvalid
+        );
     }
 
     #[test]
@@ -609,9 +620,7 @@ ws-opts: { path: /ignored }
         let mut reality = serde_yaml_ng::Mapping::new();
         reality.insert(
             serde_yaml_ng::Value::String("public-key".to_string()),
-            serde_yaml_ng::Value::String(
-                "0123456789abcdef0123456789abcdef0123456789a".to_string(),
-            ),
+            serde_yaml_ng::Value::String("0123456789abcdef0123456789abcdef0123456789a".to_string()),
         );
         reality.insert(
             serde_yaml_ng::Value::String("short-id".to_string()),
@@ -661,8 +670,11 @@ ws-opts: { path: /ignored }
     #[test]
     fn rejects_wrong_flow() {
         assert_eq!(
-            admit_yaml(&passing_yaml_with("flow: xtls-rprx-vision", "flow: xtls-rprx-splice"))
-                .unwrap_err(),
+            admit_yaml(&passing_yaml_with(
+                "flow: xtls-rprx-vision",
+                "flow: xtls-rprx-splice"
+            ))
+            .unwrap_err(),
             NodeRejection::UnsupportedFlow
         );
     }
@@ -682,8 +694,11 @@ ws-opts: { path: /ignored }
     fn rejects_non_tcp_network() {
         for network in ["ws", "grpc", "h2", "httpupgrade"] {
             assert_eq!(
-                admit_yaml(&passing_yaml_with("network: tcp", &format!("network: {network}")))
-                    .unwrap_err(),
+                admit_yaml(&passing_yaml_with(
+                    "network: tcp",
+                    &format!("network: {network}")
+                ))
+                .unwrap_err(),
                 NodeRejection::UnsupportedNetwork,
                 "{network}"
             );
@@ -742,8 +757,11 @@ ws-opts: { path: /ignored }
     #[test]
     fn rejects_hostname_server() {
         assert_eq!(
-            admit_yaml(&passing_yaml_with("server: 8.8.8.8", "server: exit.example.com"))
-                .unwrap_err(),
+            admit_yaml(&passing_yaml_with(
+                "server: 8.8.8.8",
+                "server: exit.example.com"
+            ))
+            .unwrap_err(),
             NodeRejection::ServerNotPublicIpv4
         );
     }
@@ -751,8 +769,11 @@ ws-opts: { path: /ignored }
     #[test]
     fn rejects_ipv6_server() {
         assert_eq!(
-            admit_yaml(&passing_yaml_with("server: 8.8.8.8", "server: \"2606:4700:4700::1111\""))
-                .unwrap_err(),
+            admit_yaml(&passing_yaml_with(
+                "server: 8.8.8.8",
+                "server: \"2606:4700:4700::1111\""
+            ))
+            .unwrap_err(),
             NodeRejection::ServerNotPublicIpv4
         );
     }
@@ -760,30 +781,33 @@ ws-opts: { path: /ignored }
     #[test]
     fn rejects_every_private_and_reserved_range() {
         let cases = [
-            "0.1.2.3",       // 0/8
-            "10.255.255.255", // 10/8
-            "100.64.0.1",    // 100.64/10 lower edge
+            "0.1.2.3",         // 0/8
+            "10.255.255.255",  // 10/8
+            "100.64.0.1",      // 100.64/10 lower edge
             "100.127.255.254", // 100.64/10 upper edge
-            "127.0.0.1",     // loopback
-            "169.254.1.1",   // link-local
-            "172.16.0.1",    // 172.16/12 lower edge
-            "172.31.255.254", // 172.16/12 upper edge
-            "192.0.0.9",     // 192.0.0/24
-            "192.0.2.1",     // documentation TEST-NET-1
-            "192.168.1.1",   // 192.168/16
-            "198.18.0.1",    // benchmark lower edge (also fake-ip range)
-            "198.19.255.1",  // benchmark upper edge
-            "198.51.100.7",  // documentation TEST-NET-2
-            "203.0.113.55",  // documentation TEST-NET-3
-            "224.0.0.1",     // multicast lower edge
+            "127.0.0.1",       // loopback
+            "169.254.1.1",     // link-local
+            "172.16.0.1",      // 172.16/12 lower edge
+            "172.31.255.254",  // 172.16/12 upper edge
+            "192.0.0.9",       // 192.0.0/24
+            "192.0.2.1",       // documentation TEST-NET-1
+            "192.168.1.1",     // 192.168/16
+            "198.18.0.1",      // benchmark lower edge (also fake-ip range)
+            "198.19.255.1",    // benchmark upper edge
+            "198.51.100.7",    // documentation TEST-NET-2
+            "203.0.113.55",    // documentation TEST-NET-3
+            "224.0.0.1",       // multicast lower edge
             "239.255.255.255",
-            "240.0.0.1",     // 240/4 reserved
+            "240.0.0.1", // 240/4 reserved
             "255.255.255.255",
         ];
         for ip in cases {
             assert_eq!(
-                admit_yaml(&passing_yaml_with("server: 8.8.8.8", &format!("server: {ip}")))
-                    .unwrap_err(),
+                admit_yaml(&passing_yaml_with(
+                    "server: 8.8.8.8",
+                    &format!("server: {ip}")
+                ))
+                .unwrap_err(),
                 NodeRejection::ServerNotPublicIpv4,
                 "{ip}"
             );
@@ -792,9 +816,22 @@ ws-opts: { path: /ignored }
 
     #[test]
     fn accepts_public_ips_at_range_edges() {
-        for ip in ["1.1.1.1", "100.63.255.255", "100.128.0.1", "172.15.255.255", "172.32.0.1", "198.17.0.1", "198.20.0.1", "223.255.255.255"] {
+        for ip in [
+            "1.1.1.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "198.17.0.1",
+            "198.20.0.1",
+            "223.255.255.255",
+        ] {
             assert!(
-                admit_yaml(&passing_yaml_with("server: 8.8.8.8", &format!("server: {ip}"))).is_ok(),
+                admit_yaml(&passing_yaml_with(
+                    "server: 8.8.8.8",
+                    &format!("server: {ip}")
+                ))
+                .is_ok(),
                 "{ip}"
             );
         }
@@ -966,7 +1003,7 @@ ws-opts: { path: /ignored }
             "a..com".to_string(),
             "a%b.com".to_string(),
             "a b.com".to_string(),
-            format!("{}.com", "a".repeat(64)),  // label over 63 bytes
+            format!("{}.com", "a".repeat(64)), // label over 63 bytes
             format!("{}.com", "a".repeat(250)), // total over 253 bytes
         ];
         for sni in cases {
@@ -981,21 +1018,28 @@ ws-opts: { path: /ignored }
     #[test]
     fn sni_accepts_and_normalizes_valid_hosts() {
         // Lowercased (macOS parity).
-        let node =
-            admit_node(&with_field("sni", YValue::String("WWW.Example.COM".to_string()))).unwrap();
+        let node = admit_node(&with_field(
+            "sni",
+            YValue::String("WWW.Example.COM".to_string()),
+        ))
+        .unwrap();
         assert_eq!(node.servername, "www.example.com");
         // Surrounding dots are stripped.
-        let node =
-            admit_node(&with_field("sni", YValue::String("..example.com.".to_string()))).unwrap();
+        let node = admit_node(&with_field(
+            "sni",
+            YValue::String("..example.com.".to_string()),
+        ))
+        .unwrap();
         assert_eq!(node.servername, "example.com");
         // IP literals pass as-is: macOS normalizedHost returns early for them.
-        let node =
-            admit_node(&with_field("sni", YValue::String("1.2.3.4".to_string()))).unwrap();
+        let node = admit_node(&with_field("sni", YValue::String("1.2.3.4".to_string()))).unwrap();
         assert_eq!(node.servername, "1.2.3.4");
         // Hyphens inside labels and 63-byte labels are fine.
-        let node =
-            admit_node(&with_field("sni", YValue::String("a-b-c.example.com".to_string())))
-                .unwrap();
+        let node = admit_node(&with_field(
+            "sni",
+            YValue::String("a-b-c.example.com".to_string()),
+        ))
+        .unwrap();
         assert_eq!(node.servername, "a-b-c.example.com");
         assert!(
             admit_node(&with_field(
@@ -1030,7 +1074,12 @@ ws-opts: { path: /ignored }
     #[test]
     fn rejects_special_registry_blocks_beyond_macos() {
         // L8 hardening blocks.
-        for ip in ["192.31.196.1", "192.52.193.1", "192.88.99.1", "192.175.48.1"] {
+        for ip in [
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.1",
+            "192.175.48.1",
+        ] {
             assert_eq!(
                 admit_node(&with_field("server", YValue::String(ip.to_string()))).unwrap_err(),
                 NodeRejection::ServerNotPublicIpv4,

@@ -86,7 +86,11 @@ pub(crate) fn frontend_ipc_silence() -> Option<std::time::Duration> {
     if last == 0 {
         return None;
     }
-    Some(PROCESS_START.elapsed().saturating_sub(std::time::Duration::from_millis(last)))
+    Some(
+        PROCESS_START
+            .elapsed()
+            .saturating_sub(std::time::Duration::from_millis(last)),
+    )
 }
 
 /// TS: `interface TonoSignInChallenge { challengeId: string; expiresIn: number; message: string }`
@@ -534,7 +538,7 @@ pub async fn tono_select_server(
     app: AppHandle,
     name: String,
 ) -> Result<(), String> {
-    let (action, generation) = {
+    let action = {
         let mut inner = state.lock().await;
         if !inner.nodes.iter().any(|node| node.name == name) {
             return Err("unknown server".to_string());
@@ -588,7 +592,7 @@ pub async fn tono_select_server(
         {
             state.audit().log(AuditEvent::NodeSwitch { from, to: name.clone() });
         }
-        (action, generation)
+        action
     };
 
     match action {
@@ -1235,9 +1239,9 @@ pub async fn tono_upload_diagnostics(
         }
         Err(err) => {
             let message = diagnostics_upload_error(&err);
-            state.audit().log(AuditEvent::DiagnosticsUploadFail {
-                error: err.to_string(),
-            });
+            state
+                .audit()
+                .log(AuditEvent::DiagnosticsUploadFail { error: err.to_string() });
             Err(message)
         }
     }

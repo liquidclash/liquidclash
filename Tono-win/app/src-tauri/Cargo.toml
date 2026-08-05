@@ -1,6 +1,6 @@
 [package]
 name = "clash-verge"
-version = "0.0.5"
+version = "0.0.13"
 description = "clash verge"
 authors = ["zzzgydi", "Tunglies", "wonfen", "MystiPanda"]
 license = "GPL-3.0-only"
@@ -25,7 +25,11 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 verge-dev = ["clash_verge_logger/color", "clash_verge_service_ipc/development-channel"]
 dev-sidecar = ["verge-dev"]
-tauri-dev = []
+tauri-dev = ["dep:tauri-plugin-devtools"]
+# Real-machine App -> installed Service testing. This never relaxes the Service's
+# Program Files allowlist or injected SHA-256 check; it only lets a non-installed
+# test App nominate that already-installed, still-validated core binary.
+windows-integration-test = []
 tokio-trace = ["console-subscriber"]
 clippy = ["tauri/test"]
 tracing = []
@@ -93,11 +97,14 @@ tokio-stream = "0.1.19"
 backon = { version = "1.6.0", features = ["tokio-sleep"] }
 tauri-plugin-http = "2.5.9"
 console-subscriber = { version = "0.5.0", optional = true }
-tauri-plugin-devtools = { version = "2.1.0" }
+# The devtools plugin enables Tauri's `tracing` feature. On Windows that makes
+# WebView JavaScript dispatch synchronous, so it must not be feature-unified
+# into production builds that never register the plugin.
+tauri-plugin-devtools = { version = "2.1.0", optional = true }
 tauri-plugin-mihomo = { git = "https://github.com/clash-verge-rev/tauri-plugin-mihomo", branch = "refactor-use-reqwest-ipc" }
 clash_verge_logger = { git = "https://github.com/clash-verge-rev/clash-verge-logger" }
 async-trait = "0.1.91"
-clash_verge_service_ipc = { path = "../../service", version = "2.6.2", features = [
+clash_verge_service_ipc = { path = "../../service", version = "2.6.3", features = [
   "client",
 ] }
 arc-swap = "1.9.2"

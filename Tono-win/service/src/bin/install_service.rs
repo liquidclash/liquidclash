@@ -233,6 +233,41 @@ fn wait_for_service_ready() -> Result<(), Error> {
     })
 }
 
+/// Bridge pre-fix disconnected installs across an in-place Service restart.
+///
+/// `stop_windows_service` has already waited for SCM `Stopped`; taking the owner lock here proves
+/// no standalone/stale daemon can race the state classification. The library then leaves active
+/// or damaged protection untouched, but writes a one-boot `wanted:false` tombstone when there is
+/// no active owner and no wanted intent. That is the missing evidence the replacement needs to
+/// clean orphaned persistent filters instead of emergency-blocking a disconnected machine.
+#[cfg(windows)]
+fn prepare_windows_replacement_state() -> Result<(), Error> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create Service replacement preparation runtime")?;
+    runtime.block_on(async {
+        let owner = clash_verge_service_ipc::acquire_service_owner()
+            .await?
+            .context(
+                "another Service daemon still owns the replacement state; refusing to race it",
+            )?;
+        let marked_disconnected =
+            clash_verge_service_ipc::prepare_for_service_replacement().await?;
+        if marked_disconnected {
+            println!(
+                "Prepared disconnected Service replacement state; startup will clean orphaned WFP filters."
+            );
+        } else {
+            println!(
+                "Preserving active or ambiguous fail-closed protection across Service replacement."
+            );
+        }
+        drop(owner);
+        Ok(())
+    })
+}
+
 // Only launchd code calls this, and the tests below exercise the plan classifier rather than the
 // target string — so widening the gate to `test` only made it dead code everywhere but macOS.
 #[cfg(target_os = "macos")]
@@ -604,6 +639,7 @@ fn main() -> anyhow::Result<()> {
             // UAC succeeded, but publishing/configuring/starting the replacement can still fail;
             // without this rollback a repair attempt turns that failure into a permanent outage.
             let mut restart_on_failure = RestartServiceOnFailure::new(&service, was_active);
+            prepare_windows_replacement_state()?;
             // Reconfigure before the binary swap, which is the first irreversible step: a record
             // a previous uninstall only marked for deletion still opens and still stops, but
             // every write to it fails with 1072. Discovering that after `publish_staged_binary`
@@ -650,6 +686,10 @@ fn main() -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
 
+    // Fresh installs normally have no Service and no WFP provider. This also covers repair/update
+    // runs whose old SCM record is already gone: a pre-fix disconnected build may still have
+    // persistent filters, so give the replacement the same explicit-release evidence as above.
+    prepare_windows_replacement_state()?;
     let publish_outcome = publish_staged_binary(&staged, &target)?;
     let service = match service_manager.create_service(&service_info, service_access) {
         Ok(service) => service,

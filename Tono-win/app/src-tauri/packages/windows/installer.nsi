@@ -626,7 +626,9 @@ FunctionEnd
 
 !macro RemoveVergeService
   ; An updater temporarily removes the old application files but must preserve the running
-  ; Service and fail-closed policy until the new install helper replaces them.
+  ; Service until the new install helper replaces it. The helper itself distinguishes a durable
+  ; active/wanted session (preserve fail-closed) from a disconnected old build (write a one-start
+  ; wanted:false tombstone so late-visible orphan filters are cleaned by the replacement).
   ${If} $UpdateMode == 1
     DetailPrint "Update mode: preserving ${PRODUCTNAME} Service until replacement."
   ${Else}
@@ -652,10 +654,9 @@ FunctionEnd
     ; The helper's exit-code contract (uninstall_service.rs `cleanup_exit_code`):
     ;   0 = the machine is clean (or was already clean)
     ;   2 = the network was provably restored; only cosmetic cleanup (SCM record/binary) failed
-    ;   4 = the kill-switch filters were removed, but the saved DNS servers could not be proven
-    ;       restored, so the affected adapters were reset to automatic (DHCP). The machine is
-    ;       neither blocked nor pointed at Tono's resolver: log it and continue.
-    ;   3 = cleanup could not show the machine was made safe; the barrier may still be installed
+    ;   4 = the kill-switch filters were removed; DNS may be inexact (DHCP fallback, still on a
+    ;       Tono resolver, or unproven). Continue — an inexact resolver is not a blocked machine.
+    ;   3 = cleanup could not show the WFP barrier was removed; recovery files stay on disk
     ; nsExec may also return "error"/"timeout" or another numeric string. Only a proven-safe
     ; result may let the uninstall continue: anything that is not 0, 2 or 4 is treated exactly
     ; like 3, because nothing showed the machine was made safe. That discipline is unchanged —
@@ -663,16 +664,30 @@ FunctionEnd
     ${If} $0 == "2"
       DetailPrint "${PRODUCTNAME} network protection was restored; some Service leftovers could not be removed and will be cleaned up by a future install."
     ${ElseIf} $0 == "4"
-      DetailPrint "${PRODUCTNAME} network protection was removed, but your previous DNS servers could not be verified, so the affected adapters were set back to automatic (DHCP). Your machine gets DNS from your network again. If you had entered DNS servers by hand, set them again in Settings > Network & Internet."
+      DetailPrint "${PRODUCTNAME} network protection (kill switch) was removed. DNS may need a manual check: Settings > Network & Internet > your adapter > DNS server assignment > Automatic (DHCP) for IPv4 and IPv6. Install/uninstall continues because the machine is no longer blocked."
     ${ElseIf} $0 != "0"
-      ; Two different machines land here and the details above carry the helper's own message
-      ; naming which: the kill-switch filters could not be removed (reboot and retry), or they
-      ; were removed but DNS is still pointed at Tono's stopped resolver (set the adapter's DNS
-      ; back to Automatic/DHCP and retry, which then completes on the fallback path above).
-      ; Both remedies are named here because only the detail log can tell them apart.
-      Abort "Tono could not confirm this machine was made safe to uninstall (result $0), so nothing was deleted and the recovery files were kept. See the messages above for what failed. If the kill switch could not be removed, reboot Windows and run this uninstaller again — removing Tono now would leave the machine blocked with nothing left to unblock it. If instead your DNS could not be restored, open Settings > Network & Internet, set your adapter's DNS server assignment back to Automatic (DHCP), then run this uninstaller again. Installing Tono again first also repairs the Service."
+      ; Result 3 means the kill-switch filters may still be installed. DNS-only problems no longer
+      ; land here (they are exit 4). Reboot and retry, or reinstall to repair the Service first.
+      Abort "Tono could not confirm this machine was made safe to uninstall (result $0), so nothing was deleted and the recovery files were kept. See the messages above for what failed. The kill switch may still be installed — reboot Windows and run this uninstaller or installer again. Removing Tono while the barrier stays armed would leave the machine blocked with nothing left to unblock it. Installing Tono again first also repairs the Service."
     ${EndIf}
   ${EndIf}
+!macroend
+
+; Test 5 and older installers copied a second Mihomo plus Unix-named service helpers/scripts into
+; Program Files. They are intentionally absent from the current resource manifest, which also
+; means Tauri's generated uninstall loop cannot know they exist. Remove the exact historical
+; names on both upgrade and uninstall; /REBOOTOK covers an old core image that Windows still has
+; mapped without broadening the target beyond Tono's own install directory.
+!macro RemoveKnownLegacyPayload
+  Delete /REBOOTOK "$INSTDIR\verge-mihomo-alpha.exe"
+  Delete /REBOOTOK "$INSTDIR\resources\clash-verge-service"
+  Delete /REBOOTOK "$INSTDIR\resources\clash-verge-service-install"
+  Delete /REBOOTOK "$INSTDIR\resources\clash-verge-service-uninstall"
+  Delete /REBOOTOK "$INSTDIR\resources\clash-verge-service.exe"
+  Delete /REBOOTOK "$INSTDIR\resources\clash-verge-service-install.exe"
+  Delete /REBOOTOK "$INSTDIR\resources\clash-verge-service-uninstall.exe"
+  Delete /REBOOTOK "$INSTDIR\resources\set_dns.sh"
+  Delete /REBOOTOK "$INSTDIR\resources\unset_dns.sh"
 !macroend
 
 Section EarlyChecks
@@ -978,7 +993,17 @@ Section Install
     WriteRegStr SHCTX "${UNINSTKEY}" "HelpLink" "${HOMEPAGE}"
   !endif
 
+  ; A fresh/repair install may follow an older uninstaller that deleted its SCM record and state
+  ; file but accidentally left persistent WFP filters behind. Starting the new Service directly
+  ; would interpret that orphaned combination as an intentional fail-closed state and take the
+  ; customer offline until the App happened to release it. A non-update install runs the full
+  ; disarm helper here. UpdateMode deliberately keeps the Service in place, then the replacement
+  ; helper preserves active protection or marks a proven-disconnected legacy state for cleanup.
+  !insertmacro RemoveVergeService
   !insertmacro StartVergeService
+
+  ; The replacement Service is verified and no legacy core can still own these files.
+  !insertmacro RemoveKnownLegacyPayload
 
   ; Create file associations
   {{#each file_associations as |association| ~}}
@@ -1121,6 +1146,9 @@ Section Uninstall
     Delete "$INSTDIR\\{{this}}"
   {{/each}}
 
+  ; These files came from older bundles and therefore never appear in the generated lists above.
+  !insertmacro RemoveKnownLegacyPayload
+
   ; Delete app associations
   {{#each file_associations as |association| ~}}
     {{#each association.ext as |ext| ~}}
@@ -1143,7 +1171,9 @@ Section Uninstall
   {{#each resources_ancestors}}
   RMDir /REBOOTOK "$INSTDIR\\{{this}}"
   {{/each}}
-  RMDir "$INSTDIR"
+  ; A known legacy core may have required /REBOOTOK above. Schedule the exact product root too so
+  ; Windows can remove the now-empty directory after those mapped images are released.
+  RMDir /REBOOTOK "$INSTDIR"
 
   ; Remove shortcuts if not updating
   ${If} $UpdateMode <> 1

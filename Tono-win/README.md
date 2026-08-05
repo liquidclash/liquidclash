@@ -211,8 +211,10 @@ simplicity and Tono's PF semantics. Summary (full rule tables in
 
 - One fixed-GUID persistent provider; one persistent sublayer
   (**tono-kill-switch**, Mullvad-style) holding every rule, layered purely by
-  filter weight: loopback/DHCP/NDP permits (8/7) over the endpoint/TUN/API
-  permits (8/8/7) over the hard DNS block (6) over the block-all pair (1).
+  filter weight: loopback/DHCP/NDP permits (8/7) and endpoint/TUN/API permits
+  (8/8/7) over the block-all pair (1). The default-deny floor already blocks
+  physical DNS leaks; there is deliberately no extra port-53 block, because
+  Windows resolver traffic transitions between loopback and the TUN path.
   WFP arbitrates sublayer-first, so "weighted permits over a floor block" is
   only sound inside a single sublayer (see `docs/wfp-kill-switch.md` §2).
 - `ALE_AUTH_CONNECT_V4/V6` for the outbound fail-closed boundary; IPv6 is
@@ -252,6 +254,14 @@ Windows 10 22H2 / Windows 11, x64 and ARM64.
 
 No production token, node UUID, Reality key material, signing key, or live
 endpoint may be committed.
+
+Real-Windows integration builds use `--features windows-integration-test`.
+That feature injects 1000 ms of synthetic mainland-like latency into marked
+remote operations by default while production builds compile the hook to a
+no-op. Set `TONO_WINDOWS_INTEGRATION_LATENCY_MS=0` for a no-delay diagnostic,
+or choose another value from 0 through 5000 ms. Acceptance still requires a
+real connect, ordinary App/browser traffic, disconnect, and exact DNS restore;
+the synthetic delay supplements that loop and never replaces it.
 
 ## Status
 

@@ -8,11 +8,11 @@ mod shared;
 use anyhow::Error;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use shared::run_command;
-#[cfg(windows)]
-use shared::{read_service_pid_file, stop_windows_service, terminate_process_by_pid};
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
+#[cfg(windows)]
+use shared::{read_service_pid_file, stop_windows_service, terminate_process_by_pid};
 
 /// How Windows cleanup ended. `main` maps this onto the exit-code contract with the NSIS
 /// uninstall macro, which must only block when the machine cannot be proven safe; the mapping
@@ -62,13 +62,20 @@ const EXIT_STILL_PROTECTED: i32 = 3;
 #[cfg(any(windows, test))]
 const EXIT_RESTORED_AUTOMATIC: i32 = 4;
 
-/// The marker `dns::DNS_RESTORED_AUTOMATIC_PREFIX` puts in the disarm error when the ladder
-/// reached rung 2. Duplicated as a literal on purpose — the constant is `pub(crate)` in the
-/// library, and this is the same cross-boundary marker convention the App already uses for
-/// `TONO_WFP_ENGINE_WEDGED` (`app/src-tauri/src/tono/connection.rs`). Matched by substring,
-/// because every layer wraps the message in its own context.
+/// Markers the library puts in a disarm error **only after** WFP objects are deleted. Duplicated
+/// as literals on purpose — the constants are `pub(crate)` in the library, and this is the same
+/// cross-boundary marker convention the App already uses for `TONO_WFP_ENGINE_WEDGED`
+/// (`app/src-tauri/src/tono/connection.rs`). Matched by substring, because every layer wraps the
+/// message in its own context.
+///
+/// Any of these lets the uninstall/install continue (exit 4 family). The only blocking condition
+/// is "the WFP barrier may still be installed".
 #[cfg(any(windows, test))]
 const DNS_RESTORED_AUTOMATIC_MARKER: &str = "TONO_DNS_RESTORED_AUTOMATIC";
+#[cfg(any(windows, test))]
+const DNS_STILL_ON_LOOPBACK_MARKER: &str = "TONO_DNS_STILL_ON_LOOPBACK";
+#[cfg(any(windows, test))]
+const WFP_REMOVED_CONTINUE_MARKER: &str = "TONO_WFP_REMOVED";
 
 /// Environment variable that opts this process into the uninstall-only DNS escalation ladder.
 /// Must match `windows_kill_switch::UNINSTALL_LADDER_ENV`. Set in this process image only, so
@@ -91,8 +98,9 @@ fn cleanup_exit_code(outcome: &CleanupOutcome) -> i32 {
 /// The invariant, stated once and asserted in the tests: an uninstall may only continue on an
 /// outcome whose *precondition is that the WFP filters are gone*. `Clean` and
 /// `CosmeticFailure` are reached only after a proven disarm; `RestoredToAutomatic` is reached
-/// only from a disarm error carrying the rung-2 marker, and
-/// `windows_kill_switch::emergency_disarm_windows_kill_switch` produces that marker strictly
+/// only from a disarm error carrying a post-WFP continue marker
+/// (`TONO_DNS_RESTORED_AUTOMATIC` / `TONO_DNS_STILL_ON_LOOPBACK` / `TONO_WFP_REMOVED`), and
+/// `windows_kill_switch::emergency_disarm_windows_kill_switch` produces those markers strictly
 /// after the WFP objects have been deleted. Everything else blocks.
 ///
 /// It lives here rather than only in `installer.nsi` so the rule is stated in a language that
@@ -100,16 +108,23 @@ fn cleanup_exit_code(outcome: &CleanupOutcome) -> i32 {
 /// and the tests below cover the unknown-result case that fallthrough has to catch.
 #[cfg(test)]
 fn uninstall_may_continue(exit_code: i32) -> bool {
-    matches!(exit_code, 0 | EXIT_COSMETIC_FAILURE | EXIT_RESTORED_AUTOMATIC)
+    matches!(
+        exit_code,
+        0 | EXIT_COSMETIC_FAILURE | EXIT_RESTORED_AUTOMATIC
+    )
 }
 
-/// Classify the disarm result. The *only* thing that downgrades a disarm failure from blocking
-/// to continue-with-warning is the rung-2 marker; anything else — a wedged WFP engine, a failed
-/// tombstone write, rung 3, an unrecognised message — stays blocking, because none of those can
-/// show that the barrier was removed.
+/// Classify the disarm result. Any marker that is only ever emitted **after** WFP removal
+/// downgrades a disarm "failure" to continue-with-warning. Everything else — a wedged WFP
+/// engine, a failed tombstone write before removal, an unrecognised message — stays blocking,
+/// because none of those can show that the barrier was removed.
 #[cfg(any(windows, test))]
 fn classify_disarm_failure(error: Error) -> CleanupOutcome {
-    if format!("{error:#}").contains(DNS_RESTORED_AUTOMATIC_MARKER) {
+    let message = format!("{error:#}");
+    if message.contains(DNS_RESTORED_AUTOMATIC_MARKER)
+        || message.contains(DNS_STILL_ON_LOOPBACK_MARKER)
+        || message.contains(WFP_REMOVED_CONTINUE_MARKER)
+    {
         CleanupOutcome::RestoredToAutomatic(error)
     } else {
         CleanupOutcome::StillProtected(error)
@@ -132,6 +147,18 @@ fn poll_until<T>(
         }
     }
     Err(anyhow::anyhow!("{timeout_message}"))
+}
+
+/// The only safe "already clean" classification. A missing SCM record and missing state files
+/// are insufficient: persistent WFP filters can outlive both, and Service startup intentionally
+/// converts exactly that orphaned combination back into a strict emergency block.
+#[cfg(any(windows, test))]
+fn cleanup_fast_path_allowed(
+    service_present: bool,
+    recovery_state_present: bool,
+    residual_filters_present: bool,
+) -> bool {
+    !service_present && !recovery_state_present && !residual_filters_present
 }
 
 #[cfg(target_os = "macos")]
@@ -341,15 +368,46 @@ fn windows_cleanup() -> CleanupOutcome {
         Err(error) => return CleanupOutcome::StillProtected(error.into()),
     };
 
-    // No service, no kill-switch intent, no DNS snapshot, no live daemon: the machine is
-    // already clean. Report success instead of failing a repeated uninstall over disarm
-    // plumbing that has nothing left to operate on.
-    if service.is_none() && !windows_recovery_state_present() {
-        println!("No service, kill-switch intent, or DNS snapshot present; nothing to clean up.");
-        return match remove_windows_service_binary() {
-            Ok(()) => CleanupOutcome::Clean,
-            Err(error) => CleanupOutcome::CosmeticFailure(error),
+    // No service/state is *not* enough to report success. A real customer install reached this
+    // branch with orphaned persistent WFP filters; this helper returned Clean, then the next
+    // Service start correctly saw those filters and installed a strict emergency block, taking
+    // the machine offline until the App released it. Probe the WFP engine itself before the
+    // fast path. A probe error is unknown/possibly armed and therefore blocks the uninstall.
+    let recovery_state_present = windows_recovery_state_present();
+    if service.is_none() && !recovery_state_present {
+        let residual_filters_present = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => match runtime
+                .block_on(clash_verge_service_ipc::residual_filters_present())
+            {
+                Ok(present) => present,
+                Err(error) => {
+                    return CleanupOutcome::StillProtected(
+                        error.context("could not prove that orphaned Tono WFP filters are absent"),
+                    );
+                }
+            },
+            Err(error) => {
+                return CleanupOutcome::StillProtected(
+                    anyhow::Error::new(error)
+                        .context("failed to create the residual WFP verification runtime"),
+                );
+            }
         };
+        if cleanup_fast_path_allowed(false, false, residual_filters_present) {
+            println!(
+                "No service, recovery state, or residual Tono WFP filters present; nothing to clean up."
+            );
+            return match remove_windows_service_binary() {
+                Ok(()) => CleanupOutcome::Clean,
+                Err(error) => CleanupOutcome::CosmeticFailure(error),
+            };
+        }
+        println!(
+            "No service or recovery state remains, but orphaned Tono WFP filters exist; running the full network disarm."
+        );
     }
 
     if let Some(service) = service.as_ref()
@@ -499,9 +557,10 @@ fn remove_windows_service_binary() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CleanupOutcome, DNS_RESTORED_AUTOMATIC_MARKER, EXIT_COSMETIC_FAILURE,
-        EXIT_RESTORED_AUTOMATIC, EXIT_STILL_PROTECTED, classify_disarm_failure, cleanup_exit_code,
-        poll_until, uninstall_may_continue,
+        CleanupOutcome, DNS_RESTORED_AUTOMATIC_MARKER, DNS_STILL_ON_LOOPBACK_MARKER,
+        EXIT_COSMETIC_FAILURE, EXIT_RESTORED_AUTOMATIC, EXIT_STILL_PROTECTED,
+        WFP_REMOVED_CONTINUE_MARKER, classify_disarm_failure, cleanup_exit_code,
+        cleanup_fast_path_allowed, poll_until, uninstall_may_continue,
     };
     use std::cell::Cell;
 
@@ -511,9 +570,25 @@ mod tests {
     }
 
     #[test]
+    fn already_clean_fast_path_requires_wfp_absence_too() {
+        assert!(cleanup_fast_path_allowed(false, false, false));
+        for inputs in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(
+                !cleanup_fast_path_allowed(inputs.0, inputs.1, inputs.2),
+                "service, recovery state, and residual WFP are each independently enough to require the full disarm: {inputs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cosmetic_failure_is_distinct_and_never_reads_as_blocking() {
-        let code =
-            cleanup_exit_code(&CleanupOutcome::CosmeticFailure(anyhow::anyhow!("leftover")));
+        let code = cleanup_exit_code(&CleanupOutcome::CosmeticFailure(anyhow::anyhow!(
+            "leftover"
+        )));
         assert_eq!(code, EXIT_COSMETIC_FAILURE);
         assert_ne!(code, 0);
         assert_ne!(code, EXIT_STILL_PROTECTED);
@@ -546,25 +621,34 @@ mod tests {
         assert!(uninstall_may_continue(code));
     }
 
-    /// Rung 2 is reached only on the marker the library emits *after* deleting the WFP objects.
+    /// Post-WFP continue markers (rung 2, rung 3, generic WFP-removed) all let install/uninstall
+    /// proceed. They are only ever attached after the barrier is gone.
     #[test]
-    fn only_the_rung_two_marker_downgrades_a_disarm_failure_to_continue() {
-        let outcome = classify_disarm_failure(anyhow::anyhow!(
-            "WFP was removed and 2 adapter(s) were set back to automatic (DHCP) DNS"
-        )
-        .context(format!("{DNS_RESTORED_AUTOMATIC_MARKER}: uninstall fallback")));
-        assert!(matches!(outcome, CleanupOutcome::RestoredToAutomatic(_)));
-        assert!(uninstall_may_continue(cleanup_exit_code(&outcome)));
+    fn post_wfp_markers_downgrade_a_disarm_failure_to_continue() {
+        for message in [
+            format!("{DNS_RESTORED_AUTOMATIC_MARKER}: uninstall fallback"),
+            format!("{DNS_STILL_ON_LOOPBACK_MARKER}: still on protected DNS"),
+            format!("{WFP_REMOVED_CONTINUE_MARKER}: WFP was removed, but DNS restore could not be proven"),
+        ] {
+            let outcome = classify_disarm_failure(anyhow::anyhow!("{message}"));
+            assert!(
+                matches!(outcome, CleanupOutcome::RestoredToAutomatic(_)),
+                "{message}"
+            );
+            assert!(
+                uninstall_may_continue(cleanup_exit_code(&outcome)),
+                "{message}"
+            );
+        }
     }
 
-    /// Everything that is not the marker keeps blocking: rung 3, a wedged WFP engine, a failed
-    /// tombstone write, and any message this build does not recognise. None of them can show the
-    /// barrier was removed, and an uninstall that continues on them is exactly the "app removed,
-    /// filters left armed" end state the ladder must never produce.
+    /// Messages that cannot prove the barrier is gone keep blocking: a wedged WFP engine, a
+    /// failed tombstone write *before* removal, and any message this build does not recognise.
+    /// Continuing on those is exactly the "app removed, filters left armed" end state the
+    /// ladder must never produce.
     #[test]
     fn every_unmarked_disarm_failure_still_blocks() {
         for message in [
-            "TONO_DNS_STILL_ON_LOOPBACK: could not be taken off the loopback resolver",
             "TONO_WFP_ENGINE_WEDGED: the WFP engine did not answer",
             "TONO_DNS_RESTORE_STALLED: DNS restore did not answer",
             "failed to write the disarm tombstone",
@@ -580,6 +664,13 @@ mod tests {
             assert_eq!(code, EXIT_STILL_PROTECTED, "{message}");
             assert!(!uninstall_may_continue(code), "{message}");
         }
+    }
+
+    #[test]
+    fn post_wfp_continue_markers_are_the_documented_literals() {
+        assert_eq!(DNS_RESTORED_AUTOMATIC_MARKER, "TONO_DNS_RESTORED_AUTOMATIC");
+        assert_eq!(DNS_STILL_ON_LOOPBACK_MARKER, "TONO_DNS_STILL_ON_LOOPBACK");
+        assert_eq!(WFP_REMOVED_CONTINUE_MARKER, "TONO_WFP_REMOVED");
     }
 
     /// The invariant, asserted over the whole outcome space rather than per case: every outcome
@@ -615,13 +706,6 @@ mod tests {
         for code in [1, 5, 6, 100, 3010, -1] {
             assert!(!uninstall_may_continue(code), "exit {code} must block");
         }
-    }
-
-    /// The marker literal is a cross-binary contract with `dns.rs`; a silent rename on either
-    /// side turns rung 2 back into a refusal and the app back into something unremovable.
-    #[test]
-    fn the_rung_two_marker_literal_is_the_documented_one() {
-        assert_eq!(DNS_RESTORED_AUTOMATIC_MARKER, "TONO_DNS_RESTORED_AUTOMATIC");
     }
 
     /// Same contract in the other direction: the ladder only runs if this process image sets the

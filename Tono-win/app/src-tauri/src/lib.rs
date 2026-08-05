@@ -1,6 +1,12 @@
 #![allow(non_snake_case)]
 #![recursion_limit = "512"]
 
+// `tauri-plugin-devtools` enables synchronous traced WebView dispatch. It is useful while
+// developing, but a release binary carrying it can deadlock the Windows message pump when an
+// emitter and a main-thread callback meet. Keep an accidental release invocation fail-fast.
+#[cfg(all(not(debug_assertions), feature = "tauri-dev"))]
+compile_error!("the tauri-dev/devtools feature must not be enabled in a release build");
+
 mod cmd;
 pub mod config;
 mod constants;
@@ -250,7 +256,12 @@ async fn recover_tono_state(app_handle: AppHandle, first_error: String) {
             Ok(state) => {
                 let state = std::sync::Arc::new(state);
                 if app_handle.manage(state.clone()) {
-                    logging!(info, Type::Setup, "Tono state recovered after {} attempt(s)", attempt + 1);
+                    logging!(
+                        info,
+                        Type::Setup,
+                        "Tono state recovered after {} attempt(s)",
+                        attempt + 1
+                    );
                     tono::commands::restore_session_guarded(app_handle.clone(), state).await;
                 }
                 return;
@@ -301,18 +312,17 @@ async fn main_thread_pump_watchdog(app_handle: AppHandle) {
             return;
         }
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        let probe_handle = app_handle.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let sent_at = std::time::Instant::now();
-        // The visibility read rides along inside the dispatched closure: it is already on the
-        // main thread there, so it costs nothing extra and can never add a blocking round trip.
+        // Keep the main-thread closure lock-free. `Manager::get_webview_window` acquires Tauri's
+        // webview-manager mutex. A background `Emitter::emit` holds that mutex while, when Tauri
+        // tracing is enabled, it synchronously waits for this same event loop to evaluate JS.
+        // Looking up the window here therefore creates a deterministic lock inversion:
+        // emitter -> main thread, main thread -> webview manager. This exact cycle was captured
+        // in the Windows hang dump for tono-windows-0.0.5.
         if app_handle
             .run_on_main_thread(move || {
-                let visible = probe_handle
-                    .get_webview_window("main")
-                    .and_then(|window| window.is_visible().ok())
-                    .unwrap_or(false);
-                let _ = tx.send(visible);
+                let _ = tx.send(());
             })
             .is_err()
         {
@@ -321,8 +331,8 @@ async fn main_thread_pump_watchdog(app_handle: AppHandle) {
         }
 
         let mut landed = std::pin::pin!(rx);
-        let visible = match tokio::time::timeout(MAIN_THREAD_STALL_THRESHOLD, landed.as_mut()).await {
-            Ok(Ok(visible)) => visible,
+        match tokio::time::timeout(MAIN_THREAD_STALL_THRESHOLD, landed.as_mut()).await {
+            Ok(Ok(())) => {}
             // Sender dropped: the loop tore the dispatch down, i.e. we are shutting down.
             Ok(Err(_)) => return,
             Err(_) => {
@@ -332,7 +342,7 @@ async fn main_thread_pump_watchdog(app_handle: AppHandle) {
                     "Main thread pump STALLED: no dispatch ran in {MAIN_THREAD_STALL_THRESHOLD:?}. \
                      A freeze reported around this timestamp is on the native side, not in the WebView"
                 );
-                let Ok(visible) = landed.await else {
+                let Ok(()) = landed.await else {
                     return;
                 };
                 logging!(
@@ -341,9 +351,16 @@ async fn main_thread_pump_watchdog(app_handle: AppHandle) {
                     "Main thread pump resumed after {:?}",
                     sent_at.elapsed()
                 );
-                visible
             }
-        };
+        }
+
+        // Do the diagnostic visibility lookup only after the probe closure has returned to the
+        // watchdog worker. If an emitter currently owns the manager mutex, the main event loop
+        // remains free to service it and release the mutex before this lookup proceeds.
+        let visible = app_handle
+            .get_webview_window("main")
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
 
         // The pump answered, so the native side is healthy. If a visible window has also stopped
         // making its scheduled status call, the WebView is the stuck side.
@@ -755,9 +772,7 @@ mod exit_budget_tests {
 
 #[cfg(test)]
 mod pump_watchdog_tests {
-    use super::{
-        FRONTEND_SILENCE_THRESHOLD, MAIN_THREAD_PROBE_INTERVAL, MAIN_THREAD_STALL_THRESHOLD,
-    };
+    use super::{FRONTEND_SILENCE_THRESHOLD, MAIN_THREAD_PROBE_INTERVAL, MAIN_THREAD_STALL_THRESHOLD};
 
     /// Windows ghosts a window ("Not Responding") after roughly five seconds without a pumped
     /// message. The watchdog is only useful if it records the stall *before* the user can see it,

@@ -189,7 +189,9 @@ mod tests {
     fn exercise(store: &impl CredentialStore) {
         assert_eq!(store.refresh_token().unwrap(), None);
         store.set_refresh_token("rt-1").unwrap();
-        store.set_installation_id("2f5b1f2a-0000-4c81-8d2b-3f2d0a1b2c3d").unwrap();
+        store
+            .set_installation_id("2f5b1f2a-0000-4c81-8d2b-3f2d0a1b2c3d")
+            .unwrap();
         assert_eq!(store.refresh_token().unwrap().as_deref(), Some("rt-1"));
         assert_eq!(
             store.installation_id().unwrap().as_deref(),

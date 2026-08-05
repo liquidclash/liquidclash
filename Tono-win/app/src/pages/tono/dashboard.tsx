@@ -27,6 +27,8 @@ import { ConnectProgressCard } from './connect-progress'
 import { latencyColor, readNodeLatency } from './node-latency'
 import { nodeFlag, nodeDisplayName } from './node-meta'
 
+const TONO_PROTECTED_DNS_V4 = '198.18.0.2'
+
 const LockIcon = ({ locked }: { locked: boolean }) => (
   <svg
     width="12"
@@ -415,7 +417,10 @@ const DashboardPage = () => {
             {actionError}
           </span>
         )}
-        <ConnectProgressCard uiState={uiState} onRefreshStatus={mutateTonoStatus} />
+        <ConnectProgressCard
+          uiState={uiState}
+          onRefreshStatus={mutateTonoStatus}
+        />
         {status?.selectedServer && (
           <ActiveNodeCard
             serverName={status.selectedServer}
@@ -449,7 +454,10 @@ const DashboardPage = () => {
               value={t('tono.dashboard.killSwitchModes.locked')}
               valueColor={TONO_COLORS.connected}
             />
-            <InfoItem label={t('tono.dashboard.info.dns')} value="127.0.0.1" />
+            <InfoItem
+              label={t('tono.dashboard.info.dns')}
+              value={TONO_PROTECTED_DNS_V4}
+            />
             <InfoItem
               label={t('tono.dashboard.info.upload')}
               value={`↑ ${up} ${upUnit}/s`}

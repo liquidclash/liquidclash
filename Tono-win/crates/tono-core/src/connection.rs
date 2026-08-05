@@ -365,7 +365,10 @@ mod tests {
         assert!(ConnectStage::Preparing < ConnectStage::VerifyingTraffic);
         assert!(ConnectStage::LockingTraffic < ConnectStage::ApplyingCloudPolicy);
         assert!(ConnectStage::ApplyingCloudPolicy < ConnectStage::SecuringDns);
-        let labels: Vec<&str> = ConnectStage::ALL.iter().map(|stage| stage.label()).collect();
+        let labels: Vec<&str> = ConnectStage::ALL
+            .iter()
+            .map(|stage| stage.label())
+            .collect();
         assert_eq!(
             labels,
             [
@@ -402,10 +405,16 @@ mod tests {
         assert_eq!(status.ui_state(), UiState::NotConnected);
         status.is_connecting = true;
         status.stage = Some(ConnectStage::SecuringDns);
-        assert_eq!(status.ui_state(), UiState::Connecting(ConnectStage::SecuringDns));
+        assert_eq!(
+            status.ui_state(),
+            UiState::Connecting(ConnectStage::SecuringDns)
+        );
         // Missing stage falls back to the first stage label.
         status.stage = None;
-        assert_eq!(status.ui_state(), UiState::Connecting(ConnectStage::Preparing));
+        assert_eq!(
+            status.ui_state(),
+            UiState::Connecting(ConnectStage::Preparing)
+        );
         status.is_connecting = false;
         status.is_connected = true;
         assert_eq!(status.ui_state(), UiState::Connected);
@@ -447,7 +456,10 @@ mod tests {
     fn happy_path_connect_then_disconnect() {
         let mut fsm = ConnectionFsm::new();
         fsm.begin_connect();
-        assert_eq!(fsm.status().ui_state(), UiState::Connecting(ConnectStage::Preparing));
+        assert_eq!(
+            fsm.status().ui_state(),
+            UiState::Connecting(ConnectStage::Preparing)
+        );
         for stage in &ConnectStage::ALL[1..] {
             fsm.advance_stage(*stage);
             if *stage == ConnectStage::StartingTunnel {
@@ -458,7 +470,10 @@ mod tests {
         fsm.mark_session_verified();
         fsm.connect_succeeded().unwrap();
         assert_eq!(fsm.status().ui_state(), UiState::Connected);
-        assert!(fsm.kill_switch_armed(), "kill switch stays armed while connected");
+        assert!(
+            fsm.kill_switch_armed(),
+            "kill switch stays armed while connected"
+        );
         fsm.begin_disconnect();
         assert_eq!(fsm.status().ui_state(), UiState::Disconnecting);
         fsm.finish_disconnect();
@@ -475,7 +490,11 @@ mod tests {
         assert_eq!(fsm.connect_failed(), FailureAction::FullRelease);
         assert_eq!(fsm.status().ui_state(), UiState::NotConnected);
         assert!(!fsm.kill_switch_armed());
-        assert_eq!(fsm.next_reconnect_delay(), None, "no protected reconnect after release");
+        assert_eq!(
+            fsm.next_reconnect_delay(),
+            None,
+            "no protected reconnect after release"
+        );
     }
 
     #[test]
@@ -504,10 +523,7 @@ mod tests {
         fsm.mark_kill_switch_armed();
         fsm.mark_session_verified();
         fsm.connect_succeeded().unwrap();
-        assert_eq!(
-            fsm.tunnel_died(),
-            FailureAction::KeepBlockingAndReconnect
-        );
+        assert_eq!(fsm.tunnel_died(), FailureAction::KeepBlockingAndReconnect);
         assert!(fsm.kill_switch_armed());
         assert_eq!(fsm.status().ui_state(), UiState::ProtectedOffline);
         assert!(!fsm.status().is_connected);

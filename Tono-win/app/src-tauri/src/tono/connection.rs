@@ -12,14 +12,16 @@
 //! side effects — no `fail_connect`, no emit, no core action — when it
 //! moved (H1).
 
-use std::{future::Future, net::IpAddr, sync::Arc, time::Duration};
+use std::{error::Error as _, future::Future, net::IpAddr, sync::Arc, time::Duration};
 
 use clash_verge_logging::{Type, logging};
 use clash_verge_service_ipc::{
     DnsProtectionStatus, KillSwitchConfig, KillSwitchStatus, KillSwitchStatusMode, ProxyEndpoint, ProxyProtocol,
     RuntimeBundle,
 };
+use futures::{StreamExt as _, stream::FuturesUnordered};
 use tauri::AppHandle;
+use tauri_plugin_mihomo::{MihomoExt as _, models::Protocol};
 use tokio_util::sync::CancellationToken;
 use tono_core::{
     EXIT_GROUP_NAME,
@@ -34,7 +36,7 @@ use crate::{
     core::service,
     process::AsyncHandler,
     tono::{
-        audit::AuditEvent,
+        audit::{self, AuditEvent},
         bootstrap, commands,
         state::{AccountState, TonoState},
     },
@@ -43,7 +45,7 @@ use crate::{
 /// §6.8 exit probe target.
 const EXIT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// §6.8: the probe also proves fake-ip DNS via this lookup.
-const FAKE_IP_LOOKUP: &str = "www.gstatic.com:443";
+const FAKE_IP_LOOKUP_HOST: &str = "www.gstatic.com";
 /// §6.4: controller readiness poll budget. Mihomo's controller is usually up within a few
 /// hundred milliseconds, so the first polls run on a tight 50 ms grid before falling back to
 /// the coarse 250 ms interval — the fixed grid alone overshot a typical readiness by ~200 ms.
@@ -60,7 +62,7 @@ const CONTROLLER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// plus interface-alias propagation is slow (~10 s on real hardware, P0-12).
 const LOCK_ATTEMPTS: u32 = 50;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(200);
-/// §6.7/§6.8 retry counts.
+/// §6.7 DNS verification retry count.
 const VERIFY_ATTEMPTS: u32 = 3;
 const VERIFY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// C2 — §6.8 exit-probe budgets. The generated runtime sets `unified-delay: true`
@@ -74,18 +76,69 @@ const EXIT_PROBE_CORE_TIMEOUT_MS: u64 = 8_000;
 /// the verdict of an exit probe. 3 s over the core budget covers the loopback round trip, the
 /// core's scheduling, and the JSON reply.
 const EXIT_PROBE_CLIENT_TIMEOUT: Duration = Duration::from_secs(11);
-/// Whole-stage ceiling for one `checkingExit` pass. `VERIFY_ATTEMPTS` full-length attempts would
-/// be 34.5 s — a quarter of the transaction on their own — so the stage refuses to *start* an
-/// attempt the remaining budget cannot hold (fast failures, e.g. a 504, still get all three).
-const EXIT_PROBE_STAGE_TIMEOUT: Duration = Duration::from_secs(24);
+/// The controller delay request is advisory during Connect. Its reqwest timeout plus the
+/// integration profile's maximum synthetic delay bounds the single attempt; retrying a doubled
+/// `unified-delay` request made a harmless 504 consume 38 seconds before the authoritative real
+/// App data-plane check was even allowed to run.
+#[cfg(test)]
+const EXIT_PROBE_ADVISORY_BUDGET: Duration = Duration::from_secs(16);
 /// Every other controller call keeps the original general budget: `/version` polls are bounded
 /// far tighter by `CONTROLLER_POLL_TIMEOUT`, and a cloud-policy `/dns/query` must not be able to
 /// spend an exit-probe-sized slice of the transaction.
 const CONTROLLER_HTTP_TIMEOUT: Duration = Duration::from_secs(6);
+/// One attempt through the Windows DNS Client. The Windows path uses cancellable `DnsQueryEx`,
+/// so a slow adapter transition can consume this budget without leaving stale `getaddrinfo`
+/// workers behind; all bounded attempts remain available on high-latency machines.
+const FAKE_IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// §6.9 must prove traffic from the App itself, not merely ask Mihomo whether Mihomo can reach
+/// the Internet. The client is fresh, ignores all explicit proxy settings, resolves through the
+/// protected system DNS, and therefore has only one permitted path while WFP is locked: WinTUN.
+// A 4 s connect ceiling passed the local 1 s synthetic-latency profile but failed on real
+// mainland-to-US paths: that profile delays *before* the request and therefore does not consume
+// reqwest's DNS + proxy handshake + TLS connect budget. The Buffalo reports show the independent
+// controller request completing in 2.5 s while every real App request exhausts exactly this 4 s
+// connect ceiling. Twelve seconds covers several cross-border handshakes without weakening the
+// verdict; the whole request remains absolutely bounded and still has to return the exact TLS
+// origin status.
+const TUN_DATA_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const TUN_DATA_PLANE_TIMEOUT: Duration = Duration::from_secs(18);
+/// A single public origin is not a data plane. The controller probe and 0.0.7's App probe both
+/// targeted Google, so one node-to-Google failure made two nominally independent checks fail
+/// together on a mainland tester. Race independent TLS origins and accept the first exact,
+/// authenticated response. Because WFP is already verified Locked, any such fresh App flow can
+/// only leave through WinTUN; an ordinary physical-interface fallback remains impossible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TunDataPlaneProbe {
+    label: &'static str,
+    url: &'static str,
+    expected_status: u16,
+}
+
+const TUN_DATA_PLANE_PROBES: [TunDataPlaneProbe; 3] = [
+    TunDataPlaneProbe {
+        label: "Google",
+        url: EXIT_PROBE_URL,
+        expected_status: 204,
+    },
+    TunDataPlaneProbe {
+        label: "Cloudflare",
+        url: "https://cp.cloudflare.com/generate_204",
+        expected_status: 204,
+    },
+    TunDataPlaneProbe {
+        label: "Apple",
+        url: "https://www.apple.com/library/test/success.html",
+        expected_status: 200,
+    },
+];
+/// Controller failures are useful only when they remain bounded and safe to persist in the
+/// connect progress/audit trail. Mihomo's local API normally returns a tiny JSON error; cap the
+/// extracted message in case that shape changes.
+const CONTROLLER_ERROR_DETAIL_LIMIT: usize = 384;
 /// V1/H1 — §6.9 kill-switch verification retries. `KillSwitchStatus.live` on Windows is not a
 /// live query: it is a ~1.5 s-decaying cache refreshed by a 1 s loop, so one slow-but-successful
 /// verify reads `live: false` and fails a healthy tunnel. Every other stage retries (`lock` 50×,
-/// `probe_exit` 3×, `verify_fake_ip` 3×, `wait_controller` 64×); the only stage reading a
+/// `verify_fake_ip` 3×, `wait_controller` 64×); the only stage reading a
 /// time-decayed field retried zero times. The window deliberately spans more than one full
 /// refresh period, so the verdict is never decided by a single sample of a decaying value.
 const VERIFY_LOCK_ATTEMPTS: u32 = 4;
@@ -96,7 +149,8 @@ const VERIFY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(700);
 /// still false (it is committed only after both stages pass), so `plan_failure(armed = true,
 /// session_verified = false, ..)` resolves to `FullRelease` — and `next_reconnect_delay()`
 /// then requires `is_protection_blocked && session_verified`, both false, so nothing retries.
-/// One transient 504 took the user from a working tunnel to NotConnected with no recovery.
+/// A controller delay result is only advisory; the real App data-plane request below owns the
+/// verdict. A transient failure of that authoritative check still gets one full in-place retry.
 ///
 /// The retry therefore belongs **before** the full release, inside the still-live transaction:
 /// the decision table, the verification latch, and the release rules are untouched, and an
@@ -121,19 +175,19 @@ const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// | StartClash #1 — cold WinTUN install + WFP arm             |  60 s | Service handler budget
 /// | controller readiness (`CONTROLLER_READY_TIMEOUT`)         |  15 s |
 /// | lock ladder (`LOCK_ATTEMPTS` × `LOCK_RETRY_INTERVAL`)     |  10 s |
-/// | cloud policy — `/dns/query` + StartClash #2 + relock      |  35 s |
+/// | cloud policy — DNS 35 s + StartClash #2 60 s + ready/lock| 120 s |
 /// | securingDNS — PowerShell batches + read-back              |  30 s |
-/// | fake-ip verification (3 × (2 s + 0.5 s))                  |   8 s |
-/// | checkingExit (`EXIT_PROBE_STAGE_TIMEOUT`)                 |  24 s |
-/// | verifyingTraffic (`VERIFY_LOCK_ATTEMPTS` × IPC + 0.7 s)   |   5 s |
-/// | C3 second verification round + round delay                |  30 s |
+/// | fake-ip verification (3 × (5 s + 0.5 s), cancellable)     |  16 s |
+/// | checkingExit (one advisory controller delay request)      |  16 s |
+/// | verifyingTraffic (WFP status + mainland App HTTP over TUN) |  26 s |
+/// | C3 second TUN round + concurrent proxy check + delay       |  27 s |
 /// | MarkVerified commit IPC                                   |   5 s |
-/// | **total**                                                 | 225 s |
+/// | **total**                                                 | 328 s |
 ///
-/// 240 s leaves margin over that sum. It is a backstop for a wedged stage, not an expected
+/// 360 s leaves margin over that sum. It is a backstop for a wedged stage, not an expected
 /// duration: every leg above has its own tighter budget, so a real hang surfaces as that stage's
 /// error long before this deadline — whose own expiry is the one failure with no retry left.
-const CONNECT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(240);
+const CONNECT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(360);
 /// The accounting table above, machine-checked by `connect_budget_covers_a_cold_first_connect`.
 #[cfg(test)]
 const CONNECT_BUDGET_LEGS: [(&str, u64); 11] = [
@@ -141,12 +195,12 @@ const CONNECT_BUDGET_LEGS: [(&str, u64); 11] = [
     ("StartClash #1 (cold WinTUN + WFP arm)", 60),
     ("controller readiness", 15),
     ("lock ladder", 10),
-    ("cloud policy (StartClash #2 + relock)", 35),
+    ("cloud policy (DNS + StartClash #2 + ready/relock)", 120),
     ("securingDNS", 30),
-    ("fake-ip verification", 8),
-    ("checkingExit", 24),
-    ("verifyingTraffic", 5),
-    ("C3 second verification round", 30),
+    ("fake-ip verification", 16),
+    ("checkingExit", 16),
+    ("verifyingTraffic", 26),
+    ("C3 second verification round", 27),
     ("MarkVerified commit", 5),
 ];
 /// The redacted runtime copy is a diagnostics convenience, but it lands under `%APPDATA%`,
@@ -244,7 +298,11 @@ impl HealthLegs {
     }
 
     pub const fn observe_kill_switch(&mut self, unhealthy: bool) {
-        self.kill_switch = if unhealthy { self.kill_switch.saturating_add(1) } else { 0 };
+        self.kill_switch = if unhealthy {
+            self.kill_switch.saturating_add(1)
+        } else {
+            0
+        };
     }
 
     pub const fn observe_protected_dns(&mut self, unhealthy: bool) {
@@ -325,6 +383,20 @@ pub fn network_event_fires(changed: bool, since_last_event: Option<Duration>) ->
     changed && since_last_event.is_none_or(|elapsed| elapsed >= NETWORK_EVENT_DEBOUNCE)
 }
 
+/// A Windows route/interface notification is only a hint: WinTUN creation, protected-DNS
+/// reconciliation, and their delayed IP Helper callbacks can all arrive after Connect has
+/// already committed. Keep the fail-closed response for a changed Core identity or a failed
+/// health leg, but require a fresh locked data-plane failure before a notification by itself
+/// tears down a tunnel that is still carrying authenticated HTTPS traffic.
+pub fn monitor_requires_reconnect(
+    event_invalidated: bool,
+    core_changed: bool,
+    health_invalid: bool,
+    event_probe_failed: bool,
+) -> bool {
+    health_invalid || (event_invalidated && (core_changed || event_probe_failed))
+}
+
 /// F2: while Connected, the barrier must be wanted, live, and fully
 /// locked; anything else (or no answer) is unhealthy.
 pub fn kill_switch_unhealthy(status: Option<&KillSwitchStatus>) -> bool {
@@ -354,7 +426,8 @@ fn dns_error_is_a_failure(last_error: Option<&str>) -> bool {
     }
 }
 
-/// Connected is not healthy unless every currently known adapter is proven to use loopback DNS.
+/// Connected is not healthy unless every currently known adapter is proven to use Tono's
+/// protected DNS endpoint.
 /// The Service status deliberately includes adapters that appeared after the original snapshot,
 /// closing the first-netmon-sample race and covering a failed Windows notification registration.
 pub fn protected_dns_unhealthy(status: Option<&DnsProtectionStatus>) -> bool {
@@ -643,6 +716,12 @@ pub const SERVICE_TOO_OLD_PREFIX: &str = "TONO_SERVICE_TOO_OLD";
 pub const WFP_ENGINE_WEDGED_PREFIX: &str = "TONO_WFP_ENGINE_WEDGED";
 /// Windows' Base Filtering Engine service is not running, so no kill switch can be installed.
 pub const BFE_NOT_RUNNING_PREFIX: &str = "TONO_BFE_NOT_RUNNING";
+/// Stable post-lock classifications. The loopback-proxy cross-check distinguishes a selected
+/// node/Core path that works without WinTUN from a failure shared by every Mihomo ingress path.
+/// None of these markers relaxes the real TUN proof required for Connected.
+pub const TUN_DATA_PLANE_BROKEN_PREFIX: &str = "TONO_TUN_DATA_PLANE_BROKEN";
+pub const TUN_INGRESS_BROKEN_PREFIX: &str = "TONO_TUN_INGRESS_BROKEN";
+pub const NODE_OR_CORE_UNREACHABLE_PREFIX: &str = "TONO_NODE_OR_CORE_UNREACHABLE";
 
 /// Translate the Service's stable WFP markers into an actionable message. Returns `None` for
 /// every other error so callers keep the original diagnostic text.
@@ -691,10 +770,7 @@ pub fn is_retryable_lock_error(message: &str) -> bool {
         return true;
     }
     // Transient service lifecycle contention while StartClash is still materializing.
-    if lower.contains("service unavailable")
-        || lower.contains("operation already")
-        || lower.contains("busy")
-    {
+    if lower.contains("service unavailable") || lower.contains("operation already") || lower.contains("busy") {
         return true;
     }
     false
@@ -741,9 +817,10 @@ async fn run_stages(
     // Re-reading either after the first Core start can select the Tono adapter itself and makes
     // the runtime plan disagree with the WFP preflight that was actually performed.
     let traffic_policy = { state.lock().await.traffic_policy.clone() };
-    let needs_physical_interface = traffic_policy.as_ref().is_some_and(|policy| {
-        !policy.domains.is_empty() || !policy.media_endpoints.is_empty() || !policy.web_domains.is_empty()
-    });
+    let needs_physical_interface = WINDOWS_OPTIONAL_DIRECT_ENABLED
+        && traffic_policy.as_ref().is_some_and(|policy| {
+            !policy.domains.is_empty() || !policy.media_endpoints.is_empty() || !policy.web_domains.is_empty()
+        });
 
     // The five preparation probes are independent of each other and all read-only /
     // cancellation-safe (the two port binds are released immediately; the core-path query is a
@@ -753,13 +830,15 @@ async fn run_stages(
     //    must not depend on the system resolver once blocking starts, and the app's own API
     //    client is pinned to the same addresses (see `tono::bootstrap` / `tono::transport`).
     //  - The physical egress interface, still strictly before the first Core start (above).
-    //  - Tono is TUN-only, so it does not expose Mihomo's legacy mixed listener. A fresh
-    //    controller port eliminates collisions with another proxy or a stale 9090 listener.
-    //  - DNS stays fixed at loopback:53 because Windows adapter protection points resolvers
-    //    there, therefore prove both TCP and UDP are available before installing WFP rather
-    //    than timing out after the arm.
+    //  - Fresh loopback controller and diagnostic mixed-proxy ports eliminate collisions with
+    //    another proxy or stale fixed listeners. The mixed listener is never a connection proof
+    //    or product proxy: it is used only after a real TUN failure to distinguish node/Core
+    //    egress from the Windows TUN path, and the runtime binds it explicitly to 127.0.0.1.
+    //  - Mihomo's DNS listener still owns loopback:53 and publishes that resolver through the
+    //    TUN endpoint at 198.18.0.2. Prove both listener sockets are available before installing
+    //    WFP rather than timing out after the arm.
     //  - The Service-side core binary path validation.
-    let (bootstrap_api_hosts, physical_interface_probe, controller_port, dns_preflight, core_path) = transaction
+    let (bootstrap_api_hosts, physical_interface_probe, runtime_ports, dns_preflight, core_path) = transaction
         .wait("preparing service", async {
             tokio::join!(
                 bootstrap_hosts(),
@@ -770,13 +849,15 @@ async fn run_stages(
                         None
                     }
                 },
-                allocate_controller_port(),
+                allocate_runtime_ports(),
                 preflight_dns_listener(),
                 service::tono_core_binary_path(),
             )
         })
         .await?;
-    let controller_port = controller_port.map_err(StageFailure::error)?;
+    let runtime_ports = runtime_ports.map_err(StageFailure::error)?;
+    let controller_port = runtime_ports.controller_port;
+    let mixed_port = runtime_ports.mixed_port;
     dns_preflight.map_err(StageFailure::error)?;
     let core_path = core_path.map_err(StageFailure::error)?;
     let physical_interface = match physical_interface_probe {
@@ -787,11 +868,6 @@ async fn run_stages(
         }
         None => None,
     };
-    let runtime_ports = RuntimePorts {
-        mixed_port: 0,
-        controller_port,
-    };
-
     // §5: the owned runtime carries a fresh random controller secret; only
     // the redacted copy may touch disk.
     let secret = generate_controller_secret();
@@ -882,6 +958,7 @@ async fn run_stages(
                 generation,
                 &secret,
                 controller_port,
+                mixed_port,
                 &proxy_endpoints,
                 &bootstrap_api_hosts,
                 traffic_policy,
@@ -890,7 +967,7 @@ async fn run_stages(
         )
         .await??;
 
-    // §6.7: securingDNS — snapshot + point resolvers at loopback, then prove
+    // §6.7: securingDNS — snapshot + point resolvers at the protected TUN endpoint, then prove
     // an ordinary lookup returns a fake-ip address.
     set_stage(state, app, ConnectStage::SecuringDns, generation, true, started).await?;
     transaction
@@ -913,6 +990,7 @@ async fn run_stages(
         app,
         &secret,
         controller_port,
+        mixed_port,
         generation,
         started,
         transaction,
@@ -927,6 +1005,12 @@ async fn run_stages(
         .await?
         .map_err(StageFailure::error)?;
     kill_status.verified = true;
+
+    // The Tono runtime owns a fresh HTTP controller port and secret on every connection. The
+    // dashboard reuses the Mihomo plugin's traffic WebSocket, so point that plugin at this
+    // generation before publishing Connected. Updating the protocol last prevents a subscriber
+    // from observing a half-configured HTTP context.
+    configure_owned_controller_for_ui(app, &secret, controller_port);
 
     // §6.10: only now Connected; monitors start.
     {
@@ -970,8 +1054,9 @@ async fn run_stages(
     Ok(())
 }
 
-/// C3 — the post-lock verification group: `checkingExit` then `verifyingTraffic`, retried as a
-/// pair up to [`POST_LOCK_VERIFY_ROUNDS`] times inside the still-live transaction.
+/// C3 — the post-lock verification group: an advisory controller delay check followed by the
+/// authoritative real App data-plane check, retried up to [`POST_LOCK_VERIFY_ROUNDS`] times
+/// inside the still-live transaction.
 ///
 /// Why here and not in the failure path: by this point WFP is armed *and* locked and the tunnel
 /// is proven up, but `session_verified` is committed only after both stages pass. A failure
@@ -980,48 +1065,89 @@ async fn run_stages(
 /// `is_protection_blocked && session_verified`, both false afterwards, so nothing retries. A
 /// single transient 504 on the exit probe took a working tunnel to NotConnected with no recovery.
 ///
-/// Fail-closed is untouched: this only re-runs the *checks*. Nothing here marks a session
-/// verified, releases or weakens the barrier, or shortens any release; an exhausted group returns
-/// the same error to the same decision table and still resolves to the same `FullRelease`. The
-/// shared transaction deadline and the generation guard bound the retry, so it can neither
-/// outlive a disconnect nor extend the connect past its budget.
+/// Fail-closed is untouched: a controller `/delay` 504 is tolerated only if a fresh HTTPS request
+/// from this App succeeds while WFP is locked and system DNS points into WinTUN. That is stronger
+/// proof of user traffic than Mihomo's doubled synthetic measurement. Nothing here marks a
+/// session verified until that proof passes, releases or weakens the barrier, or shortens any
+/// release; an exhausted real-data-plane check still reaches the same `FullRelease`.
 #[allow(clippy::too_many_arguments, reason = "stage helper mirrors run_stages' own context")]
 async fn verify_post_lock(
     state: &Arc<TonoState>,
     app: &AppHandle,
     secret: &str,
     controller_port: u16,
+    mixed_port: u16,
     generation: u64,
     started: std::time::Instant,
     transaction: &ConnectTransaction,
 ) -> Result<KillSwitchStatus, StageFailure> {
+    // §6.8 is deliberately one advisory measurement for the whole verification group. Repeating
+    // Mihomo's doubled `unified-delay` request on every TUN retry used to spend another full
+    // cross-border round without adding any connection proof.
+    set_stage(state, app, ConnectStage::CheckingExit, generation, true, started).await?;
+    let controller_probe = transaction
+        .wait("advisory exit measurement", probe_exit_once(secret, controller_port))
+        .await?
+        .map(|_| ());
+
+    // §6.9 owns the verdict: first prove the barrier is wanted/live/locked, then make a fresh
+    // request from this App through system DNS and WinTUN.
+    set_stage(state, app, ConnectStage::VerifyingTraffic, generation, true, started).await?;
     let mut last = String::from("post-lock verification did not run");
     for round in 0..POST_LOCK_VERIFY_ROUNDS {
-        // §6.8: checkingExit — probe generate_204 through the Tono-Exit group. Only the first
-        // round announces the stage: `advance_stage` moves forward only (it debug-asserts on a
-        // regression), and a retry of the same group is not a new stage. Later rounds still take
-        // the generation guard `set_stage` would have taken, with the same late-arm patch.
-        if round == 0 {
-            set_stage(state, app, ConnectStage::CheckingExit, generation, true, started).await?;
-        } else if state.lock().await.connect_generation != generation {
+        if round > 0 && state.lock().await.connect_generation != generation {
             return Err(stale_after_arm(state, generation).await);
         }
-        let outcome = match transaction
-            .wait("exit verification", probe_exit(secret, controller_port))
-            .await?
-        {
-            Ok(()) => {
-                // §6.9: verifyingTraffic — the barrier must be wanted, live, and locked.
-                set_stage(state, app, ConnectStage::VerifyingTraffic, generation, true, started).await?;
-                transaction.wait("kill-switch verification", verify_locked()).await?
-            }
-            Err(err) => Err(err),
+        let final_round = round + 1 == POST_LOCK_VERIFY_ROUNDS;
+        let (data_plane, proxy_cross_check) = if final_round {
+            // Only an exhausted TUN path needs diagnosis. Run the loopback proxy check beside the
+            // last mandatory TUN attempt so a broken machine does not pay another serial network
+            // timeout. Success here remains diagnostic only and can never mark Connected.
+            let (data_plane, proxy) = transaction
+                .wait("real TUN verification with proxy cross-check", async {
+                    tokio::join!(verify_locked_data_plane(), verify_mixed_proxy_data_plane(mixed_port))
+                })
+                .await?;
+            (data_plane, Some(proxy))
+        } else {
+            (
+                transaction
+                    .wait("real TUN data-plane verification", verify_locked_data_plane())
+                    .await?,
+                None,
+            )
         };
-        match outcome {
-            Ok(status) => return Ok(status),
-            Err(err) => last = err,
+        let data_plane_error = data_plane.as_ref().err().cloned();
+
+        match classify_post_lock_verification(controller_probe.clone(), data_plane) {
+            PostLockVerification::Verified {
+                status,
+                controller_warning,
+            } => {
+                if let Some(error) = controller_warning {
+                    let error = audit::redact(&error);
+                    logging!(
+                        warn,
+                        Type::Service,
+                        "Tono: controller exit measurement degraded; real TUN data plane passed: {error}"
+                    );
+                    state.audit().log(AuditEvent::HealthProbeFail {
+                        probe: "controllerExitAdvisory",
+                        error,
+                    });
+                }
+                return Ok(status);
+            }
+            PostLockVerification::Retry { error } => {
+                last = match (proxy_cross_check, data_plane_error) {
+                    (Some(proxy), Some(data_plane)) => {
+                        classify_exhausted_data_plane(controller_probe.clone(), data_plane, proxy)
+                    }
+                    _ => error,
+                };
+            }
         }
-        if round + 1 == POST_LOCK_VERIFY_ROUNDS {
+        if final_round {
             break;
         }
         logging!(
@@ -1039,6 +1165,60 @@ async fn verify_post_lock(
             .await?;
     }
     Err(StageFailure::error(last))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PostLockVerification<T> {
+    Verified {
+        status: T,
+        controller_warning: Option<String>,
+    },
+    Retry {
+        error: String,
+    },
+}
+
+fn classify_post_lock_verification<T>(
+    controller_probe: Result<(), String>,
+    data_plane: Result<T, String>,
+) -> PostLockVerification<T> {
+    match (controller_probe, data_plane) {
+        (Ok(()), Ok(status)) => PostLockVerification::Verified {
+            status,
+            controller_warning: None,
+        },
+        (Err(error), Ok(status)) => PostLockVerification::Verified {
+            status,
+            controller_warning: Some(error),
+        },
+        (Ok(()), Err(error)) => PostLockVerification::Retry { error },
+        (Err(controller), Err(data_plane)) => PostLockVerification::Retry {
+            error: format!(
+                "controller exit measurement failed: {controller}; real TUN data plane failed: {data_plane}"
+            ),
+        },
+    }
+}
+
+fn classify_exhausted_data_plane(
+    controller_probe: Result<(), String>,
+    data_plane: String,
+    proxy_cross_check: Result<(), String>,
+) -> String {
+    match (controller_probe, proxy_cross_check) {
+        (Ok(()), Ok(())) => format!(
+            "{TUN_DATA_PLANE_BROKEN_PREFIX}: selected node and Mihomo proxy egress passed, but the Windows TUN data plane failed: {data_plane}"
+        ),
+        (Err(controller), Ok(())) => format!(
+            "{TUN_DATA_PLANE_BROKEN_PREFIX}: loopback proxy egress passed despite controller warning ({controller}), but the Windows TUN data plane failed: {data_plane}"
+        ),
+        (Ok(()), Err(proxy)) => format!(
+            "{TUN_INGRESS_BROKEN_PREFIX}: controller node egress passed, but both App ingress paths failed; TUN: {data_plane}; loopback proxy: {proxy}"
+        ),
+        (Err(controller), Err(proxy)) => format!(
+            "{NODE_OR_CORE_UNREACHABLE_PREFIX}: controller, Windows TUN, and loopback proxy checks all failed; controller: {controller}; TUN: {data_plane}; loopback proxy: {proxy}"
+        ),
+    }
 }
 
 /// The generation guard used between the long I/O steps.
@@ -1142,7 +1322,7 @@ async fn stale_after_arm(state: &Arc<TonoState>, generation: u64) -> StageFailur
 
 /// A stale DNS enable needs one extra rollback before WFP may be released. A disconnect can
 /// restore DNS while the old enable IPC is still in flight; if that enable commits afterwards,
-/// releasing WFP alone strands the machine on loopback DNS with no resolver. Node-switch
+/// releasing WFP alone strands the machine on Tono's protected DNS with no answering core. Node-switch
 /// invalidations deliberately keep DNS protected because their replacement transaction owns it.
 async fn stale_after_dns(state: &Arc<TonoState>, generation: u64) -> StageFailure {
     let release_intent = { state.lock().await.release_intent_for(generation) };
@@ -1780,22 +1960,17 @@ async fn spawn_network_monitor(state: &Arc<TonoState>, app: &AppHandle) {
     inner.tasks.network_monitor = Some(handle);
 }
 
-/// F2 leg 2: one periodic exit probe while Connected. Returns whether it counts as a failure on
-/// the probe leg — including the "Connected without an authenticated controller endpoint" case,
-/// which is itself abnormal.
-async fn periodic_exit_probe_failed(state: &Arc<TonoState>) -> bool {
-    let controller = {
-        let inner = state.lock().await;
-        inner.controller_secret.clone().zip(inner.controller_port)
-    };
-    let Some((secret, port)) = controller else {
-        return true;
-    };
-    match probe_exit_once(&secret, port).await {
-        Ok(_) => false,
+/// F2 leg 2: periodically repeat the same authoritative multi-origin real App request used at
+/// Connect. The controller delay API is deliberately excluded: under `unified-delay` it is a
+/// doubled measurement and persistent 504s on distant Reality exits do not prove user traffic is
+/// dead. A single public origin is likewise insufficient: every independent TLS target must fail
+/// before this leg reports failure.
+async fn periodic_data_plane_probe_failed(state: &Arc<TonoState>) -> bool {
+    match verify_tun_data_plane().await {
+        Ok(()) => false,
         Err(err) => {
             state.audit().log(AuditEvent::HealthProbeFail {
-                probe: "exit",
+                probe: "tunDataPlane",
                 error: err,
             });
             true
@@ -1850,14 +2025,14 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
         let protected_dns = service::tono_protected_dns_status().await.ok();
         legs.observe_protected_dns(protected_dns_unhealthy(protected_dns.as_ref()));
 
-        // F2 leg 2: periodic single-shot exit probe through the tunnel.
+        // F2 leg 2: periodic real App data-plane probe through the tunnel.
         if last_probe.elapsed() >= EXIT_PROBE_INTERVAL {
             last_probe = std::time::Instant::now();
-            legs.observe_probe(periodic_exit_probe_failed(&state).await);
+            legs.observe_probe(periodic_data_plane_probe_failed(&state).await);
         }
         let health_invalid = legs.invalid();
 
-        let (invalidate, kill_switch_snapshot, service_events) = {
+        let (invalidate, network_changed, core_changed, kill_switch_snapshot, service_events) = {
             let mut inner = state.lock().await;
 
             // L3: surface kill switch changes as they are observed.
@@ -1930,7 +2105,7 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
                     restart_count: snapshot.restart_count,
                 });
             }
-            (invalidated, snapshot_for_emit, events)
+            (invalidated, network_changed, core_changed, snapshot_for_emit, events)
         };
         for event in service_events {
             state.audit().log(event);
@@ -1938,7 +2113,28 @@ async fn network_monitor_loop(state: Arc<TonoState>, app: AppHandle) {
         if let Some(status) = kill_switch_snapshot {
             commands::emit_status(&app, &status);
         }
-        if invalidate || health_invalid {
+
+        // IP Helper delivers Tono's own WinTUN/route and DNS-reconciliation callbacks
+        // asynchronously. A callback can therefore land after the Service write window and
+        // after this monitor seeded its counter, producing the old connectOk -> networkChange ->
+        // reconnect loop. Do not trust the event either way: under the still-locked barrier,
+        // repeat the same multi-origin HTTPS proof that admitted Connected. Success proves the
+        // current tunnel still carries user traffic; failure corroborates the event and keeps the
+        // existing fail-closed reconnect. Core identity and health failures remain unconditional.
+        let event_probe_failed = if invalidate && network_changed && !core_changed && !health_invalid {
+            periodic_data_plane_probe_failed(&state).await
+        } else {
+            false
+        };
+        if invalidate && network_changed && !core_changed && !health_invalid && !event_probe_failed {
+            logging!(
+                info,
+                Type::Service,
+                "Tono: Windows reported a network change, but the locked TUN data plane remains healthy; keeping Connected"
+            );
+            legs.observe_probe(false);
+        }
+        if monitor_requires_reconnect(invalidate, core_changed, health_invalid, event_probe_failed) {
             handle_network_change(&state, &app).await;
             return;
         }
@@ -2099,6 +2295,7 @@ async fn set_stage(
 /// times out first throws away mihomo's diagnosis and reports a transport error instead.
 fn controller_client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(500))
         .timeout(timeout)
@@ -2110,23 +2307,51 @@ fn controller_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
 
-/// Pick an unused loopback port for this connection generation. The bind is intentionally released
-/// before Mihomo starts; a second process can theoretically win that narrow race, but Mihomo then
-/// fails immediately and the absolute connection deadline handles it. Keeping a listener open would
-/// prevent the child from binding on Windows.
-async fn allocate_controller_port() -> Result<u16, String> {
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+fn configure_owned_controller_for_ui(app: &AppHandle, secret: &str, controller_port: u16) {
+    let mihomo = app.mihomo();
+    mihomo.update_external_host(Some("127.0.0.1"));
+    mihomo.update_external_port(Some(controller_port));
+    mihomo.update_secret(Some(secret));
+    if let Err(error) = mihomo.update_protocol(Protocol::Http) {
+        // Telemetry must never turn a fully verified tunnel into a failed connection. Keep the
+        // product online and make the missing dashboard data diagnosable instead.
+        logging!(
+            warn,
+            Type::Frontend,
+            "Tono: failed to configure dashboard traffic telemetry: {error:#}"
+        );
+    }
+}
+
+/// Pick two distinct unused loopback ports for this connection generation. Both binds stay live
+/// until both port numbers have been observed, so the OS cannot hand the same ephemeral port to
+/// the controller and the diagnostic proxy. They are intentionally released before Mihomo starts;
+/// another process can theoretically win that narrow race, but Mihomo then fails immediately and
+/// the absolute connection deadline handles it. Keeping either listener open would prevent the
+/// child from binding on Windows.
+async fn allocate_runtime_ports() -> Result<RuntimePorts, String> {
+    let controller = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("cannot allocate loopback controller port: {error}"))?;
-    let port = listener
+    let mixed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|error| format!("cannot allocate loopback diagnostic proxy port: {error}"))?;
+    let controller_port = controller
         .local_addr()
         .map_err(|error| format!("cannot inspect loopback controller port: {error}"))?
         .port();
-    drop(listener);
-    if port == 0 {
-        return Err("operating system returned an invalid controller port".to_string());
+    let mixed_port = mixed
+        .local_addr()
+        .map_err(|error| format!("cannot inspect loopback diagnostic proxy port: {error}"))?
+        .port();
+    drop((controller, mixed));
+    if controller_port == 0 || mixed_port == 0 || controller_port == mixed_port {
+        return Err("operating system returned an invalid runtime listener plan".to_string());
     }
-    Ok(port)
+    Ok(RuntimePorts {
+        mixed_port,
+        controller_port,
+    })
 }
 
 /// Protected DNS requires Mihomo to own both TCP and UDP loopback:53. Fail before WFP is installed
@@ -2211,56 +2436,43 @@ async fn lock_kill_switch_with_retries() -> Result<(), String> {
     Err(format!("kill switch lock failed (TUN adapter not ready?): {last}"))
 }
 
-/// §6.7: an ordinary system lookup must return a fake-ip address (3 tries).
+/// §6.7: an ordinary system lookup must return a fake-ip address. On Windows, use the DNS Client
+/// API directly with cache bypass and true cancellation; this keeps all three propagation retries
+/// useful instead of accumulating uncancellable `getaddrinfo` work.
 async fn verify_fake_ip() -> Result<(), String> {
     let mut last = String::from("no answer");
     for attempt in 0..VERIFY_ATTEMPTS {
-        match tokio::time::timeout(DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host(FAKE_IP_LOOKUP)).await {
-            Ok(Ok(addrs)) => {
-                let addrs: Vec<_> = addrs.collect();
-                if addrs.iter().any(|addr| is_fake_ip(addr.ip())) {
+        #[cfg(windows)]
+        let lookup = crate::tono::windows_dns::query_a(FAKE_IP_LOOKUP_HOST, FAKE_IP_LOOKUP_TIMEOUT)
+            .await
+            .map(|addrs| addrs.into_iter().map(IpAddr::V4).collect::<Vec<_>>());
+        #[cfg(not(windows))]
+        let lookup = tokio::time::timeout(
+            FAKE_IP_LOOKUP_TIMEOUT,
+            tokio::net::lookup_host((FAKE_IP_LOOKUP_HOST, 443)),
+        )
+        .await
+        .map_err(|_| format!("system DNS lookup exceeded {FAKE_IP_LOOKUP_TIMEOUT:?}"))
+        .and_then(|result| {
+            result
+                .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
+                .map_err(|e| e.to_string())
+        });
+
+        match lookup {
+            Ok(addrs) => {
+                if addrs.iter().copied().any(is_fake_ip) {
                     return Ok(());
                 }
                 last = format!("no fake-ip in {addrs:?}");
             }
-            Ok(Err(err)) => last = err.to_string(),
-            Err(_) => last = format!("system DNS lookup exceeded {DNS_LOOKUP_TIMEOUT:?}"),
+            Err(err) => last = err,
         }
         if attempt + 1 < VERIFY_ATTEMPTS {
             tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
         }
     }
     Err(format!("fake-ip verification failed: {last}"))
-}
-
-/// C2: whether a further exit-probe attempt fits in what is left of the stage budget. A probe
-/// started without room for a full core budget can only ever report the client's timeout, which
-/// is precisely the diagnosis-destroying outcome the re-budget exists to avoid.
-pub fn exit_probe_attempt_fits(remaining: Duration) -> bool {
-    remaining > VERIFY_RETRY_INTERVAL + EXIT_PROBE_CLIENT_TIMEOUT
-}
-
-/// §6.8: delay-probe the exit group through the selected node (≤ `VERIFY_ATTEMPTS` tries; no
-/// sleep after the last failure — it only delayed the error). C2: the attempts are additionally
-/// bounded by [`EXIT_PROBE_STAGE_TIMEOUT`], so three full-length probes cannot silently become a
-/// 34 s stage.
-async fn probe_exit(secret: &str, controller_port: u16) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + EXIT_PROBE_STAGE_TIMEOUT;
-    let mut last = String::from("no response");
-    for attempt in 0..VERIFY_ATTEMPTS {
-        match probe_exit_once(secret, controller_port).await {
-            Ok(_) => return Ok(()),
-            Err(err) => last = err,
-        }
-        if attempt + 1 == VERIFY_ATTEMPTS {
-            break;
-        }
-        if !exit_probe_attempt_fits(deadline.saturating_duration_since(tokio::time::Instant::now())) {
-            break;
-        }
-        tokio::time::sleep(VERIFY_RETRY_INTERVAL).await;
-    }
-    Err(format!("exit check failed: {last}"))
 }
 
 /// One exit probe: `GET /proxies/Tono-Exit/delay` against the generate_204 target with an
@@ -2278,6 +2490,7 @@ async fn probe_exit_once(secret: &str, controller_port: u16) -> Result<u64, Stri
         .append_pair("url", EXIT_PROBE_URL)
         .append_pair("timeout", &EXIT_PROBE_CORE_TIMEOUT_MS.to_string());
 
+    crate::tono::integration_profile::delay_remote_operation().await;
     match client.get(url).bearer_auth(secret).send().await {
         Ok(response) if response.status().is_success() => match response.json::<serde_json::Value>().await {
             Ok(value) => {
@@ -2352,17 +2565,153 @@ async fn verify_locked() -> Result<KillSwitchStatus, String> {
     ))
 }
 
+/// The authoritative connection verdict: an ordinary fresh App flow must traverse the protected
+/// Windows data plane. With WFP locked, a physical-interface fallback is blocked and only the
+/// recorded WinTUN LUID is permitted, so a valid HTTPS 204 is positive evidence of tunnel traffic.
+async fn verify_locked_data_plane() -> Result<KillSwitchStatus, String> {
+    let status = verify_locked().await?;
+    verify_tun_data_plane().await?;
+    Ok(status)
+}
+
+async fn verify_tun_data_plane() -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(TUN_DATA_PLANE_CONNECT_TIMEOUT)
+        .timeout(TUN_DATA_PLANE_TIMEOUT)
+        .build()
+        .map_err(|error| format!("cannot create TUN data-plane probe: {error}"))?;
+    crate::tono::integration_profile::delay_remote_operation().await;
+
+    race_data_plane_probes(&client)
+        .await
+        .map_err(|failures| format_tun_probe_failures(&failures))
+}
+
+/// Diagnostic-only App ingress through Mihomo's ephemeral loopback mixed listener. This bypasses
+/// WinTUN but still uses the exact owned runtime, selected exit group, staged core, WFP endpoint
+/// permit, and remote node. A success therefore isolates a Windows TUN/route failure; it is never
+/// returned as a successful connection verdict.
+async fn verify_mixed_proxy_data_plane(mixed_port: u16) -> Result<(), String> {
+    let proxy_url = format!("http://127.0.0.1:{mixed_port}");
+    let proxy = reqwest::Proxy::all(&proxy_url)
+        .map_err(|error| format!("cannot configure loopback diagnostic proxy: {error}"))?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(TUN_DATA_PLANE_CONNECT_TIMEOUT)
+        .timeout(TUN_DATA_PLANE_TIMEOUT)
+        .build()
+        .map_err(|error| format!("cannot create loopback diagnostic proxy probe: {error}"))?;
+    crate::tono::integration_profile::delay_remote_operation().await;
+
+    race_data_plane_probes(&client).await.map_err(|failures| {
+        format!(
+            "all {} independent loopback-proxy probes failed: {}",
+            TUN_DATA_PLANE_PROBES.len(),
+            failures.join(" | ")
+        )
+    })
+}
+
+async fn race_data_plane_probes(client: &reqwest::Client) -> Result<(), Vec<String>> {
+    let mut in_flight = FuturesUnordered::new();
+    for probe in TUN_DATA_PLANE_PROBES {
+        in_flight.push(probe_tun_endpoint(&client, probe));
+    }
+
+    let mut failures = Vec::with_capacity(TUN_DATA_PLANE_PROBES.len());
+    while let Some(result) = in_flight.next().await {
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(error),
+        }
+    }
+    Err(failures)
+}
+
+async fn probe_tun_endpoint(client: &reqwest::Client, probe: TunDataPlaneProbe) -> Result<(), String> {
+    let response = client
+        .get(probe.url)
+        .send()
+        .await
+        .map_err(|error| format!("{} ({}): {}", probe.label, probe.url, describe_reqwest_error(&error)))?;
+    let actual = response.status().as_u16();
+    if actual == probe.expected_status {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} ({}) answered {}, expected {}",
+            probe.label, probe.url, actual, probe.expected_status
+        ))
+    }
+}
+
+fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else {
+        "request"
+    };
+    let mut parts = vec![format!("{category}: {error}")];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let detail = cause.to_string();
+        if !detail.is_empty() && parts.last().is_none_or(|last| last != &detail) {
+            parts.push(detail);
+        }
+        if parts.len() == 5 {
+            break;
+        }
+        source = cause.source();
+    }
+    let joined = parts.join(" -> ");
+    controller_error_detail(&joined).unwrap_or_else(|| category.to_string())
+}
+
+fn format_tun_probe_failures(failures: &[String]) -> String {
+    format!(
+        "all {} independent real TUN data-plane probes failed: {}",
+        TUN_DATA_PLANE_PROBES.len(),
+        failures.join(" | ")
+    )
+}
+
 // ---- WeChat-DIRECT cloud policy (Build 28) ----
 
+/// Optional physical-interface DIRECT acceleration currently requires a destructive second Core
+/// start. Mainland reports proved the first full-tunnel runtime could resolve the policy through
+/// the selected node, then the replacement runtime lost controller, TUN, and loopback-proxy
+/// egress together. Retain the already-working full-tunnel runtime until policy activation can be
+/// made transactional with a proven rollback. This removes physical DIRECT permits and therefore
+/// narrows, rather than weakens, the fail-closed policy.
+const WINDOWS_OPTIONAL_DIRECT_ENABLED: bool = false;
 /// Maximum resolved addresses kept per policy domain (Mac parity).
 const MAX_ADDRESSES_PER_DOMAIN: usize = 8;
+/// A cloud policy can currently carry dozens of names. Launching all DoH
+/// lookups at once overloaded otherwise healthy distant Reality exits on
+/// real mainland-like links, so keep a small, deterministic in-flight cap.
+const CLOUD_DNS_QUERY_CONCURRENCY: usize = 4;
+/// One transient controller/DoH failure must not tear down a protected
+/// connection. Permanent controller errors still fail immediately.
+const CLOUD_DNS_QUERY_ATTEMPTS: u32 = 3;
+const CLOUD_DNS_QUERY_RETRY_DELAY: Duration = Duration::from_millis(350);
+/// Both WeChat and web-domain sets share this one deadline. The enclosing
+/// connect transaction remains the final fail-closed ceiling.
+const CLOUD_POLICY_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// The applyingCloudPolicy stage: when a validated cloud policy exists,
 /// resolve its domains through the now-running controller, build the
 /// DIRECT plan, and re-arm with the endpoint permits + the direct-enabled
 /// runtime. Returns the controller secret the remaining stages must use
 /// (a second start rotates it). `Ok(original)` when there is no policy or
-/// the policy is empty — byte-identical behavior to a plan-less connect.
+/// the policy is empty. DIRECT is optional acceleration: if its interface
+/// snapshot or DNS discovery is unavailable, no DIRECT permits are added
+/// and the byte-identical plan-less tunnel continues instead.
 async fn apply_cloud_policy(
     state: &Arc<TonoState>,
     app: &AppHandle,
@@ -2371,6 +2720,7 @@ async fn apply_cloud_policy(
     generation: u64,
     original_secret: &str,
     controller_port: u16,
+    mixed_port: u16,
     proxy_endpoints: &[ProxyEndpoint],
     bootstrap_api_hosts: &[String],
     policy: Option<tono_core::policy::TonoTrafficPolicy>,
@@ -2382,17 +2732,43 @@ async fn apply_cloud_policy(
     if policy.domains.is_empty() && policy.media_endpoints.is_empty() && policy.web_domains.is_empty() {
         return Ok(original_secret.to_string());
     }
+    if !WINDOWS_OPTIONAL_DIRECT_ENABLED {
+        return Ok(skip_optional_direct_policy(
+            state,
+            original_secret,
+            "optional Windows DIRECT policy is disabled; retaining the proven full-tunnel runtime".to_string(),
+        ));
+    }
 
-    let interface = physical_interface
-        .ok_or_else(|| StageFailure::error("cloud DIRECT policy has no pre-TUN physical interface snapshot"))?;
+    let Some(interface) = physical_interface else {
+        return Ok(skip_optional_direct_policy(
+            state,
+            original_secret,
+            "cloud DIRECT policy has no pre-TUN physical interface snapshot".to_string(),
+        ));
+    };
 
-    // Resolve every policy domain through the controller (parallel; a
-    // failed query fails the stage = a connect failure behind the barrier).
-    let (wechat_pins, web_pins) = tokio::try_join!(
-        resolve_direct_domains(original_secret, controller_port, &policy.domains, node),
-        resolve_direct_domains(original_secret, controller_port, &policy.web_domains, node),
-    )
-    .map_err(StageFailure::error)?;
+    // Resolve through a small bounded pool. WeChat and web sets run in
+    // sequence so their separate batches cannot double the global cap.
+    let resolution = tokio::time::timeout(CLOUD_POLICY_RESOLUTION_TIMEOUT, async {
+        let wechat = resolve_direct_domains(original_secret, controller_port, &policy.domains, node).await?;
+        let web = resolve_direct_domains(original_secret, controller_port, &policy.web_domains, node).await?;
+        Ok::<_, String>((wechat, web))
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "cloud DIRECT DNS resolution exceeded {}s",
+            CLOUD_POLICY_RESOLUTION_TIMEOUT.as_secs()
+        )
+    })
+    .and_then(|result| result);
+    let (wechat_pins, web_pins) = match classify_optional_direct_resolution(resolution) {
+        OptionalDirectResolution::Ready(pins) => pins,
+        OptionalDirectResolution::Skip(reason) => {
+            return Ok(skip_optional_direct_policy(state, original_secret, reason));
+        }
+    };
     let (plan, direct_endpoints) = build_direct_plan(interface, &wechat_pins, &web_pins, &policy.media_endpoints, node)
         .map_err(StageFailure::error)?;
     if plan.hosts.is_empty()
@@ -2417,7 +2793,7 @@ async fn apply_cloud_policy(
         &secret,
         Some(&plan),
         RuntimePorts {
-            mixed_port: 0,
+            mixed_port,
             controller_port,
         },
     )
@@ -2470,23 +2846,53 @@ async fn apply_cloud_policy(
     Ok(secret)
 }
 
+/// Resolution failures only disable the optional DIRECT optimization. Keeping
+/// the original runtime and its zero-DIRECT WFP policy is the fail-closed
+/// outcome: every packet still has to traverse the protected tunnel.
+#[derive(Debug, PartialEq, Eq)]
+enum OptionalDirectResolution<T> {
+    Ready(T),
+    Skip(String),
+}
+
+fn classify_optional_direct_resolution<T>(result: Result<T, String>) -> OptionalDirectResolution<T> {
+    match result {
+        Ok(value) => OptionalDirectResolution::Ready(value),
+        Err(reason) => OptionalDirectResolution::Skip(reason),
+    }
+}
+
+fn skip_optional_direct_policy(state: &Arc<TonoState>, original_secret: &str, reason: String) -> String {
+    let reason = audit::redact(&reason);
+    logging!(
+        warn,
+        Type::Service,
+        "Tono: optional cloud DIRECT policy skipped; all traffic remains tunneled: {reason}"
+    );
+    state.audit().log(AuditEvent::PolicyActivationSkipped { reason });
+    original_secret.to_string()
+}
+
 /// One (host, usable addresses, ports) pin per policy domain, resolved via
-/// the mihomo controller's `/dns/query` (fail-closed on any query error).
+/// the mihomo controller's `/dns/query`. An error rejects the entire DIRECT
+/// plan; the caller then continues with zero DIRECT permits.
 async fn resolve_direct_domains(
     secret: &str,
     controller_port: u16,
     domains: &[tono_core::policy::PolicyDomain],
     node: &ValidatedNode,
 ) -> Result<Vec<(String, Vec<std::net::Ipv4Addr>, Vec<u16>)>, String> {
-    let queries: Vec<_> = domains
-        .iter()
-        .map(|domain| {
+    let client = controller_client(CONTROLLER_HTTP_TIMEOUT)?;
+    let mut pins = Vec::with_capacity(domains.len());
+    for batch in domains.chunks(CLOUD_DNS_QUERY_CONCURRENCY) {
+        let queries = batch.iter().map(|domain| {
             let host = domain.host.clone();
             let ports = domain.ports.clone();
             let server = node.server;
             let secret = secret.to_string();
+            let client = client.clone();
             async move {
-                let addresses = dns_query_a(&secret, controller_port, &host).await?;
+                let addresses = dns_query_a_with_retry(&client, &secret, controller_port, &host).await?;
                 let usable: Vec<std::net::Ipv4Addr> = addresses
                     .into_iter()
                     .filter(|ip| tono_core::node::is_public_ipv4(*ip))
@@ -2496,32 +2902,139 @@ async fn resolve_direct_domains(
                     .collect();
                 Ok::<_, String>((host, usable, ports))
             }
-        })
-        .collect();
-    let mut pins = Vec::with_capacity(queries.len());
-    for result in futures::future::join_all(queries).await {
-        pins.push(result?);
+        });
+        for result in futures::future::join_all(queries).await {
+            pins.push(result?);
+        }
     }
     Ok(pins)
 }
 
+#[derive(Debug)]
+struct ControllerDnsFailure {
+    message: String,
+    retryable: bool,
+}
+
+fn controller_dns_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+async fn dns_query_a_with_retry(
+    client: &reqwest::Client,
+    secret: &str,
+    controller_port: u16,
+    host: &str,
+) -> Result<Vec<std::net::Ipv4Addr>, String> {
+    let mut last = String::from("no response");
+    for attempt in 1..=CLOUD_DNS_QUERY_ATTEMPTS {
+        match dns_query_a(client, secret, controller_port, host).await {
+            Ok(addresses) => return Ok(addresses),
+            Err(error) => {
+                last = error.message;
+                if !error.retryable {
+                    return Err(last);
+                }
+            }
+        }
+        if attempt < CLOUD_DNS_QUERY_ATTEMPTS {
+            tokio::time::sleep(CLOUD_DNS_QUERY_RETRY_DELAY).await;
+        }
+    }
+    Err(format!(
+        "dns query for {host} failed after {CLOUD_DNS_QUERY_ATTEMPTS} attempts: {last}"
+    ))
+}
+
 /// `GET /dns/query?name=<host>&type=A` through the controller; the response
 /// shape is tolerated by collecting every IPv4 literal in the JSON tree.
-async fn dns_query_a(secret: &str, controller_port: u16, host: &str) -> Result<Vec<std::net::Ipv4Addr>, String> {
-    let client = controller_client(CONTROLLER_HTTP_TIMEOUT)?;
-    let mut url = reqwest::Url::parse(&controller_url(controller_port, "/dns/query")).map_err(|err| err.to_string())?;
+async fn dns_query_a(
+    client: &reqwest::Client,
+    secret: &str,
+    controller_port: u16,
+    host: &str,
+) -> Result<Vec<std::net::Ipv4Addr>, ControllerDnsFailure> {
+    let mut url =
+        reqwest::Url::parse(&controller_url(controller_port, "/dns/query")).map_err(|err| ControllerDnsFailure {
+            message: err.to_string(),
+            retryable: false,
+        })?;
     url.query_pairs_mut().append_pair("name", host).append_pair("type", "A");
+    crate::tono::integration_profile::delay_remote_operation().await;
     let response = client
         .get(url)
         .bearer_auth(secret)
         .send()
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| ControllerDnsFailure {
+            message: err.to_string(),
+            retryable: true,
+        })?;
     if !response.status().is_success() {
-        return Err(format!("dns query for {host} answered {}", response.status()));
+        let status = response.status();
+        let retryable = controller_dns_status_is_retryable(status);
+        let detail = response
+            .text()
+            .await
+            .ok()
+            .and_then(|body| controller_error_detail(&body));
+        let message = match detail {
+            Some(detail) => format!("dns query for {host} answered {status}: {detail}"),
+            None => format!("dns query for {host} answered {status}"),
+        };
+        return Err(ControllerDnsFailure { message, retryable });
     }
-    let value: serde_json::Value = response.json().await.map_err(|err| err.to_string())?;
+    let value: serde_json::Value = response.json().await.map_err(|err| ControllerDnsFailure {
+        message: format!("dns query for {host} returned invalid JSON: {err}"),
+        retryable: false,
+    })?;
     Ok(collect_ipv4_literals(&value))
+}
+
+/// Extract the human-readable part of a Mihomo controller error without carrying credentials,
+/// query strings, arbitrary control characters, or an unbounded response into logs/UI state.
+pub fn controller_error_detail(body: &str) -> Option<String> {
+    const MAX_JSON_INPUT: usize = 4 * 1024;
+    let json_detail = (body.len() <= MAX_JSON_INPUT)
+        .then(|| serde_json::from_str::<serde_json::Value>(body).ok())
+        .flatten()
+        .and_then(|value| {
+            ["message", "error", "detail"]
+                .into_iter()
+                .find_map(|key| value.get(key).and_then(serde_json::Value::as_str).map(str::to_owned))
+        });
+    let source = json_detail.as_deref().unwrap_or(body);
+
+    let mut normalized = String::with_capacity(CONTROLLER_ERROR_DETAIL_LIMIT.min(source.len()));
+    let mut pending_space = false;
+    let mut truncated = false;
+    for character in source.chars() {
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            if normalized.chars().count() >= CONTROLLER_ERROR_DETAIL_LIMIT {
+                truncated = true;
+                break;
+            }
+            normalized.push(' ');
+            pending_space = false;
+        }
+        if normalized.chars().count() >= CONTROLLER_ERROR_DETAIL_LIMIT {
+            truncated = true;
+            break;
+        }
+        normalized.push(character);
+    }
+    let mut normalized = audit::redact(normalized.trim());
+    if normalized.is_empty() {
+        return None;
+    }
+    if truncated {
+        normalized.push('…');
+    }
+    Some(normalized)
 }
 
 /// Collect every IPv4 literal from a JSON tree (mihomo's dns.Msg JSON nests
@@ -2801,26 +3314,27 @@ async fn write_redacted_copy(state: &Arc<TonoState>, redacted: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONNECT_BUDGET_LEGS, CONNECT_TRANSACTION_TIMEOUT, CORE_MISSING_SUSTAINED_SAMPLES,
-        CONTROLLER_READY_TIMEOUT, CoreSample, EXIT_PROBE_CLIENT_TIMEOUT, EXIT_PROBE_CORE_TIMEOUT_MS,
-        EXIT_PROBE_STAGE_TIMEOUT, EXPLICIT_RELEASE_TIMEOUT, FailurePlan, HEALTH_FAILURE_THRESHOLD,
-        HealthLegs, LOCK_ATTEMPTS, LOCK_RETRY_INTERVAL, MAX_DIRECT_ENDPOINTS,
-        NETWORK_EVENT_DEBOUNCE, NETWORK_MONITOR_INTERVAL, POST_LOCK_VERIFY_ROUNDS,
-        POST_LOCK_VERIFY_ROUND_DELAY, RELEASE_RECONCILING_PREFIX, SERVICE_BUSY_PREFIX,
-        SERVICE_LIFECYCLE_TIMEOUT, SERVICE_TOO_OLD_PREFIX, SelectAction, VERIFY_ATTEMPTS,
-        VERIFY_LOCK_ATTEMPTS, VERIFY_RETRY_INTERVAL, build_direct_plan, classify_core_sample,
-        collect_ipv4_literals, core_change_fires, exit_probe_attempt_fits, health_threshold_reached,
-        is_fake_ip, is_retryable_lock_error, kill_switch_unhealthy, monitor_interval,
-        network_event_fires, verify_lock_retry_window,
-        BFE_NOT_RUNNING_PREFIX, CATALOG_NOT_READY_REJECTION, TRANSITION_IN_FLIGHT_REJECTION,
-        WFP_ENGINE_WEDGED_PREFIX, guard_rejection_is_transient, map_service_ready_error,
-        map_wfp_engine_error, plan_failure, protected_dns_unhealthy, proxy_endpoint_of,
-        reconnect_allowed, retry_now_is_noop, select_action, sign_out_needs_release,
-        single_flight_begin, stale_exit_needs_release, stop_core_before_release,
+        BFE_NOT_RUNNING_PREFIX, CATALOG_NOT_READY_REJECTION, CLOUD_POLICY_RESOLUTION_TIMEOUT, CONNECT_BUDGET_LEGS,
+        CONNECT_TRANSACTION_TIMEOUT, CONTROLLER_READY_TIMEOUT, CORE_MISSING_SUSTAINED_SAMPLES, CoreSample,
+        EXIT_PROBE_ADVISORY_BUDGET, EXIT_PROBE_CLIENT_TIMEOUT, EXIT_PROBE_CORE_TIMEOUT_MS, EXPLICIT_RELEASE_TIMEOUT,
+        FailurePlan, HEALTH_FAILURE_THRESHOLD, HealthLegs, LOCK_ATTEMPTS, LOCK_RETRY_INTERVAL, MAX_DIRECT_ENDPOINTS,
+        NETWORK_EVENT_DEBOUNCE, NETWORK_MONITOR_INTERVAL, POST_LOCK_VERIFY_ROUND_DELAY, POST_LOCK_VERIFY_ROUNDS,
+        RELEASE_RECONCILING_PREFIX, SERVICE_BUSY_PREFIX, SERVICE_LIFECYCLE_TIMEOUT, SERVICE_TOO_OLD_PREFIX,
+        SelectAction, TRANSITION_IN_FLIGHT_REJECTION, TUN_DATA_PLANE_CONNECT_TIMEOUT, TUN_DATA_PLANE_PROBES,
+        TUN_DATA_PLANE_TIMEOUT, VERIFY_LOCK_ATTEMPTS, WFP_ENGINE_WEDGED_PREFIX, WINDOWS_OPTIONAL_DIRECT_ENABLED,
+        build_direct_plan, classify_core_sample, collect_ipv4_literals, controller_error_detail, core_change_fires,
+        format_tun_probe_failures, guard_rejection_is_transient, health_threshold_reached, is_fake_ip,
+        is_retryable_lock_error, kill_switch_unhealthy, map_service_ready_error, map_wfp_engine_error,
+        monitor_interval, monitor_requires_reconnect, network_event_fires, plan_failure, protected_dns_unhealthy,
+        proxy_endpoint_of, reconnect_allowed, retry_now_is_noop, select_action, sign_out_needs_release,
+        single_flight_begin, stale_exit_needs_release, stop_core_before_release, verify_lock_retry_window,
     };
     use clash_verge_service_ipc::DnsProtectionStatus;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
+    use std::{
+        collections::BTreeSet,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    };
     use tono_core::{connection::ConnectionStatus, node::ValidatedNode};
 
     // ---- H7: the monitor's tick source must never collapse its thresholds ----
@@ -2831,10 +3345,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_interval_delays_missed_ticks_instead_of_bursting() {
         let interval = monitor_interval();
-        assert_eq!(
-            interval.missed_tick_behavior(),
-            tokio::time::MissedTickBehavior::Delay
-        );
+        assert_eq!(interval.missed_tick_behavior(), tokio::time::MissedTickBehavior::Delay);
         assert_eq!(interval.period(), NETWORK_MONITOR_INTERVAL);
     }
 
@@ -2889,8 +3400,13 @@ mod tests {
     #[test]
     fn each_health_leg_thresholds_independently() {
         for (name, apply) in [
-            ("kill switch", (|legs: &mut HealthLegs| legs.observe_kill_switch(true)) as fn(&mut HealthLegs)),
-            ("protected dns", |legs: &mut HealthLegs| legs.observe_protected_dns(true)),
+            (
+                "kill switch",
+                (|legs: &mut HealthLegs| legs.observe_kill_switch(true)) as fn(&mut HealthLegs),
+            ),
+            ("protected dns", |legs: &mut HealthLegs| {
+                legs.observe_protected_dns(true)
+            }),
             ("probe", |legs: &mut HealthLegs| legs.observe_probe(true)),
             ("service", |legs: &mut HealthLegs| legs.observe_service_failure()),
         ] {
@@ -2906,18 +3422,12 @@ mod tests {
 
     #[test]
     fn a_missing_core_pid_is_a_quiet_sample() {
-        assert_eq!(
-            classify_core_sample(Some(42), Some(3), None, 0),
-            CoreSample::Missing
-        );
+        assert_eq!(classify_core_sample(Some(42), Some(3), None, 0), CoreSample::Missing);
         assert!(
             !core_change_fires(CoreSample::Missing, 1),
             "the Service reports core_pid: None on its non-error inactive path"
         );
-        assert!(core_change_fires(
-            CoreSample::Missing,
-            CORE_MISSING_SUSTAINED_SAMPLES
-        ));
+        assert!(core_change_fires(CoreSample::Missing, CORE_MISSING_SUSTAINED_SAMPLES));
     }
 
     #[test]
@@ -2948,10 +3458,7 @@ mod tests {
     /// a restart — treating it as one would make the missing-sample threshold pointless.
     #[test]
     fn a_reset_restart_counter_is_not_a_restart() {
-        assert_eq!(
-            classify_core_sample(Some(42), Some(3), None, 0),
-            CoreSample::Missing
-        );
+        assert_eq!(classify_core_sample(Some(42), Some(3), None, 0), CoreSample::Missing);
         assert_eq!(
             classify_core_sample(Some(42), Some(3), Some(42), 0),
             CoreSample::Unchanged
@@ -2968,6 +3475,30 @@ mod tests {
         assert!(network_event_fires(true, None));
         assert!(network_event_fires(true, Some(NETWORK_EVENT_DEBOUNCE)));
         assert!(!network_event_fires(false, None), "no change, no invalidation");
+    }
+
+    #[test]
+    fn a_network_notification_needs_data_plane_corroboration() {
+        assert!(
+            !monitor_requires_reconnect(true, false, false, false),
+            "a healthy locked tunnel must survive a delayed notification from its own setup"
+        );
+        assert!(
+            monitor_requires_reconnect(true, false, false, true),
+            "a failed real data-plane probe corroborates the network event"
+        );
+        assert!(
+            monitor_requires_reconnect(true, true, false, false),
+            "a changed Core identity always rebuilds the connection"
+        );
+        assert!(
+            monitor_requires_reconnect(false, false, true, false),
+            "independent health failure remains fail-closed without a network event"
+        );
+        assert!(
+            !monitor_requires_reconnect(false, false, false, true),
+            "an event-only probe result has no meaning when debounce did not emit an event"
+        );
     }
 
     // ---- V1/H1: verify_locked must not decide on one sample of a decaying cache ----
@@ -3006,16 +3537,13 @@ mod tests {
     }
 
     #[test]
-    fn exit_probe_stage_stays_within_its_ceiling() {
-        // Two full-length attempts fit; the naive VERIFY_ATTEMPTS × client-timeout ladder does
-        // not, which is exactly why the stage stops starting attempts it cannot finish.
-        assert!(exit_probe_attempt_fits(EXIT_PROBE_STAGE_TIMEOUT));
-        assert!(!exit_probe_attempt_fits(EXIT_PROBE_CLIENT_TIMEOUT));
-        assert!(!exit_probe_attempt_fits(Duration::ZERO));
-        let two_attempts = EXIT_PROBE_CLIENT_TIMEOUT * 2 + VERIFY_RETRY_INTERVAL;
-        assert!(two_attempts <= EXIT_PROBE_STAGE_TIMEOUT);
-        let naive_ladder = EXIT_PROBE_CLIENT_TIMEOUT * VERIFY_ATTEMPTS + VERIFY_RETRY_INTERVAL * 2;
-        assert!(naive_ladder > EXIT_PROBE_STAGE_TIMEOUT);
+    fn advisory_exit_probe_is_one_bounded_attempt() {
+        // 11 s of HTTP + at most 5 s from the mainland integration profile. Connect performs
+        // exactly one such advisory request before the authoritative data-plane check.
+        assert_eq!(
+            EXIT_PROBE_ADVISORY_BUDGET,
+            EXIT_PROBE_CLIENT_TIMEOUT + Duration::from_secs(5)
+        );
     }
 
     // ---- C3: a transient verification failure is not "the tunnel never came up" ----
@@ -3055,12 +3583,108 @@ mod tests {
     fn the_post_lock_group_retries_before_giving_up() {
         assert!(
             POST_LOCK_VERIFY_ROUNDS >= 2,
-            "one transient 504 must not destroy a working tunnel"
+            "one transient real TUN failure must not destroy a working tunnel"
         );
         // ...but the group stays bounded: it can never outlive the transaction budget.
-        let worst = (EXIT_PROBE_STAGE_TIMEOUT + verify_lock_retry_window() + POST_LOCK_VERIFY_ROUND_DELAY)
-            * POST_LOCK_VERIFY_ROUNDS;
+        let real_data_plane_budget = verify_lock_retry_window() + TUN_DATA_PLANE_TIMEOUT + Duration::from_secs(5);
+        let worst = EXIT_PROBE_ADVISORY_BUDGET
+            + real_data_plane_budget * POST_LOCK_VERIFY_ROUNDS
+            + POST_LOCK_VERIFY_ROUND_DELAY;
         assert!(worst < CONNECT_TRANSACTION_TIMEOUT);
+    }
+
+    #[test]
+    fn exhausted_tun_failure_uses_the_independent_proxy_cross_check() {
+        use super::{
+            NODE_OR_CORE_UNREACHABLE_PREFIX, TUN_DATA_PLANE_BROKEN_PREFIX, TUN_INGRESS_BROKEN_PREFIX,
+            classify_exhausted_data_plane,
+        };
+
+        let tun = "all real TUN probes timed out".to_string();
+        let isolated = classify_exhausted_data_plane(Ok(()), tun.clone(), Ok(()));
+        assert!(isolated.starts_with(TUN_DATA_PLANE_BROKEN_PREFIX));
+        assert!(isolated.contains("node and Mihomo proxy egress passed"));
+
+        let advisory_degraded = classify_exhausted_data_plane(Err("delay probe 504".to_string()), tun.clone(), Ok(()));
+        assert!(advisory_degraded.starts_with(TUN_DATA_PLANE_BROKEN_PREFIX));
+        assert!(advisory_degraded.contains("loopback proxy egress passed"));
+
+        let ingress = classify_exhausted_data_plane(Ok(()), tun.clone(), Err("proxy CONNECT timeout".to_string()));
+        assert!(ingress.starts_with(TUN_INGRESS_BROKEN_PREFIX));
+
+        let unreachable = classify_exhausted_data_plane(
+            Err("delay probe 504".to_string()),
+            tun,
+            Err("proxy CONNECT timeout".to_string()),
+        );
+        assert!(unreachable.starts_with(NODE_OR_CORE_UNREACHABLE_PREFIX));
+    }
+
+    #[test]
+    fn controller_504_is_advisory_but_real_data_plane_remains_mandatory() {
+        use super::{PostLockVerification, classify_post_lock_verification};
+
+        assert_eq!(
+            classify_post_lock_verification(Err("delay probe answered 504 Gateway Timeout".to_string()), Ok(7_u8)),
+            PostLockVerification::Verified {
+                status: 7,
+                controller_warning: Some("delay probe answered 504 Gateway Timeout".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_post_lock_verification::<u8>(Ok(()), Err("real request timed out".to_string())),
+            PostLockVerification::Retry {
+                error: "real request timed out".to_string(),
+            }
+        );
+        let both_failed = classify_post_lock_verification::<u8>(
+            Err("delay probe answered 504 Gateway Timeout".to_string()),
+            Err("HTTPS 204 failed".to_string()),
+        );
+        assert_eq!(
+            both_failed,
+            PostLockVerification::Retry {
+                error: "controller exit measurement failed: delay probe answered 504 Gateway Timeout; real TUN data plane failed: HTTPS 204 failed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn real_data_plane_probes_independent_https_origins() {
+        assert!(
+            TUN_DATA_PLANE_PROBES.len() >= 3,
+            "one provider failure must not decide whether a locked tunnel works"
+        );
+        let mut hosts = BTreeSet::new();
+        for probe in TUN_DATA_PLANE_PROBES {
+            let url = reqwest::Url::parse(probe.url).expect("probe URL must parse");
+            assert_eq!(url.scheme(), "https", "{} must be authenticated TLS", probe.label);
+            hosts.insert(url.host_str().expect("probe URL must carry a host").to_string());
+            assert!(
+                (200..300).contains(&probe.expected_status),
+                "{} must require an exact success status",
+                probe.label
+            );
+        }
+        assert_eq!(
+            hosts.len(),
+            TUN_DATA_PLANE_PROBES.len(),
+            "nominally separate probes must not share an origin"
+        );
+    }
+
+    #[test]
+    fn real_data_plane_failure_names_every_failed_origin() {
+        let failures = vec![
+            "Google: timeout".to_string(),
+            "Cloudflare: connect reset".to_string(),
+            "Apple: status 503".to_string(),
+        ];
+        let error = format_tun_probe_failures(&failures);
+        assert!(error.contains("all 3 independent"));
+        for failure in failures {
+            assert!(error.contains(&failure));
+        }
     }
 
     /// Fail-closed: retrying the checks changes nothing about the decision table. An exhausted
@@ -3088,7 +3712,7 @@ mod tests {
     #[test]
     fn connect_budget_covers_a_cold_first_connect() {
         let accounted: u64 = CONNECT_BUDGET_LEGS.iter().map(|(_, secs)| secs).sum();
-        assert_eq!(accounted, 225, "the table in the doc comment must stay in sync");
+        assert_eq!(accounted, 328, "the table in the doc comment must stay in sync");
         assert!(
             Duration::from_secs(accounted) <= CONNECT_TRANSACTION_TIMEOUT,
             "the accounted cold-connect worst case ({accounted} s) must fit the budget"
@@ -3103,8 +3727,26 @@ mod tests {
         };
         assert!(leg("controller readiness") >= CONTROLLER_READY_TIMEOUT);
         assert!(leg("lock ladder") >= LOCK_RETRY_INTERVAL * LOCK_ATTEMPTS);
-        assert!(leg("checkingExit") >= EXIT_PROBE_STAGE_TIMEOUT);
-        assert!(leg("verifyingTraffic") >= verify_lock_retry_window());
+        assert!(
+            leg("cloud policy (DNS + StartClash #2 + ready/relock)")
+                >= CLOUD_POLICY_RESOLUTION_TIMEOUT
+                    + Duration::from_secs(60)
+                    + CONTROLLER_READY_TIMEOUT
+                    + LOCK_RETRY_INTERVAL * LOCK_ATTEMPTS,
+            "the cloud-policy leg must cover its DNS deadline, second Service start, controller readiness, and relock"
+        );
+        assert!(leg("checkingExit") >= EXIT_PROBE_ADVISORY_BUDGET);
+        assert!(
+            leg("verifyingTraffic") >= verify_lock_retry_window() + TUN_DATA_PLANE_TIMEOUT,
+            "the final stage must budget both WFP status and one real App data-plane request"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants, reason = "these tests exist to pin the constants")]
+    fn tun_data_plane_probe_is_bounded_and_cannot_outlive_its_connect() {
+        assert!(TUN_DATA_PLANE_CONNECT_TIMEOUT < TUN_DATA_PLANE_TIMEOUT);
+        assert!(TUN_DATA_PLANE_TIMEOUT < CONNECT_TRANSACTION_TIMEOUT);
     }
 
     // ---- D1: the release UI budget must match the Service's reality ----
@@ -3616,6 +4258,137 @@ mod tests {
         assert_eq!(
             collect_ipv4_literals(&garbage),
             vec![std::net::Ipv4Addr::new(9, 0, 0, 9)]
+        );
+    }
+
+    #[test]
+    fn controller_error_detail_extracts_redacts_and_caps_mihomo_errors() {
+        assert_eq!(
+            controller_error_detail(r#"{"message":"all DNS requests failed\nAuthorization: Bearer secret-value"}"#),
+            Some("all DNS requests failed Authorization: ***".to_string())
+        );
+        assert_eq!(
+            controller_error_detail(r#"{"error":"GET https://resolver.test/dns-query?token=secret timed out"}"#),
+            Some("GET https://resolver.test/dns-query?*** timed out".to_string())
+        );
+        assert_eq!(controller_error_detail("  \r\n\t"), None);
+        let capped = controller_error_detail(&"x".repeat(600)).expect("non-empty detail");
+        assert_eq!(capped.chars().count(), super::CONTROLLER_ERROR_DETAIL_LIMIT + 1);
+        assert!(capped.ends_with('…'));
+    }
+
+    #[test]
+    fn cloud_dns_retries_only_transient_controller_statuses() {
+        assert!(super::controller_dns_status_is_retryable(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(super::controller_dns_status_is_retryable(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!super::controller_dns_status_is_retryable(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(!super::controller_dns_status_is_retryable(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloud_dns_retries_a_transient_burst_and_reuses_one_client() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                (500, r#"{"message":"temporary burst"}"#),
+                (200, r#"{"Answer":[{"A":"93.184.216.34"}]}"#),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client = super::controller_client(Duration::from_secs(3)).unwrap();
+        let addresses = super::dns_query_a_with_retry(&client, "test-secret", port, "www.example.com")
+            .await
+            .expect("the second controller answer should recover the transient first one");
+        assert_eq!(addresses, [Ipv4Addr::new(93, 184, 216, 34)]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_cloud_dns_500_skips_optional_direct_policy() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let body = r#"{"message":"context deadline exceeded"}"#;
+            for _ in 0..super::CLOUD_DNS_QUERY_ATTEMPTS {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client = super::controller_client(Duration::from_secs(3)).unwrap();
+        let error = super::dns_query_a_with_retry(&client, "test-secret", port, "mmbiz.qpic.cn")
+            .await
+            .expect_err("a persistent controller failure must reject the whole DIRECT plan");
+        server.await.unwrap();
+
+        assert_eq!(
+            super::classify_optional_direct_resolution::<()>(Err(error)),
+            super::OptionalDirectResolution::Skip(
+                "dns query for mmbiz.qpic.cn failed after 3 attempts: dns query for mmbiz.qpic.cn answered 500 Internal Server Error: context deadline exceeded".to_string()
+            )
+        );
+        assert_eq!(
+            super::classify_optional_direct_resolution(Ok(7_u8)),
+            super::OptionalDirectResolution::Ready(7)
+        );
+    }
+
+    #[test]
+    fn windows_direct_policy_does_not_replace_the_proven_full_tunnel_runtime() {
+        assert!(
+            !WINDOWS_OPTIONAL_DIRECT_ENABLED,
+            "re-enable only with transactional rollback and a mainland second-start regression test"
         );
     }
 

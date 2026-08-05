@@ -6,6 +6,8 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, LocalFree,
 };
 #[cfg(not(feature = "test"))]
+use windows_sys::Win32::Foundation::{ERROR_NOT_ALL_ASSIGNED, SetLastError};
+#[cfg(not(feature = "test"))]
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
@@ -13,7 +15,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 #[cfg(not(feature = "test"))]
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, EqualSid, OWNER_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE,
+    AdjustTokenPrivileges, CreateWellKnownSid, EqualSid, LUID_AND_ATTRIBUTES,
+    LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
+    SECURITY_MAX_SID_SIZE, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
     WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Security::{
@@ -26,6 +30,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
     GetFileInformationByHandle, GetFileType, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
+#[cfg(not(feature = "test"))]
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 #[cfg(not(feature = "test"))]
 const PRIVATE_SERVICE_DIRECTORY_SDDL: &str = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
@@ -170,6 +176,15 @@ fn ensure_local_system_owner(handle: *mut std::ffi::c_void, path: &Path) -> Resu
     }
     drop(security);
 
+    // An elevated administrator token contains SeRestorePrivilege but leaves it disabled. Merely
+    // opening the file with WRITE_OWNER is therefore insufficient for assigning LocalSystem as
+    // owner: SetSecurityInfo returns ERROR_INVALID_OWNER (1307). That exact path made the
+    // uninstall helper fail before removing WFP, because its atomic kill-switch tombstone is
+    // created under the administrator token and inherits Builtin Administrators ownership.
+    // Enable the privilege only for this assignment and restore the token state on drop; the
+    // long-running service must not keep a broader token than it needs.
+    let _restore_privilege = RestorePrivilegeGuard::enable()
+        .context("enabling SeRestorePrivilege for LocalSystem owner migration")?;
     let status = unsafe {
         SetSecurityInfo(
             handle,
@@ -187,6 +202,95 @@ fn ensure_local_system_owner(handle: *mut std::ffi::c_void, path: &Path) -> Resu
         );
     }
     Ok(())
+}
+
+/// Scoped SeRestorePrivilege enablement for the one owner migration above.
+///
+/// `AdjustTokenPrivileges` can return success while setting `ERROR_NOT_ALL_ASSIGNED`; treating
+/// that as success would simply turn the original 1307 into a later opaque failure, so both
+/// signals are checked. The previous single-privilege state is restored even when
+/// `SetSecurityInfo` fails.
+#[cfg(not(feature = "test"))]
+struct RestorePrivilegeGuard {
+    token: OwnedHandle,
+    previous: TOKEN_PRIVILEGES,
+}
+
+#[cfg(not(feature = "test"))]
+impl RestorePrivilegeGuard {
+    fn enable() -> Result<Self> {
+        let mut token = std::ptr::null_mut();
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            )
+        } == 0
+            || token.is_null()
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open the current process token");
+        }
+        let token = OwnedHandle(token);
+
+        let mut luid = Default::default();
+        if unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_RESTORE_NAME, &mut luid) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to resolve SeRestorePrivilege");
+        }
+        let desired = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let mut previous = TOKEN_PRIVILEGES::default();
+        let mut previous_len = 0_u32;
+        unsafe { SetLastError(0) };
+        if unsafe {
+            AdjustTokenPrivileges(
+                token.0,
+                0,
+                &desired,
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                &mut previous,
+                &mut previous_len,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to enable SeRestorePrivilege");
+        }
+        let last_error = unsafe { GetLastError() };
+        if last_error == ERROR_NOT_ALL_ASSIGNED {
+            bail!("the elevated process token does not contain SeRestorePrivilege");
+        }
+        if last_error != 0 {
+            bail!("enabling SeRestorePrivilege returned Windows error {last_error}");
+        }
+
+        Ok(Self { token, previous })
+    }
+}
+
+#[cfg(not(feature = "test"))]
+impl Drop for RestorePrivilegeGuard {
+    fn drop(&mut self) {
+        // Best effort: the process is already elevated and the only safe fallback is to exit,
+        // which every current caller does after its maintenance operation.
+        unsafe {
+            AdjustTokenPrivileges(
+                self.token.0,
+                0,
+                &self.previous,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+    }
 }
 
 #[cfg(not(feature = "test"))]

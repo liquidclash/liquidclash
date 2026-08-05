@@ -142,7 +142,12 @@ mod tests {
 
     #[test]
     fn state_key_matches_the_serialized_wire_value() {
-        for state in [StepState::Pending, StepState::Current, StepState::Completed, StepState::Failed] {
+        for state in [
+            StepState::Pending,
+            StepState::Current,
+            StepState::Completed,
+            StepState::Failed,
+        ] {
             let record = StepRecord {
                 key: "preparing",
                 label: "Preparing",

@@ -1,15 +1,23 @@
 //! Per-adapter DNS protection for the Windows kill switch.
 //!
-//! Snapshot every adapter's IPv4/IPv6 `NameServer`/`ProfileNameServer` → point IPv4 at the
-//! loopback resolver (`127.0.0.1`) and leave IPv6 with **no servers at all** → read back what
+//! Snapshot every adapter's IPv4/IPv6 `NameServer`/`ProfileNameServer` → point IPv4 at Mihomo's
+//! TUN-side DNS endpoint (`198.18.0.2`) and leave IPv6 with **no servers at all** → read back what
 //! can be read back (evidence on the way in, a *gate* only on the way out) → restore from the
 //! snapshot on disconnect. The snapshot (`protected-dns.json`) is
 //! written atomically to the service state directory *before* any value is changed — the same
 //! discipline as the kill-switch intent record.
 //!
-//! **Why IPv6 gets an empty server list and not `::1`.** The core listens on
-//! `tono_core::config::DNS_LISTEN` = `127.0.0.1:53` — IPv4 only. Nothing has ever listened on
-//! `[::1]:53`. A build that pointed the IPv6 family at `::1` therefore configured a resolver
+//! **Why IPv4 uses the TUN endpoint instead of the loopback listener.** Mihomo listens on
+//! `127.0.0.1:53`, but with `strict-route` and `dns-hijack` a Windows resolver query addressed
+//! there is reclassified during the loopback/TUN transition and does not reach the listener on
+//! real machines. The pinned core publishes `198.18.0.2` as the DNS endpoint on the Tono
+//! adapter; a real-machine probe proved that endpoint returns fake IPs while an explicit query
+//! to `127.0.0.1` times out. Pointing adapters at the TUN endpoint also makes the security path
+//! unambiguous: the query must traverse the permitted Tono interface, while WFP default-deny
+//! blocks physical DNS.
+//!
+//! **Why IPv6 gets an empty server list and not `::1`.** Nothing listens on `[::1]:53`. A build
+//! that pointed the IPv6 family at `::1` therefore configured a resolver
 //! that never answers, and every system lookup that Windows tried over IPv6 first waited out
 //! its full timeout: the fake-ip readiness probe failed three attempts at 2 s each and connect
 //! died in `securingDNS` on a machine whose DNS was otherwise fine. Nothing was bought for it —
@@ -17,28 +25,28 @@
 //! on `CONNECT_V6` plus the condition-free v6 block-all), so `::1` prevented no leak. The
 //! protected IPv6 state is an empty **static** list ([`NO_NAME_SERVERS`]) — deliberately not
 //! DHCP, which would hand the ISP's resolvers straight back and *would* be a leak — so Windows
-//! falls through to the IPv4 loopback resolver, which answers. `::1` is still *recognised* as a
+//! falls through to the IPv4 TUN resolver, which answers. `::1` is still *recognised* as a
 //! protected/loopback value everywhere on the proof path, because adapters left that way by an
 //! older build must not read as restored.
 //!
-//! **The enable-time read-back is evidence, not a gate.** Applying loopback DNS is a *write*;
+//! **The enable-time read-back is evidence, not a gate.** Applying protected DNS is a *write*;
 //! proving it from Windows is not reliably possible. The registry stores "static, no servers"
 //! and "use DHCP" identically (which is why the IPv6 leg of the read-back was already removed),
 //! and the live apply runs through PowerShell/CIM/netsh, which fails on real machines for
 //! reasons that have nothing to do with whether DNS works: pseudo-adapters, constrained language
 //! mode, EDR hooks, a damaged WMI repository. Gating `enable` on that weak proof killed connects
-//! on machines whose DNS was fine — the last one bailed with "loopback DNS could not be verified
+//! on machines whose DNS was fine — the last one bailed with "protected DNS could not be verified
 //! on every active adapter" at 1.1 s, *before* the strong proof ever ran. So `enable` now
 //! **records** what it could not verify (per-adapter live-apply failures in the snapshot and in
 //! [`LIVE_APPLY_FAILURES`]; the whole round in `DNS_LAST_ERROR` and therefore in the status
 //! payload, behind [`DNS_PROTECTION_UNVERIFIED_PREFIX`]) and returns success, so the connect
 //! reaches the proof that is actually direct: `verify_fake_ip` in the App resolves a name through
 //! the OS and demands an answer in `198.18/16`. Nothing is traded away by demoting the weak
-//! proof, because WFP independently blocks DNS to every non-loopback address on **both** families
-//! (the weight-6 `block-dns` filters plus the condition-free block-alls): a machine whose DNS
-//! configuration cannot be verified cannot leak, it can only fail to resolve — and failing to
-//! resolve is exactly what the fake-ip probe catches, with the recorded note in the status
-//! payload to say why. What stays a hard failure of `enable` is the case where **no per-adapter
+//! proof, because WFP default-denies DNS on the physical interfaces while its verified-TUN
+//! permit admits the `198.18.0.2` path: a machine whose DNS configuration cannot be verified
+//! cannot leak, it can only fail to resolve — and failing to resolve is exactly what the
+//! fake-ip probe catches, with the recorded note in the status payload to say why. What stays a
+//! hard failure of `enable` is the case where **no per-adapter
 //! outcome exists at all** (the adapter enumeration or the apply batch itself errored, or the
 //! record of the round could not be persisted): then there is nothing to restore, nothing to
 //! reconcile, and nothing truthful to report.
@@ -57,7 +65,7 @@
 //!
 //! **Proof is read off the machine as it is now, never off history:** a restore is proven when
 //! the registry read-back matches the snapshot exactly *and* a live read says that nothing on
-//! the machine still resolves through the loopback core. Per-adapter live-apply results are
+//! the machine still resolves through a Tono-owned protected target. Per-adapter live-apply results are
 //! still recorded (in memory and in the snapshot file) and a failed live-apply is still retried
 //! once during restore, but a `live_apply_failed` bit from an earlier round is a reason to
 //! *demand* that live evidence — never a veto over evidence that is already in. It used to be
@@ -92,7 +100,9 @@
 //! operation lock for the lifetime of the service. And a `protected-dns.json` this build cannot
 //! read is recovered from live evidence (`recover_unreadable_snapshot`) rather than turning
 //! the disarm gate into a permanent lockout — but only when nothing on the machine still
-//! resolves through the loopback core.
+//! resolves through a Tono-owned target. A *missing* snapshot is also evidence-checked: if an
+//! adapter still contains `198.18.0.2`, neither a new enable nor disarm may reinterpret it as
+//! the user's original DNS (`DNS_SNAPSHOT_MISSING_PREFIX`).
 //!
 //! The pure snapshot/merge/restore-decision logic in this file is platform-independent and
 //! unit-tested on any host; the registry/CIM/netsh engine is compiled only on Windows.
@@ -107,6 +117,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const ENGINE_LIVE: bool = cfg!(all(windows, not(feature = "test")));
 
+/// Mihomo's DNS endpoint inside the pinned WinTUN `/30`. This is deliberately distinct from
+/// `DNS_LISTEN` (`127.0.0.1:53`): on real Windows, `strict-route` plus DNS hijacking makes the
+/// TUN-side endpoint the only address that answers while WFP is locked.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+pub(crate) const PROTECTED_DNS_V4: &str = "198.18.0.2";
+/// Legacy protected value and a legitimate pre-existing local-resolver value. New protection
+/// never writes it, but restore/recovery must still recognize it without confusing it with the
+/// current TUN DNS endpoint.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 pub(crate) const LOOPBACK_V4: &str = "127.0.0.1";
 /// The IPv6 loopback address. **Recognised, never written.** Nothing listens on `[::1]:53`, so
@@ -127,13 +145,19 @@ const SNAPSHOT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct AdapterDnsSnapshot {
     pub interface_guid: String,
+    /// Runtime-only interface identity from IP Helper. This is used to distinguish the
+    /// currently permitted Tono WinTUN adapter from a physical adapter that was accidentally
+    /// left on our protected DNS endpoint. LUIDs are not stable across reboot/reinstall, so
+    /// they must never become part of the durable recovery snapshot.
+    #[serde(skip)]
+    pub interface_luid: Option<u64>,
     pub ipv4_name_server: Option<String>,
     pub ipv4_profile_name_server: Option<String>,
     pub ipv6_name_server: Option<String>,
     pub ipv6_profile_name_server: Option<String>,
     /// The last CIM live-apply for this adapter failed, so the running resolver cannot be
     /// trusted to match the registry until a retry succeeds. Recorded in memory and in the
-    /// snapshot file. It forces the loopback write to be replayed on the next enable
+    /// snapshot file. It forces the protected-DNS write to be replayed on the next enable
     /// ([`needs_loopback_replay`]) and it is why the restore proof insists on live evidence —
     /// but it does **not** by itself refuse a restore whose live state is verifiably correct
     /// (see [`restore_is_proven`] and the module docs).
@@ -167,7 +191,7 @@ static DNS_LAST_ERROR: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(Non
 // the core and recreating WinTUN every few seconds. A change *we* just made is not a change to
 // the machine's networking underneath us, so it must not be published as one.
 //
-// The window is opened by the two functions that actually write ([`engine_apply_loopback`] and
+// The window is opened by the two functions that actually write ([`engine_apply_protected`] and
 // [`engine_apply_snapshot`]) and by nothing else. It deliberately does **not** cover the
 // enumeration, the read-back or the cache flush, which are reads and are also the slowest part
 // of an `enable` round: keeping them outside is what keeps the window narrow enough that a
@@ -383,12 +407,12 @@ fn format_name_server_list(servers: &[String]) -> String {
     servers.join(",")
 }
 
-/// Whether a read-back value points at the loopback core: loopback only, nothing else.
+/// Whether a saved/read-back value is made only of legacy loopback resolvers.
 ///
-/// This is the *recognition* predicate — "is the machine still resolving through a core that
-/// may no longer be running?" — and it is what the restore-proof path asks. Its meaning must
-/// not drift with the protect path: `::1` still counts, because an adapter left there by an
-/// older build is still pointed at a resolver that never answers.
+/// Deliberately does **not** include the current `198.18.0.2` target. This predicate distinguishes
+/// a user's legitimate pre-existing local resolver (Acrylic/dnscrypt-proxy/Pi-hole) when deciding
+/// which adapters owe live restore proof. The broader [`is_tono_dns_value`] predicate is what
+/// recognises current plus legacy Tono-owned targets on the actual restore path.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 fn is_loopback_value(value: Option<&str>) -> bool {
     let Some(value) = value else {
@@ -399,6 +423,95 @@ fn is_loopback_value(value: Option<&str>) -> bool {
         && servers
             .iter()
             .all(|server| server == LOOPBACK_V4 || server == LOOPBACK_V6)
+}
+
+/// Whether IPv4 reads back exactly as the current protected DNS target. Requiring the complete
+/// list to contain only the TUN endpoint prevents a mixed `198.18.0.2, ISP-DNS` configuration
+/// from being reported as protected.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+fn is_protected_v4_value(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let servers = parse_name_server_list(value);
+    !servers.is_empty() && servers.iter().all(|server| server == PROTECTED_DNS_V4)
+}
+
+/// Whether a registry value contains the current Tono-only DNS endpoint anywhere in its list.
+///
+/// This is intentionally broader than [`is_protected_v4_value`]. A half-restored value such as
+/// `198.18.0.2, 1.1.1.1` is not a valid protected state, but it is still unsafe to capture as the
+/// user's original DNS when the recovery snapshot is missing: after the core stops, the first
+/// address is dead and Windows may wait on it before trying the next one.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+fn contains_current_protected_v4(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        parse_name_server_list(value)
+            .iter()
+            .any(|server| server == PROTECTED_DNS_V4)
+    })
+}
+
+fn adapter_contains_current_protected_dns(adapter: &AdapterDnsSnapshot) -> bool {
+    contains_current_protected_v4(adapter.ipv4_name_server.as_deref())
+        || contains_current_protected_v4(adapter.ipv4_profile_name_server.as_deref())
+}
+
+fn is_current_tunnel_adapter(
+    adapter: &AdapterDnsSnapshot,
+    current_tunnel_luid: Option<u64>,
+) -> bool {
+    current_tunnel_luid.is_some() && adapter.interface_luid == current_tunnel_luid
+}
+
+/// Tono's WinTUN adapter is the route *to* the protected resolver, not a Windows resolver client
+/// that needs to be redirected. Including it would snapshot our own `198.18.0.2` as a user value,
+/// write DNS back onto the tunnel, and make snapshot-less safety checks reject a healthy connect.
+fn without_current_tunnel(
+    adapters: Vec<AdapterDnsSnapshot>,
+    current_tunnel_luid: Option<u64>,
+) -> Vec<AdapterDnsSnapshot> {
+    adapters
+        .into_iter()
+        .filter(|adapter| !is_current_tunnel_adapter(adapter, current_tunnel_luid))
+        .collect()
+}
+
+/// A missing snapshot plus the current TUN DNS endpoint is an orphaned protected state, never a
+/// clean initial state. We cannot reconstruct the user's static/DHCP choice, so fail closed and
+/// tell the operator to restore it instead of recording our own endpoint as the way back.
+fn ensure_snapshotless_adapters_are_safe(adapters: &[AdapterDnsSnapshot]) -> Result<()> {
+    if adapters.iter().any(adapter_contains_current_protected_dns) {
+        bail!(
+            "{DNS_SNAPSHOT_MISSING_PREFIX}: protected-dns.json is missing while an active adapter \
+             still contains Tono's protected DNS target ({PROTECTED_DNS_V4}). Refusing to record \
+             that target as the user's original DNS or to disarm over it. Use Restore Network to \
+             remove the traffic barrier, then in Windows set the affected adapter's DNS server \
+             assignment back to Automatic (DHCP) — or to the servers you use — and retry."
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_snapshotless_dns_is_safe() -> Result<()> {
+    let current = collect_dns_adapters().await?;
+    ensure_snapshotless_adapters_are_safe(&current)
+}
+
+/// Whether a value is still owned by Tono and may become unreachable when the core stops. This
+/// includes the current TUN endpoint and the loopback values written by older builds. Restore
+/// proof uses this broader predicate; snapshot logic still uses [`is_loopback_value`] to retain
+/// a user's legitimate pre-existing local resolver.
+#[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
+fn is_tono_dns_value(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let servers = parse_name_server_list(value);
+    !servers.is_empty()
+        && servers.iter().all(|server| {
+            server == PROTECTED_DNS_V4 || server == LOOPBACK_V4 || server == LOOPBACK_V6
+        })
 }
 
 /// Whether a read-back **IPv6** value is the protected state — the question "is this adapter
@@ -485,20 +598,16 @@ fn read_back_label(read_back: LoopbackReadBack) -> &'static str {
 /// Adapter GUIDs are long; name at most this many in the note and count the rest.
 const UNVERIFIED_NAMED_ADAPTERS: usize = 4;
 
-/// Compose the note for an `enable` round that applied loopback DNS but could not prove it.
+/// Compose the note for an `enable` round that applied protected DNS but could not prove it.
 ///
 /// `None` means the round is clean — every adapter's live apply succeeded and the read-back
 /// either confirmed the state or was never attempted (a build with no engine). Everything else
 /// produces a note that is deliberately *not* an error: it rides in `DNS_LAST_ERROR` and
 /// therefore in the status payload on an otherwise successful enable, so that when the connect
-/// later dies in `verify_fake_ip` with "system DNS lookup exceeded 2s" the diagnostics report and
+/// later dies in `verify_fake_ip` with "system DNS lookup exceeded 5s" the diagnostics report and
 /// the service log already name the real cause. It also states why this is not a leak, because
 /// the next person to read it will ask.
-fn unverified_note(
-    failed: &[String],
-    total: usize,
-    read_back: LoopbackReadBack,
-) -> Option<String> {
+fn unverified_note(failed: &[String], total: usize, read_back: LoopbackReadBack) -> Option<String> {
     if failed.is_empty()
         && matches!(
             read_back,
@@ -521,11 +630,11 @@ fn unverified_note(
         _ => named,
     };
     Some(format!(
-        "{DNS_PROTECTION_UNVERIFIED_PREFIX}: loopback DNS was applied but could not be verified \
+        "{DNS_PROTECTION_UNVERIFIED_PREFIX}: protected DNS ({PROTECTED_DNS_V4}) was applied but could not be verified \
          on {} of {total} adapter(s) — live apply failed on: {adapters}; read-back={}. \
-         Protection was NOT abandoned and this is not a leak: WFP blocks DNS to every \
-         non-loopback address on both address families, so an adapter whose configuration cannot \
-         be verified can only fail to resolve, never resolve past the tunnel. The connect \
+         Protection was NOT abandoned and this is not a leak: WFP default-denies physical DNS \
+         on both address families and permits the verified TUN interface, so an adapter whose \
+         configuration cannot be verified can only fail to resolve, never bypass the tunnel. The connect \
          continues to the fake-ip probe, which resolves a name through the OS and proves the \
          answering resolver directly; if that probe fails (\"system DNS lookup exceeded\"), this \
          is the reason. Automatic reconciliation keeps retrying these adapters.",
@@ -746,9 +855,17 @@ fn accepts_degraded_restore(consecutive_live_failures: u32, registry_matches: bo
 /// code, so the text is part of the exit-code contract and must not drift.
 pub(crate) const DNS_RESTORED_AUTOMATIC_PREFIX: &str = "TONO_DNS_RESTORED_AUTOMATIC";
 
-/// Stable marker for the last rung: the machine could not be taken off the loopback resolver at
-/// all. This is the only DNS state that still blocks an uninstall.
+/// Stable marker for the last DNS rung: the machine could not be taken off Tono's protected DNS
+/// target. Emitted only **after** WFP objects are already deleted. It must never by itself block
+/// uninstall or reinstall — the user can fix DNS in Windows Settings, and cannot conjure back an
+/// uninstaller that refuses to run. `uninstall_service.rs` treats this as continue-with-warning
+/// (same exit family as [`DNS_RESTORED_AUTOMATIC_PREFIX`]).
 pub(crate) const DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX: &str = "TONO_DNS_STILL_ON_LOOPBACK";
+
+/// Stable marker that the WFP barrier is gone even though some DNS step is imperfect. The
+/// emergency-disarm path attaches this to every post-removal DNS error so the uninstaller can
+/// never re-classify "filters removed, DNS messy" as "machine still blocked" (result 3).
+pub(crate) const WFP_REMOVED_CONTINUE_PREFIX: &str = "TONO_WFP_REMOVED";
 
 /// Which rung of the uninstall ladder the evidence lands on. Pure, so the whole decision table
 /// is unit-tested off Windows.
@@ -945,6 +1062,9 @@ pub(crate) const DNS_ENGINE_WEDGED_PREFIX: &str = "TONO_DNS_ENGINE_WEDGED";
 /// Separate from them because the user action differs: this one is resolved by putting the
 /// affected adapters back on automatic (DHCP) DNS, or by the elevated emergency disarm.
 pub(crate) const DNS_SNAPSHOT_UNREADABLE_PREFIX: &str = "TONO_DNS_SNAPSHOT_UNREADABLE";
+/// Stable marker for a deleted recovery snapshot while an adapter still carries the current
+/// Tono-only DNS endpoint. The disarm gate must stay closed until Windows DNS is repaired.
+pub(crate) const DNS_SNAPSHOT_MISSING_PREFIX: &str = "TONO_DNS_SNAPSHOT_MISSING";
 
 /// Stable, App-mappable marker for "the restore was accepted on registry evidence alone after a
 /// sustained live-apply failure" (see [`accepts_degraded_restore`]). It rides in `last_error` on
@@ -952,7 +1072,7 @@ pub(crate) const DNS_SNAPSHOT_UNREADABLE_PREFIX: &str = "TONO_DNS_SNAPSHOT_UNREA
 /// failed operation.
 pub(crate) const DNS_RESTORE_DEGRADED_PREFIX: &str = "TONO_DNS_RESTORE_DEGRADED";
 
-/// Stable, App-mappable marker for "loopback DNS was applied, but the apply or its read-back
+/// Stable, App-mappable marker for "protected DNS was applied, but the apply or its read-back
 /// could not be verified on every adapter". Like [`DNS_RESTORE_DEGRADED_PREFIX`] it rides in
 /// `last_error` on an otherwise **successful** operation, so the App must treat it as a warning
 /// to surface (and to put in the diagnostics report), never as a failed enable. It is the
@@ -965,7 +1085,7 @@ pub(crate) const DNS_PROTECTION_UNVERIFIED_PREFIX: &str = "TONO_DNS_UNVERIFIED";
 /// surrounding `IPC_HANDLER_TIMEOUT` = 60 s more than half its budget to answer the client.
 #[cfg(all(windows, not(feature = "test")))]
 const DNS_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
-/// Budget for a *mutating* call (loopback apply / snapshot restore). Longer than the reading
+/// Budget for a *mutating* call (protected-DNS apply / snapshot restore). Longer than the reading
 /// budget on purpose: this path already contains two internally bounded PowerShell batches
 /// (2 × `engine::POWERSHELL_TIMEOUT` = 20 s) plus the registry sweep, and an outer bound below
 /// its own inner bound would report a merely slow machine as wedged and refuse a restore that
@@ -1074,7 +1194,7 @@ impl Drop for DnsCallClaim {
 /// forever.
 #[cfg(any(all(windows, not(feature = "test")), test))]
 fn dns_call_is_periodic(operation: &str) -> bool {
-    operation == "collect" || operation == "verify loopback"
+    operation == "collect" || operation == "verify protected DNS"
 }
 
 /// Run one DNS engine operation on a blocking thread under a hard deadline, holding the
@@ -1193,11 +1313,20 @@ async fn engine_collect() -> Result<Vec<AdapterDnsSnapshot>> {
     }
     #[cfg(not(all(windows, not(feature = "test"))))]
     {
-        Ok(Vec::new())
+        Ok(test_hooks::collected_adapters())
     }
 }
 
-async fn engine_apply_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<Vec<(String, bool)>> {
+/// Collect only adapters whose Windows resolver configuration Tono owns. The current WinTUN
+/// adapter is identified by the same runtime LUID that the WFP tunnel permit validated; names
+/// and GUID strings are deliberately not trusted for this security boundary.
+async fn collect_dns_adapters() -> Result<Vec<AdapterDnsSnapshot>> {
+    let adapters = engine_collect().await?;
+    let current_tunnel_luid = crate::core::windows_kill_switch::protected_tunnel_luid().await;
+    Ok(without_current_tunnel(adapters, current_tunnel_luid))
+}
+
+async fn engine_apply_protected(adapters: &[AdapterDnsSnapshot]) -> Result<Vec<(String, bool)>> {
     // The only two writers of adapter DNS are this and `engine_apply_snapshot`; both mark the
     // window so `netmon` does not report our own writes as the machine's network changing.
     let _self_write = SelfWriteWindow::open();
@@ -1207,8 +1336,8 @@ async fn engine_apply_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<Vec<(S
             .iter()
             .map(|adapter| adapter.interface_guid.clone())
             .collect::<Vec<_>>();
-        return bounded_dns_call(DNS_APPLY_TIMEOUT, "apply loopback", move || {
-            engine::apply_loopback_set(&guids)
+        return bounded_dns_call(DNS_APPLY_TIMEOUT, "apply protected DNS", move || {
+            engine::apply_protected_set(&guids)
         })
         .await;
     }
@@ -1270,7 +1399,7 @@ async fn engine_apply_snapshot(snapshot: &DnsSnapshot) -> Result<Vec<(String, bo
 /// list in which every entry has all four values absent. "Absent" is what the engine turns into
 /// a registry delete and a DHCP live apply, so this is a precise structural test rather than a
 /// flag that could drift from what is actually applied.
-#[cfg(not(all(windows, not(feature = "test"))))]
+#[cfg(any(test, not(all(windows, not(feature = "test")))))]
 fn is_automatic_reset(snapshot: &DnsSnapshot) -> bool {
     !snapshot.adapters.is_empty()
         && snapshot.adapters.iter().all(|adapter| {
@@ -1288,7 +1417,7 @@ async fn engine_all_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<bool> {
             .iter()
             .map(|adapter| adapter.interface_guid.clone())
             .collect::<Vec<_>>();
-        return bounded_dns_call(DNS_CALL_TIMEOUT, "verify loopback", move || {
+        return bounded_dns_call(DNS_CALL_TIMEOUT, "verify protected DNS", move || {
             engine::all_loopback(&guids)
         })
         .await;
@@ -1300,8 +1429,8 @@ async fn engine_all_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<bool> {
     }
 }
 
-/// Whether any adapter still resolves through the loopback core — "is any of it left?", the
-/// mirror of `engine_all_loopback`'s "is protection complete?".
+/// Whether any adapter still resolves through a current or legacy Tono protected DNS target —
+/// "is any of it left?", the mirror of `engine_all_loopback`'s "is protection complete?".
 ///
 /// Two callers: the snapshot-less recovery, and the restore proof itself, which needs positive
 /// live evidence that the machine is not being left pointed at a core that is about to stop
@@ -1314,7 +1443,7 @@ async fn engine_any_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<bool> {
             .iter()
             .map(|adapter| adapter.interface_guid.clone())
             .collect::<Vec<_>>();
-        return bounded_dns_call(DNS_CALL_TIMEOUT, "detect loopback", move || {
+        return bounded_dns_call(DNS_CALL_TIMEOUT, "detect Tono DNS", move || {
             engine::any_loopback(&guids)
         })
         .await;
@@ -1332,7 +1461,28 @@ async fn engine_any_loopback(adapters: &[AdapterDnsSnapshot]) -> Result<bool> {
 /// Test-only control over the engine answers that are unobservable off Windows.
 #[cfg(any(not(all(windows, not(feature = "test"))), test))]
 pub(crate) mod test_hooks {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::AdapterDnsSnapshot;
+    use std::sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    static COLLECTED_ADAPTERS: LazyLock<Mutex<Vec<AdapterDnsSnapshot>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+
+    pub(crate) fn collected_adapters() -> Vec<AdapterDnsSnapshot> {
+        COLLECTED_ADAPTERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_collected_adapters(adapters: Vec<AdapterDnsSnapshot>) {
+        *COLLECTED_ADAPTERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = adapters;
+    }
 
     static LIVE_DNS_ON_LOOPBACK: AtomicBool = AtomicBool::new(false);
 
@@ -1482,16 +1632,17 @@ async fn quarantine_snapshot(label: &str, reason: &str) -> Result<()> {
 /// across every retry and every reboot — a permanently blocked machine with no in-app way out.
 ///
 /// The way out is evidence, not trust: read the live adapters and demand that *nothing* still
-/// points at the loopback core (and that no live-apply failure is on record). That establishes
+/// points at either Tono's current TUN DNS endpoint or a legacy protected loopback value (and
+/// that no live-apply failure is on record). That establishes
 /// the property the disarm gate actually protects — the machine is not left resolving through a
 /// core that is no longer running — without knowing what the servers used to be. Only then is
 /// the file quarantined.
 ///
-/// Every other outcome (still on loopback, a recorded live failure, or an engine call that
+/// Every other outcome (still on a Tono DNS target, a recorded live failure, or an engine call that
 /// times out on the way to finding out) returns an error: nothing is deleted, nothing is
 /// disarmed, and the message names the two documented ways forward.
 async fn recover_unreadable_snapshot(reason: &str) -> Result<()> {
-    let current = engine_collect().await?;
+    let current = collect_dns_adapters().await?;
     let any_loopback = engine_any_loopback(&current).await?;
     let live_apply_failed = !LIVE_APPLY_FAILURES
         .lock()
@@ -1500,8 +1651,8 @@ async fn recover_unreadable_snapshot(reason: &str) -> Result<()> {
     if !restore_established_without_snapshot(any_loopback, live_apply_failed) {
         bail!(
             "{DNS_SNAPSHOT_UNREADABLE_PREFIX}: protected-dns.json cannot be read ({reason}) and \
-             the machine still resolves through the loopback core \
-             (loopback_dns={any_loopback}, live_apply_failed={live_apply_failed}), so the \
+             the machine still resolves through a Tono protected DNS target \
+             (tono_dns={any_loopback}, live_apply_failed={live_apply_failed}), so the \
              original DNS servers cannot be proven restored and protection stays armed. Set the \
              affected adapters back to automatic (DHCP) DNS — or to the servers you use — and \
              retry the disconnect; the elevated `--emergency-disarm` remains the documented \
@@ -1511,17 +1662,17 @@ async fn recover_unreadable_snapshot(reason: &str) -> Result<()> {
     quarantine_snapshot(
         "corrupt",
         &format!(
-            "protected-dns.json cannot be read ({reason}); no adapter still resolves through the \
-             loopback core, so restoration holds without it and protection starts from a clean \
+            "protected-dns.json cannot be read ({reason}); no adapter still resolves through a \
+             Tono protected DNS target, so restoration holds without it and protection starts from a clean \
              snapshot"
         ),
     )
     .await
 }
 
-/// Snapshot → set loopback → verify. Idempotent: a second call while protected keeps the
-/// original snapshot — but if the adapters are not actually on loopback (a previous enable
-/// died mid-apply), the loopback write is replayed first.
+/// Snapshot → set protected DNS → verify. Idempotent: a second call while protected keeps the
+/// original snapshot — but if the adapters are not actually on the protected endpoint (a
+/// previous enable died mid-apply), the write is replayed first.
 pub(crate) async fn enable() -> Result<DnsProtectionStatus> {
     ensure_supported()?;
     let _operation = DNS_OPERATION.lock().await;
@@ -1581,8 +1732,16 @@ async fn enable_unlocked(trigger: EnableTrigger) -> Result<DnsProtectionStatus> 
     let fresh = DnsSnapshot {
         version: SNAPSHOT_VERSION,
         taken_at: now_unix(),
-        adapters: engine_collect().await?,
+        adapters: collect_dns_adapters().await?,
     };
+    if !snapshot_present {
+        // A recovery file can be deleted independently of the registry (AV quarantine, manual
+        // cleanup, disk corruption). Never turn the TUN endpoint left behind by that event into
+        // the new "original" and make every later disconnect restore to a dead resolver. The
+        // collector has already removed the currently validated WinTUN adapter, so every target
+        // left here belongs to a resolver client that requires a real recovery record.
+        record_outcome(ensure_snapshotless_adapters_are_safe(&fresh.adapters))?;
+    }
     // Health and replay decisions cover adapters that are live now, not historical snapshot
     // entries that have since been disabled or unplugged. Their originals remain in `snapshot`
     // and are still restored in the registry on disconnect.
@@ -1610,7 +1769,7 @@ async fn enable_unlocked(trigger: EnableTrigger) -> Result<DnsProtectionStatus> 
         // is no result to record. `?` on purpose — with nothing applied there is nothing to
         // restore and nothing for the watchdog to reconcile, and a status that claimed
         // "protected" would be a lie. A wedged engine (`DNS_ENGINE_WEDGED_PREFIX`) surfaces here.
-        let live = engine_apply_loopback(&snapshot.adapters).await?;
+        let live = engine_apply_protected(&snapshot.adapters).await?;
         note_apply_round(live.iter().any(|(_, ok)| !ok));
         note_live_results(&mut snapshot, &live);
         // Hard failure #2: the record of the round could not be persisted. Persist both failures
@@ -1630,12 +1789,14 @@ async fn enable_unlocked(trigger: EnableTrigger) -> Result<DnsProtectionStatus> 
         // same connect transaction. Both outcomes — and a read that could not be performed at
         // all — are recorded and reported instead of aborting the connect.
         let read_back = if ENGINE_LIVE {
-            match engine_collect().await {
+            match collect_dns_adapters().await {
                 Ok(active_after_apply) => match engine_all_loopback(&active_after_apply).await {
                     Ok(true) => LoopbackReadBack::Verified,
                     Ok(false) => LoopbackReadBack::Contradicted,
                     Err(error) => {
-                        tracing::warn!("dns: the loopback read-back could not be run: {error:#}");
+                        tracing::warn!(
+                            "dns: the protected-DNS read-back could not be run: {error:#}"
+                        );
                         LoopbackReadBack::Unavailable
                     }
                 },
@@ -1688,6 +1849,10 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
     let bytes = match tokio::fs::read(snapshot_path()).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Absence alone is not proof of a clean state: the file and the adapter registry are
+            // separate writes. Refuse to stop the core/disarm if the current TUN DNS endpoint
+            // survived while its recovery record did not.
+            record_outcome(ensure_snapshotless_dns_is_safe().await)?;
             return status_unlocked().await;
         }
         Err(error) => return Err(error.into()),
@@ -1723,11 +1888,11 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
         // adapters at all, which would make the comparison vacuous, so off Windows the
         // snapshot's own entries stand in and the live evidence below is what decides.
         let current = if ENGINE_LIVE {
-            engine_collect().await?
+            collect_dns_adapters().await?
         } else {
             snapshot.adapters.clone()
         };
-        // The live half: is anything on this machine still pointed at the loopback core? This is
+        // The live half: is anything on this machine still pointed at a Tono DNS target? This is
         // the same evidence the corrupt-snapshot recovery runs on, and it is what replaced the
         // `live_apply_failed` veto — a stale flag from an earlier round now makes us insist on
         // this read, instead of overruling it.
@@ -1750,13 +1915,13 @@ pub(crate) async fn restore_protected() -> Result<DnsProtectionStatus> {
             let registry = registry_restore_matches(&snapshot, &current);
             let loopback = live_loopback_label(live_loopback);
             if live_loopback == Some(true) {
-                // Provably still on loopback: refused before the degraded exit is even
+                // Provably still on a Tono DNS target: refused before the degraded exit is even
                 // considered. No failure streak may release protection while the machine would
                 // be left resolving through a core that is about to stop answering — that is
                 // the ordering invariant the disarm gate exists to hold.
                 bail!(
                     "DNS restore could not be proven: adapters on this machine still resolve \
-                     through Tono's loopback resolver (registry_match={registry}, \
+                     through Tono's protected DNS target (registry_match={registry}, \
                      still_on_loopback={loopback}, \
                      consecutive_live_apply_failures={streak}), so protection stays armed rather \
                      than leaving DNS pointed at a resolver that is about to stop answering. \
@@ -1849,7 +2014,7 @@ async fn uninstall_reset_targets() -> Result<Vec<String>> {
     }
     // `saved_dns_was_loopback` is just "any of the four values is a loopback resolver"; here it
     // is asked of a *live* read rather than of saved originals.
-    Ok(engine_collect()
+    Ok(collect_dns_adapters()
         .await?
         .iter()
         .filter(|adapter| saved_dns_was_loopback(adapter))
@@ -1861,8 +2026,9 @@ async fn uninstall_reset_targets() -> Result<Vec<String>> {
 ///
 /// Rung 1 is [`restore_protected`], unchanged and unrelaxed. If it cannot prove itself, rung 2
 /// writes automatic (DHCP) DNS for both families over the adapters Tono redirected and verifies
-/// the machine is off the loopback core; rung 3 is the `Err`, and is the only DNS state that may
-/// still block an uninstall.
+/// the machine is off the loopback core; rung 3 is the `Err` (still on protected DNS). Rung 3 is
+/// reported to the detail log so the user can flip DNS in Windows Settings, but it no longer
+/// blocks uninstall/reinstall: WFP is already gone by the time the uninstaller classifies it.
 ///
 /// This function is never on the Disconnect / release / quit path. `restore_protected`,
 /// `ensure_restored` and `windows_kill_switch::disarm_unlocked` keep the strict proof: while the
@@ -1944,7 +2110,7 @@ pub(crate) async fn restore_for_uninstall() -> Result<UninstallDnsRestore> {
             let note = format!(
                 "{DNS_RESTORED_AUTOMATIC_PREFIX}: the saved DNS servers could not be proven \
                  restored ({exact_error:#}), so {} adapter(s) were set back to automatic (DHCP) \
-                 for both IPv4 and IPv6 and verified off Tono's loopback resolver \
+                 for both IPv4 and IPv6 and verified off Tono's protected DNS target \
                  (dhcp_apply_ok={automatic_apply_ok}, still_on_loopback={}). The machine gets \
                  its DNS from the network again; this is not the exact previous configuration, \
                  which is the accepted trade at uninstall time.",
@@ -1979,7 +2145,7 @@ pub(crate) async fn restore_for_uninstall() -> Result<UninstallDnsRestore> {
             // and one change in Windows' own network settings makes the next run take rung 2.
             bail!(
                 "{DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX}: this machine could not be taken off \
-                 Tono's loopback DNS resolver. The exact restore failed ({exact_error:#}) and \
+                 Tono's protected DNS target. The exact restore failed ({exact_error:#}) and \
                  the automatic (DHCP) fallback did not verify either \
                  (dhcp_apply_ok={automatic_apply_ok}, still_on_loopback={}). The network barrier \
                  has already been removed, so the machine is no longer blocked — only name \
@@ -1999,11 +2165,10 @@ pub(crate) async fn ensure_restored() -> Result<()> {
     if !SUPPORTED {
         return Ok(());
     }
-    match tokio::fs::metadata(snapshot_path()).await {
-        Ok(_) => restore_protected().await.map(|_| ()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    // `restore_protected` owns the operation lock and now proves the snapshot-less case too.
+    // A metadata fast path here used to let a deleted file open the disarm gate even while an
+    // adapter still pointed at 198.18.0.2.
+    restore_protected().await.map(|_| ())
 }
 
 pub(crate) async fn status() -> DnsProtectionStatus {
@@ -2173,7 +2338,7 @@ async fn status_unlocked() -> Result<DnsProtectionStatus> {
         Some(_snapshot) if ENGINE_LIVE => {
             // Include adapters that appeared since the last enable. Checking only saved GUIDs can
             // report a false healthy state while a fresh adapter still uses an external resolver.
-            let current = engine_collect().await?;
+            let current = collect_dns_adapters().await?;
             engine_all_loopback(&current).await?
         }
         Some(snapshot) => engine_all_loopback(&snapshot.adapters).await?,
@@ -2216,7 +2381,10 @@ fn is_active_dns_adapter(oper_status: i32, if_type: u32, has_bound_ip: bool) -> 
 
 #[cfg(all(windows, not(feature = "test")))]
 mod engine {
-    use super::{AdapterDnsSnapshot, DnsSnapshot, is_active_dns_adapter, is_loopback_value};
+    use super::{
+        AdapterDnsSnapshot, DnsSnapshot, is_active_dns_adapter, is_protected_v4_value,
+        is_tono_dns_value,
+    };
     use anyhow::{Context as _, Result, bail};
     use std::ffi::CStr;
     use windows_sys::Win32::Foundation::{
@@ -2373,6 +2541,9 @@ mod engine {
     #[derive(Debug, Clone)]
     pub(super) struct ActiveAdapter {
         pub guid: String,
+        /// Runtime interface identity. Unlike a GUID string or friendly name, this is the exact
+        /// identity used by the WFP tunnel permit for the current core instance.
+        pub luid: u64,
         /// IPv4 interface index, or 0 when IPv4 is not bound (nothing to apply or prove).
         pub ipv4_index: u32,
         /// IPv6 interface index, or 0 when IPv6 is not bound.
@@ -2431,6 +2602,9 @@ mod engine {
                 // SAFETY: the anonymous union's `IfIndex` member is always initialised by
                 // `GetAdaptersAddresses`; reading a `u32` out of it is valid for any bit pattern.
                 let ipv4_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+                // SAFETY: `GetAdaptersAddresses` initializes the `NET_LUID_LH` union for every
+                // returned adapter; reading its `u64` representation is valid for any bit pattern.
+                let luid = unsafe { adapter.Luid.Value };
                 let ipv6_index = adapter.Ipv6IfIndex;
                 let has_bound_ip =
                     !adapter.FirstUnicastAddress.is_null() && (ipv4_index != 0 || ipv6_index != 0);
@@ -2447,6 +2621,7 @@ mod engine {
                     {
                         adapters.push(ActiveAdapter {
                             guid: guid.to_owned(),
+                            luid,
                             ipv4_index,
                             ipv6_index,
                         });
@@ -2475,9 +2650,10 @@ mod engine {
         format!(r"{TCPIP6_INTERFACES}\{guid}")
     }
 
-    fn read_adapter(guid: &str) -> Result<AdapterDnsSnapshot> {
+    fn read_adapter(guid: &str, interface_luid: Option<u64>) -> Result<AdapterDnsSnapshot> {
         Ok(AdapterDnsSnapshot {
             interface_guid: guid.to_owned(),
+            interface_luid,
             ipv4_name_server: read_sz(&v4_key(guid), NAME_SERVER)?,
             ipv4_profile_name_server: read_sz(&v4_key(guid), PROFILE_NAME_SERVER)?,
             ipv6_name_server: read_sz(&v6_key(guid), NAME_SERVER)?,
@@ -2489,7 +2665,7 @@ mod engine {
     pub(super) fn collect_adapters() -> Result<Vec<AdapterDnsSnapshot>> {
         active_adapters()?
             .iter()
-            .map(|adapter| read_adapter(&adapter.guid))
+            .map(|adapter| read_adapter(&adapter.guid, Some(adapter.luid)))
             .collect()
     }
 
@@ -2513,8 +2689,8 @@ mod engine {
     ///   resolver pointing at the ISP while the registry read-back still said "protected".
     /// * The script then *reads the live list back per family* (`Get-DnsClientServerAddress`)
     ///   and only reports success when what it reads matches what it applied — exactly the
-    ///   loopback list for IPv4 and exactly *nothing* for IPv6 when protecting, and "the
-    ///   loopback address is gone" when restoring
+    ///   TUN DNS address for IPv4 and exactly *nothing* for IPv6 when protecting, and "no
+    ///   unsaved Tono-owned DNS address remains" when restoring
     ///   (a restored family's servers may legitimately come back from DHCP in another order).
     ///   A family with no live DNS instance, an interface index of 0, or a CIM `ReturnValue` of
     ///   84 ("IP not enabled on adapter") is a non-participant: there is no resolver on it to
@@ -2542,10 +2718,11 @@ mod engine {
     /// What the live read-back has to prove.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ApplyMode {
-        /// Protecting: the family's live list must be *exactly* what was applied — the loopback
+        /// Protecting: the family's live list must be *exactly* what was applied — the TUN DNS
         /// address for IPv4, and nothing at all for IPv6.
-        Loopback,
-        /// Restoring: the family's live list must no longer contain the loopback address.
+        Protect,
+        /// Restoring: the family's live list must no longer contain a Tono-owned address that
+        /// was not itself part of the user's saved resolver list.
         /// Exact equality is the registry's job (`restore_is_proven`), and DHCP may legitimately
         /// return the saved servers in another order or with an extra suffix server.
         ///
@@ -2687,6 +2864,7 @@ mod engine {
     /// The per-family apply and the per-family live read-back, shared by every entry in the
     /// batch. Kept as one prelude so the generated script stays one short line per adapter:
     /// the `-Command` argument has a hard length limit and a machine can carry many adapters.
+    const PROTECTED_DNS_V4_TOKEN: &str = "__TONO_PROTECTED_DNS_V4__";
     const SCRIPT_PRELUDE: &str = r#"$global:fails = @()
 $global:skips = @()
 function Test-Family($index, $family, $want, $restoring) {
@@ -2694,9 +2872,11 @@ function Test-Family($index, $family, $want, $restoring) {
   $entry = Get-DnsClientServerAddress -InterfaceIndex $index -AddressFamily $family -ErrorAction SilentlyContinue
   if ($null -eq $entry) { return $true }
   $have = @($entry.ServerAddresses)
-  $loop = if ($family -eq 'IPv4') { '127.0.0.1' } else { '::1' }
+  $owned = if ($family -eq 'IPv4') { @('__TONO_PROTECTED_DNS_V4__', '127.0.0.1') } else { @('::1') }
   if ($restoring) {
-    foreach ($s in $have) { if ($s -eq $loop) { return $false } }
+    foreach ($s in $have) {
+      if (($owned -contains $s) -and ($null -eq $want -or -not ($want -contains $s))) { return $false }
+    }
     return $true
   }
   if ($null -eq $want) { return $true }
@@ -2769,7 +2949,7 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
 
     fn live_apply_batch(entries: &[LiveApplyEntry], mode: ApplyMode) -> Vec<(String, bool)> {
         let restoring = mode == ApplyMode::Restore;
-        let mut script = String::from(SCRIPT_PRELUDE);
+        let mut script = SCRIPT_PRELUDE.replace(PROTECTED_DNS_V4_TOKEN, super::PROTECTED_DNS_V4);
         let mut rejected: std::collections::BTreeSet<String> = Default::default();
         for entry in entries {
             let servers_ok =
@@ -2910,18 +3090,18 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
 
     /// `guid` is the caller's spelling — per-adapter results are matched back against the
     /// snapshot by exact string — while `active` only supplies the live interface indices.
-    fn apply_loopback(guid: &str, active: &ActiveAdapter) -> Result<LiveApplyEntry> {
+    fn apply_protected(guid: &str, active: &ActiveAdapter) -> Result<LiveApplyEntry> {
         if key_exists(&v4_key(guid))? {
-            write_sz(&v4_key(guid), NAME_SERVER, super::LOOPBACK_V4)?;
-            write_sz(&v4_key(guid), PROFILE_NAME_SERVER, super::LOOPBACK_V4)?;
+            write_sz(&v4_key(guid), NAME_SERVER, super::PROTECTED_DNS_V4)?;
+            write_sz(&v4_key(guid), PROFILE_NAME_SERVER, super::PROTECTED_DNS_V4)?;
         }
         if key_exists(&v6_key(guid))? {
-            // Empty, not `::1`: the core listens on `127.0.0.1:53` only, so an adapter pointed
-            // at `::1` has a configured IPv6 resolver that never answers and every system
+            // Empty, not `::1`: an adapter pointed at `::1` has a configured IPv6 resolver that
+            // never answers and every system
             // lookup pays the full OS timeout before falling back — the `securingDNS` failure
             // this replaced. Empty is also not the same as *deleting* the value: deletion means
             // DHCP, which would hand the ISP's IPv6 resolvers back and would be a real leak.
-            // With no IPv6 servers Windows uses the IPv4 loopback resolver, which answers.
+            // With no IPv6 servers Windows uses the IPv4 TUN resolver, which answers.
             write_sz(&v6_key(guid), NAME_SERVER, super::NO_NAME_SERVERS)?;
             write_sz(&v6_key(guid), PROFILE_NAME_SERVER, super::NO_NAME_SERVERS)?;
         }
@@ -2930,14 +3110,14 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
             ipv4_index: active.ipv4_index,
             ipv6_index: active.ipv6_index,
             // One family per list: the IPv4 mechanism never sees an IPv6 address and the IPv6
-            // mechanism never sees `127.0.0.1`, and each is proven on its own family.
-            ipv4_servers: Some(vec![super::LOOPBACK_V4.to_owned()]),
+            // mechanism never sees the IPv4 TUN endpoint, and each is proven on its own family.
+            ipv4_servers: Some(vec![super::PROTECTED_DNS_V4.to_owned()]),
             // `Some(empty)` = a static list with no servers; `None` would mean DHCP.
             ipv6_servers: Some(Vec::new()),
         })
     }
 
-    pub(super) fn apply_loopback_set(guids: &[String]) -> Result<Vec<(String, bool)>> {
+    pub(super) fn apply_protected_set(guids: &[String]) -> Result<Vec<(String, bool)>> {
         let active = active_adapter_map()?;
         // An adapter that is no longer active has no live resolver to point anywhere.
         let mut results = guids
@@ -2952,9 +3132,9 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
                     .get(&guid.to_ascii_uppercase())
                     .map(|adapter| (guid, adapter))
             })
-            .map(|(guid, adapter)| apply_loopback(guid, adapter))
+            .map(|(guid, adapter)| apply_protected(guid, adapter))
             .collect::<Result<Vec<_>>>()?;
-        results.extend(live_apply_with_retry(entries, ApplyMode::Loopback));
+        results.extend(live_apply_with_retry(entries, ApplyMode::Protect));
         Ok(results)
     }
 
@@ -3019,17 +3199,17 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
         Ok(live_results)
     }
 
-    /// Whether *any* adapter still points at the loopback resolver — the mirror image of
+    /// Whether *any* adapter still points at a Tono-owned resolver — the mirror image of
     /// [`all_loopback`], and the only evidence the snapshot-less recovery path has. Deliberately
     /// checks every value of both families: one leftover `ProfileNameServer` is enough to leave
     /// the machine resolving through a core that is no longer running.
     pub(super) fn any_loopback(guids: &[String]) -> Result<bool> {
         for guid in guids {
-            let adapter = read_adapter(guid)?;
-            if is_loopback_value(adapter.ipv4_name_server.as_deref())
-                || is_loopback_value(adapter.ipv4_profile_name_server.as_deref())
-                || is_loopback_value(adapter.ipv6_name_server.as_deref())
-                || is_loopback_value(adapter.ipv6_profile_name_server.as_deref())
+            let adapter = read_adapter(guid, None)?;
+            if is_tono_dns_value(adapter.ipv4_name_server.as_deref())
+                || is_tono_dns_value(adapter.ipv4_profile_name_server.as_deref())
+                || is_tono_dns_value(adapter.ipv6_name_server.as_deref())
+                || is_tono_dns_value(adapter.ipv6_profile_name_server.as_deref())
             {
                 return Ok(true);
             }
@@ -3038,19 +3218,19 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
     }
 
     /// Whether every adapter is in the protected state. The two families do not answer the same
-    /// question: IPv4 must be on the loopback resolver, while IPv6 must have **no servers at
+    /// question: IPv4 must be on the TUN resolver, while IPv6 must have **no servers at
     /// all** — that is what the protect path writes, and reading it as drift would have the
     /// watchdog rewrite the registry every two seconds for ever.
     pub(super) fn all_loopback(guids: &[String]) -> Result<bool> {
         for guid in guids {
-            let adapter = read_adapter(guid)?;
+            let adapter = read_adapter(guid, None)?;
             // Each present family must be fully protected — NameServer and, when set,
             // ProfileNameServer (which overrides NameServer for the active profile). An absent
             // family is skipped, matching the apply side.
             if key_exists(&v4_key(guid))?
-                && (!is_loopback_value(adapter.ipv4_name_server.as_deref())
+                && (!is_protected_v4_value(adapter.ipv4_name_server.as_deref())
                     || (adapter.ipv4_profile_name_server.is_some()
-                        && !is_loopback_value(adapter.ipv4_profile_name_server.as_deref())))
+                        && !is_protected_v4_value(adapter.ipv4_profile_name_server.as_deref())))
             {
                 return Ok(false);
             }
@@ -3058,7 +3238,7 @@ function Set-AdapterDns($g, $i4, $i6, $v4, $v6, $restoring) {
             // and Windows stores that the same way it stores "use DHCP" — an absent or empty
             // `NameServer` — so the registry cannot tell the two apart and a read-back can
             // never prove it. Making it a gate is what turned a machine with a perfectly good
-            // v4 loopback resolver into `Failed to enable protected DNS`. It is also
+            // v4 TUN resolver into `Failed to enable protected DNS`. It is also
             // unnecessary: v6 DNS to a physical resolver is blocked by the weight-6 v6 DNS
             // filter and the v6 block-all, so an unprovable v6 state is a resolution failure
             // at worst, never a leak, and the fake-ip probe proves the resolver that answers.
@@ -3107,6 +3287,62 @@ mod tests {
         assert!(!is_loopback_value(Some("1.1.1.1")));
         assert!(!is_loopback_value(Some("")));
         assert!(!is_loopback_value(None));
+    }
+
+    #[test]
+    fn protected_tun_dns_detection_is_exact_and_restore_safe() {
+        assert!(is_protected_v4_value(Some(PROTECTED_DNS_V4)));
+        assert!(is_tono_dns_value(Some(PROTECTED_DNS_V4)));
+        assert!(
+            is_tono_dns_value(Some(LOOPBACK_V4)),
+            "restore must recognize the redirect written by older builds"
+        );
+        assert!(!is_protected_v4_value(Some(LOOPBACK_V4)));
+        assert!(!is_protected_v4_value(Some("198.18.0.2, 1.1.1.1")));
+        assert!(!is_tono_dns_value(Some("198.18.0.2, 1.1.1.1")));
+        assert!(!is_protected_v4_value(None));
+    }
+
+    #[test]
+    fn a_missing_snapshot_recognises_exact_and_partial_current_redirects() {
+        assert!(contains_current_protected_v4(Some(PROTECTED_DNS_V4)));
+        assert!(
+            contains_current_protected_v4(Some("198.18.0.2, 1.1.1.1")),
+            "a partial restore is still unsafe to capture as the user's original"
+        );
+        assert!(!contains_current_protected_v4(Some(LOOPBACK_V4)));
+        assert!(!contains_current_protected_v4(Some("1.1.1.1, 8.8.8.8")));
+        assert!(!contains_current_protected_v4(None));
+
+        let mut profile_only = adapter("{A}", None);
+        profile_only.ipv4_profile_name_server = Some(PROTECTED_DNS_V4.to_owned());
+        assert!(adapter_contains_current_protected_dns(&profile_only));
+        assert!(ensure_snapshotless_adapters_are_safe(&[profile_only]).is_err());
+        assert!(
+            ensure_snapshotless_adapters_are_safe(&[adapter("{LOCAL}", Some(LOOPBACK_V4))]).is_ok(),
+            "a user's pre-existing local resolver must remain a valid snapshot-less state"
+        );
+
+        let mut tunnel = adapter("{TONO-TUN}", Some(PROTECTED_DNS_V4));
+        tunnel.interface_luid = Some(42);
+        assert!(
+            ensure_snapshotless_adapters_are_safe(std::slice::from_ref(&tunnel)).is_err(),
+            "the raw safety check never guesses that an endpoint belongs to Tono"
+        );
+        let only_tunnel = without_current_tunnel(vec![tunnel.clone()], Some(42));
+        assert!(
+            only_tunnel.is_empty(),
+            "the WFP-validated current WinTUN adapter is excluded before snapshot or proof"
+        );
+
+        let mut physical = adapter("{ETHERNET}", Some(PROTECTED_DNS_V4));
+        physical.interface_luid = Some(43);
+        let physical_only = without_current_tunnel(vec![tunnel, physical], Some(42));
+        assert_eq!(physical_only.len(), 1);
+        assert!(
+            ensure_snapshotless_adapters_are_safe(&physical_only).is_err(),
+            "excluding the tunnel must not hide the same orphaned endpoint on a physical adapter"
+        );
     }
 
     /// The IPv6 half of the `securingDNS` regression. Nothing listens on `[::1]:53`
@@ -3161,7 +3397,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             taken_at: 2,
             adapters: vec![
-                adapter("{A}", Some(LOOPBACK_V4)),
+                adapter("{A}", Some(PROTECTED_DNS_V4)),
                 adapter("{NEW}", Some("9.9.9.9")),
             ],
         };
@@ -3191,8 +3427,8 @@ mod tests {
         let restored = vec![adapter("{A}", Some("1.1.1.1")), adapter("{B}", None)];
         assert!(restore_is_proven(&snapshot, &restored, Some(false)));
 
-        let still_loopback = vec![adapter("{A}", Some(LOOPBACK_V4)), adapter("{B}", None)];
-        assert!(!restore_is_proven(&snapshot, &still_loopback, Some(true)));
+        let still_protected = vec![adapter("{A}", Some(PROTECTED_DNS_V4)), adapter("{B}", None)];
+        assert!(!restore_is_proven(&snapshot, &still_protected, Some(true)));
 
         let wrong_server = vec![adapter("{A}", Some("8.8.8.8")), adapter("{B}", None)];
         assert!(!restore_is_proven(&snapshot, &wrong_server, Some(false)));
@@ -3251,7 +3487,7 @@ mod tests {
 
         // An adapter that appeared after the snapshot owes the proof: nothing says it was on
         // loopback of its own accord.
-        let with_new = vec![adapter("{NEW}", Some(LOOPBACK_V4))];
+        let with_new = vec![adapter("{NEW}", Some(PROTECTED_DNS_V4))];
         assert_eq!(adapters_owing_live_proof(&snapshot, &with_new).len(), 1);
     }
 
@@ -3259,6 +3495,7 @@ mod tests {
     fn live_restore_uses_profile_overrides_and_keeps_the_families_apart() {
         let saved = AdapterDnsSnapshot {
             interface_guid: "{DUAL}".to_owned(),
+            interface_luid: None,
             ipv4_name_server: Some("1.1.1.1".to_owned()),
             ipv4_profile_name_server: Some("8.8.8.8, 8.8.4.4".to_owned()),
             ipv6_name_server: Some("2606:4700:4700::1111".to_owned()),
@@ -3433,6 +3670,7 @@ mod tests {
             taken_at: 42,
             adapters: vec![AdapterDnsSnapshot {
                 interface_guid: "{GUID}".to_owned(),
+                interface_luid: None,
                 ipv4_name_server: Some("1.1.1.1,8.8.8.8".to_owned()),
                 ipv4_profile_name_server: None,
                 ipv6_name_server: Some("2606:4700:4700::1111".to_owned()),
@@ -3607,9 +3845,9 @@ mod tests {
         assert!(!is_automatic_reset(&empty));
     }
 
-    /// The two markers the uninstaller and the installer key off. `uninstall_service.rs`
-    /// duplicates the rung-2 literal (it cannot see a `pub(crate)` constant), so a rename on
-    /// either side silently turns rung 2 back into a refusal.
+    /// Markers the uninstaller keys off. `uninstall_service.rs` duplicates the literals (it
+    /// cannot see `pub(crate)` constants), so a rename on either side silently turns a
+    /// continue-with-warning path back into result 3.
     #[test]
     fn the_ladder_markers_are_stable_across_the_binary_boundary() {
         assert_eq!(DNS_RESTORED_AUTOMATIC_PREFIX, "TONO_DNS_RESTORED_AUTOMATIC");
@@ -3617,6 +3855,7 @@ mod tests {
             DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX,
             "TONO_DNS_STILL_ON_LOOPBACK"
         );
+        assert_eq!(WFP_REMOVED_CONTINUE_PREFIX, "TONO_WFP_REMOVED");
         assert_ne!(DNS_RESTORED_AUTOMATIC_PREFIX, DNS_RESTORE_DEGRADED_PREFIX);
     }
 
@@ -3677,6 +3916,49 @@ mod tests {
             tokio::fs::metadata(&snapshot).await.is_err(),
             "no snapshot file may be written by the reconciler"
         );
+        Ok(())
+    }
+
+    /// The snapshot and registry are separate writes. If antivirus/manual cleanup removes the
+    /// former while the latter still carries 198.18.0.2, neither Connect nor Disconnect may
+    /// reinterpret that Tono-only address as the user's original resolver or open the WFP gate.
+    #[tokio::test]
+    #[serial]
+    async fn an_orphaned_current_dns_target_cannot_be_snapshotted_or_disarmed() -> Result<()> {
+        reset_dns_state().await;
+        test_hooks::set_collected_adapters(vec![adapter("{A}", Some(PROTECTED_DNS_V4))]);
+
+        let enable_error = enable()
+            .await
+            .expect_err("an orphaned Tono endpoint is not a clean initial state");
+        let enable_message = format!("{enable_error:#}");
+        assert!(
+            enable_message.contains(DNS_SNAPSHOT_MISSING_PREFIX),
+            "{enable_message}"
+        );
+        assert!(
+            tokio::fs::metadata(snapshot_path()).await.is_err(),
+            "the TUN endpoint must never be persisted as the original DNS"
+        );
+
+        let disarm_error = ensure_restored()
+            .await
+            .expect_err("missing recovery evidence must keep the disarm gate closed");
+        let disarm_message = format!("{disarm_error:#}");
+        assert!(
+            disarm_message.contains(DNS_SNAPSHOT_MISSING_PREFIX),
+            "{disarm_message}"
+        );
+        assert!(
+            disarm_message.contains("Automatic (DHCP)"),
+            "{disarm_message}"
+        );
+
+        // Once Windows DNS is repaired, the snapshot-less disarm path is clean again.
+        test_hooks::set_collected_adapters(vec![adapter("{A}", Some("192.168.31.1"))]);
+        ensure_restored().await?;
+
+        reset_dns_state().await;
         Ok(())
     }
 
@@ -3789,6 +4071,7 @@ mod tests {
         test_hooks::set_live_dns_on_loopback(false);
         test_hooks::set_live_apply_fails(false);
         test_hooks::set_apply_batch_unavailable(false);
+        test_hooks::set_collected_adapters(Vec::new());
         // The tail of an earlier test's write window would otherwise still be running.
         SELF_WRITE_TAIL_UNTIL.store(0, Ordering::Relaxed);
     }
@@ -3839,7 +4122,7 @@ mod tests {
         assert!(note.contains("{A}") && note.contains("{B}"), "{note}");
         assert!(note.contains("read-back=not-protected"), "{note}");
         assert!(
-            note.contains("WFP blocks DNS") && note.contains("fake-ip"),
+            note.contains("WFP default-denies physical DNS") && note.contains("fake-ip"),
             "the note has to explain why this is not a leak and where the real proof is: {note}"
         );
 
@@ -3848,7 +4131,9 @@ mod tests {
         assert!(unreadable.contains("read-back=unreadable"), "{unreadable}");
 
         let many = unverified_note(
-            &(0..9).map(|index| format!("{{G{index}}}")).collect::<Vec<_>>(),
+            &(0..9)
+                .map(|index| format!("{{G{index}}}"))
+                .collect::<Vec<_>>(),
             9,
             LoopbackReadBack::Verified,
         )

@@ -242,8 +242,7 @@ mod imp {
                 }
                 let elapsed = anchor().elapsed().as_millis() as u64;
                 let quiet = elapsed.saturating_sub(LAST_RAW_MILLIS.load(Ordering::Relaxed));
-                let pending_for =
-                    elapsed.saturating_sub(FIRST_RAW_MILLIS.load(Ordering::Relaxed));
+                let pending_for = elapsed.saturating_sub(FIRST_RAW_MILLIS.load(Ordering::Relaxed));
                 if super::debounce_should_fire(quiet, pending_for)
                     && PENDING_RAW.swap(false, Ordering::AcqRel)
                 {
@@ -260,6 +259,8 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     #[test]
     fn events_are_recorded_and_bounded() {
         for index in 0..(super::MAX_RECORDED_EVENTS + 8) {
@@ -271,13 +272,16 @@ mod tests {
         assert!(super::change_count() >= super::MAX_RECORDED_EVENTS as u64);
     }
 
-    /// The P0: a DNS write of ours must not reach the product-facing feed, and the moment the
-    /// write is over the feed must be back.
+    /// The P0: a DNS write of ours must not reach the product-facing feed, and dropping the
+    /// guard must give the write depth back. The short asynchronous tail is covered by the
+    /// pure decision test in `dns`.
     #[test]
+    #[serial]
     fn our_own_dns_writes_are_not_published_as_network_changes() {
-        assert!(
-            super::raw_should_publish(),
-            "with no DNS write in flight every notification is the machine's"
+        assert_eq!(
+            crate::core::dns::self_write_depth_for_tests(),
+            0,
+            "the test must start without a DNS write in flight"
         );
         {
             let _window = crate::core::dns::open_self_write_window_for_tests();

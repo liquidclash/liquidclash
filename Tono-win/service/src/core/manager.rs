@@ -178,7 +178,7 @@ impl ChildGuard {
         // seam the retry's fail-closed branch — the one that keeps a possibly-live core tracked
         // and tells the caller the stop did not happen — would be untestable, and an untestable
         // branch is how the self-deadlock this retry now avoids survived in the first place.
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if tests::kill_failure_is_simulated() {
             anyhow::bail!("simulated: core termination could not be confirmed");
         }

@@ -10,9 +10,8 @@ pub use structure::{
     ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, ProxyEndpoint, ProxyProtocol, RemoteProvider,
     RuntimeAsset, RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
     ServiceLifecycleState, ServiceOperationKind, ServiceOperationSnapshot, ServiceStatusSnapshot,
-    StageRejection, StageRuntimeOutcome,
-    StartClashRequest, StartClashResult, StopClashOptions, StopClashPayload, WriterConfig,
-    owner_key,
+    StageRejection, StageRuntimeOutcome, StartClashRequest, StartClashResult, StopClashOptions,
+    StopClashPayload, WriterConfig, owner_key,
 };
 
 pub mod paths;
@@ -41,9 +40,9 @@ mod manager;
 #[cfg(all(feature = "standalone", windows))]
 mod netmon;
 #[cfg(feature = "standalone")]
-mod owner;
-#[cfg(feature = "standalone")]
 mod operation;
+#[cfg(feature = "standalone")]
+mod owner;
 #[cfg(feature = "standalone")]
 mod process;
 #[cfg(feature = "standalone")]
@@ -92,7 +91,10 @@ pub use desired::{
     restore_desired_state,
 };
 #[cfg(feature = "standalone")]
-pub use dns::{initialize_status_cache as initialize_protected_dns_status, spawn_status_watchdog as spawn_protected_dns_watchdog};
+pub use dns::{
+    initialize_status_cache as initialize_protected_dns_status,
+    spawn_status_watchdog as spawn_protected_dns_watchdog,
+};
 #[cfg(feature = "standalone")]
 pub use macos_kill_switch::{
     add_restored_kill_switch_tunnel, emergency_disarm_kill_switch, restore_kill_switch,
@@ -126,7 +128,8 @@ pub use test_credentials::test_owner_credentials;
 pub use test_credentials::test_owner_credentials_for_uid;
 #[cfg(feature = "standalone")]
 pub use windows_kill_switch::{
-    emergency_disarm_windows_kill_switch, relock_restored_tunnel,
+    emergency_disarm_windows_kill_switch, prepare_for_service_replacement, relock_restored_tunnel,
+    residual_filters_present, restore_on_service_start as restore_windows_kill_switch,
     retire_unverified_on_service_start as retire_unverified_windows_kill_switch,
-    restore_on_service_start as restore_windows_kill_switch, spawn_windows_kill_switch_watchdog,
+    spawn_windows_kill_switch_watchdog,
 };

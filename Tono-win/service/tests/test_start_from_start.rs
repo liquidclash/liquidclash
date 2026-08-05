@@ -130,7 +130,7 @@ mod tests {
                 proposed_session_token: proposed_session_token.clone(),
                 macos_proxy: None,
                 kill_switch: None,
-            windows_kill_switch: None,
+                windows_kill_switch: None,
             },
         )
         .await

@@ -12,8 +12,10 @@
 //! rule lives in a *single* sublayer (Mullvad-style): "weighted permits over a low block-all"
 //! only holds when filter weight is the sole ordering axis. A second, higher-weight sublayer
 //! carrying a match-all block would decide every packet before any permit here is consulted.
-//! Persistence is still reserved for the condition-free block-all pair, which is what survives
-//! a reboot; everything else is rebuilt on service start.
+//! Persistence is still reserved for the condition-free block-all filters, which are what
+//! survive a reboot; everything else is rebuilt on service start. Both ALE authorization and
+//! outbound-transport layers are covered: ALE denies new unauthorized flows, while the
+//! per-packet transport floor terminates flows that predate a policy transition.
 
 use crate::core::structure::{KillSwitchStatusMode, ProxyEndpoint, ProxyProtocol};
 use std::net::IpAddr;
@@ -41,7 +43,7 @@ impl Guid {
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 pub const TONO_WFP_PROVIDER_KEY: Guid = Guid::from_u128(0x2f7c9d41_8b3e_4a6c_9d52_1e7f0a4b6c8d);
 /// The single `tono-kill-switch` sublayer every rule lives in (see the arbitration note in the
-/// module docs). Persistent, so the fail-closed block-all pair it contains survives reboot.
+/// module docs). Persistent, so its fail-closed block-all filters survive reboot.
 #[cfg_attr(any(not(windows), feature = "test"), allow(dead_code))]
 pub const TONO_WFP_SUBLAYER_KEY: Guid = Guid::from_u128(0x2f7c9d42_8b3e_4a6c_9d52_1e7f0a4b6c8d);
 
@@ -52,9 +54,7 @@ pub const TONO_WFP_SUBLAYER_WEIGHT: u16 = 1000;
 pub const WEIGHT_HARD_PERMIT: u64 = 8;
 /// Infrastructure permits: floor DHCP/NDP, bootstrap API channel.
 pub const WEIGHT_INFRA_PERMIT: u64 = 7;
-/// Session hard DNS block (non-loopback port 53).
-pub const WEIGHT_DNS_BLOCK: u64 = 6;
-/// Both block-alls: the intent floor's persistent pair and the session's redundant pair.
+/// All block-alls: the intent floor's persistent set and the session's redundant set.
 pub const WEIGHT_BLOCK_ALL: u64 = 1;
 
 /// Resolved API host IPs are a bounded, public-only set before they ever reach WFP.
@@ -68,8 +68,11 @@ pub const MAX_API_HOST_IPS: usize = 8;
 /// older build's stale filter instead of replacing it. Bumping remaps every key, so the
 /// upgrade path cleanly removes the entire old set and installs the new one.
 /// (v1: `…9e00…` dual-sublayer; v2: `…9e01…` single-sublayer; v3: `…9e02…`
-/// port-scoped DHCP with no global NTP bypass.)
-const FILTER_NAMESPACE: u128 = 0x2f7c_9e02_0000_4a6c_0000_0000_0000_0000;
+/// port-scoped DHCP with no global NTP bypass; v4: `…9e03…` ALE-only loopback matching;
+/// v5: `…9e04…` hard address-or-ALE loopback permits; v6: `…9e05…` no redundant
+/// port-53 block over the default-deny floor; v7: `…9e06…` per-packet outbound-transport
+/// enforcement so pre-existing TCP/QUIC flows cannot survive a connect transition.)
+const FILTER_NAMESPACE: u128 = 0x2f7c_9e06_0000_4a6c_0000_0000_0000_0000;
 
 const fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -91,6 +94,8 @@ pub enum LayerKind {
     AleAuthConnectV4,
     AleAuthConnectV6,
     AleAuthRecvAcceptV6,
+    OutboundTransportV4,
+    OutboundTransportV6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,9 +139,15 @@ pub enum Condition {
         min: u16,
         max: u16,
     },
+    /// Loopback as classified by ALE. At `ALE_AUTH_CONNECT`, Windows exposes loopback through
+    /// `FWPM_CONDITION_FLAGS` (`IS_APPCONTAINER_LOOPBACK` or
+    /// `IS_NON_APPCONTAINER_LOOPBACK`). Matching only `IP_REMOTE_ADDRESS = 127/8` is not
+    /// equivalent on the real layer, so the rule table retains independent address and ALE
+    /// permits rather than assuming either representation is universal.
+    AleLoopback,
     /// `FwpmGetAppIdFromFileName` blob of the staged core binary; resolved by the engine.
     AleAppId,
-    /// WinTUN adapter LUID.
+    /// WinTUN adapter LUID. Available at both ALE connect and outbound transport.
     LocalInterface(u64),
 }
 
@@ -148,7 +159,11 @@ pub struct FilterSpec {
     pub weight: u64,
     pub action: FilterAction,
     pub conditions: Vec<Condition>,
-    /// Only the intent floor's condition-free block-all pair is persistent — Proton's rule
+    /// Render this permit with `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`. Loopback infrastructure
+    /// needs a hard permit so a later filtering provider cannot veto local control traffic;
+    /// Internet endpoint and tunnel permits intentionally remain soft.
+    pub hard_permit: bool,
+    /// Only the intent floor's condition-free block-all set is persistent — Proton's rule
     /// that persistence is reserved for condition-free blocking.
     pub persistent: bool,
 }
@@ -190,20 +205,30 @@ fn spec(
         weight,
         action,
         conditions,
+        hard_permit: false,
         persistent,
     }
 }
 
-/// The persistent fail-closed floor: loopback, DHCP, and NDP permits over a persistent
-/// block-all pair. No volatile conditions, so the set never changes while armed.
+fn hard_permit(mut filter: FilterSpec) -> FilterSpec {
+    debug_assert_eq!(filter.action, FilterAction::Permit);
+    filter.hard_permit = true;
+    filter
+}
+
+/// The persistent fail-closed floor: address-or-ALE loopback, DHCP, and NDP permits over
+/// persistent ALE and outbound-transport block-alls. The independent loopback paths are
+/// deliberate: real Windows has exposed controller connections through address matching and
+/// DNS through ALE classification. Transport layers do not expose the ALE loopback flag, so
+/// their loopback permits use the literal loopback address ranges only.
 pub fn intent_floor() -> Vec<FilterSpec> {
     use Condition as C;
     use FilterAction as A;
     use LayerKind as L;
     vec![
-        spec(
-            "intent/permit-loopback-v4".into(),
-            "intent permit loopback v4",
+        hard_permit(spec(
+            "intent/permit-loopback-address-v4".into(),
+            "intent permit loopback address v4",
             L::AleAuthConnectV4,
             WEIGHT_HARD_PERMIT,
             A::Permit,
@@ -212,10 +237,10 @@ pub fn intent_floor() -> Vec<FilterSpec> {
                 prefix: 8,
             }],
             false,
-        ),
-        spec(
-            "intent/permit-loopback-v6".into(),
-            "intent permit loopback v6",
+        )),
+        hard_permit(spec(
+            "intent/permit-loopback-address-v6".into(),
+            "intent permit loopback address v6",
             L::AleAuthConnectV6,
             WEIGHT_HARD_PERMIT,
             A::Permit,
@@ -224,11 +249,66 @@ pub fn intent_floor() -> Vec<FilterSpec> {
                 prefix: 128,
             }],
             false,
-        ),
+        )),
+        hard_permit(spec(
+            "intent/permit-loopback-ale-v4".into(),
+            "intent permit loopback ALE v4",
+            L::AleAuthConnectV4,
+            WEIGHT_HARD_PERMIT,
+            A::Permit,
+            vec![C::AleLoopback],
+            false,
+        )),
+        hard_permit(spec(
+            "intent/permit-loopback-ale-v6".into(),
+            "intent permit loopback ALE v6",
+            L::AleAuthConnectV6,
+            WEIGHT_HARD_PERMIT,
+            A::Permit,
+            vec![C::AleLoopback],
+            false,
+        )),
+        hard_permit(spec(
+            "intent/permit-loopback-transport-v4".into(),
+            "intent permit loopback transport v4",
+            L::OutboundTransportV4,
+            WEIGHT_HARD_PERMIT,
+            A::Permit,
+            vec![C::RemoteAddressV4 {
+                addr: [127, 0, 0, 0],
+                prefix: 8,
+            }],
+            false,
+        )),
+        hard_permit(spec(
+            "intent/permit-loopback-transport-v6".into(),
+            "intent permit loopback transport v6",
+            L::OutboundTransportV6,
+            WEIGHT_HARD_PERMIT,
+            A::Permit,
+            vec![C::RemoteAddressV6 {
+                addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                prefix: 128,
+            }],
+            false,
+        )),
         spec(
             "intent/permit-dhcp-v4".into(),
             "intent permit DHCP v4",
             L::AleAuthConnectV4,
+            WEIGHT_INFRA_PERMIT,
+            A::Permit,
+            vec![
+                C::Protocol(IpProtocol::Udp),
+                C::LocalPort(68),
+                C::RemotePort(67),
+            ],
+            false,
+        ),
+        spec(
+            "intent/permit-dhcp-transport-v4".into(),
+            "intent permit DHCP transport v4",
+            L::OutboundTransportV4,
             WEIGHT_INFRA_PERMIT,
             A::Permit,
             vec![
@@ -252,9 +332,34 @@ pub fn intent_floor() -> Vec<FilterSpec> {
             false,
         ),
         spec(
+            "intent/permit-dhcp-transport-v6".into(),
+            "intent permit DHCPv6 transport client to server",
+            L::OutboundTransportV6,
+            WEIGHT_INFRA_PERMIT,
+            A::Permit,
+            vec![
+                C::Protocol(IpProtocol::Udp),
+                C::LocalPort(546),
+                C::RemotePort(547),
+            ],
+            false,
+        ),
+        spec(
             "intent/permit-ndp-out".into(),
             "intent permit NDP outbound",
             L::AleAuthConnectV6,
+            WEIGHT_INFRA_PERMIT,
+            A::Permit,
+            vec![
+                C::Protocol(IpProtocol::IcmpV6),
+                C::IcmpV6TypeRange { min: 133, max: 137 },
+            ],
+            false,
+        ),
+        spec(
+            "intent/permit-ndp-transport-out".into(),
+            "intent permit NDP outbound transport",
+            L::OutboundTransportV6,
             WEIGHT_INFRA_PERMIT,
             A::Permit,
             vec![
@@ -293,6 +398,24 @@ pub fn intent_floor() -> Vec<FilterSpec> {
             vec![],
             true,
         ),
+        spec(
+            "intent/block-all-transport-v4".into(),
+            "intent block all transport v4",
+            L::OutboundTransportV4,
+            WEIGHT_BLOCK_ALL,
+            A::Block,
+            vec![],
+            true,
+        ),
+        spec(
+            "intent/block-all-transport-v6".into(),
+            "intent block all transport v6",
+            L::OutboundTransportV6,
+            WEIGHT_BLOCK_ALL,
+            A::Block,
+            vec![],
+            true,
+        ),
     ]
 }
 
@@ -325,10 +448,17 @@ fn remote_address_condition(ip: IpAddr) -> Condition {
     }
 }
 
-fn layer_for(ip: IpAddr) -> LayerKind {
+fn ale_layer_for(ip: IpAddr) -> LayerKind {
     match ip {
         IpAddr::V4(_) => LayerKind::AleAuthConnectV4,
         IpAddr::V6(_) => LayerKind::AleAuthConnectV6,
+    }
+}
+
+fn transport_layer_for(ip: IpAddr) -> LayerKind {
+    match ip {
+        IpAddr::V4(_) => LayerKind::OutboundTransportV4,
+        IpAddr::V6(_) => LayerKind::OutboundTransportV6,
     }
 }
 
@@ -341,23 +471,43 @@ pub fn session_rules(config: &RuleConfig) -> Vec<FilterSpec> {
     let mut filters = Vec::new();
 
     // A: the Tono-specific narrowing — the staged core may reach exactly the selected
-    // endpoint, nothing else on the Internet.
+    // endpoint, nothing else on the Internet. ALE provides the app identity boundary for new
+    // flows. Outbound transport has no app-id condition, so its paired exact-tuple permit is
+    // intentionally narrower but still required: it lets the authorized core's packets pass
+    // the per-packet floor while stale flows to every other destination are terminated.
     for endpoint in &config.endpoints {
         let Some((ip, port, protocol)) = parse_endpoint(endpoint) else {
             continue;
         };
         filters.push(spec(
             format!(
-                "session/permit-endpoint/{}/{ip}/{port}/{}",
+                "session/permit-endpoint/ale/{}/{ip}/{port}/{}",
                 config.app_path,
                 protocol.number()
             ),
-            "session permit core endpoint",
-            layer_for(ip),
+            "session permit core endpoint ALE",
+            ale_layer_for(ip),
             WEIGHT_HARD_PERMIT,
             A::Permit,
             vec![
                 C::AleAppId,
+                remote_address_condition(ip),
+                C::Protocol(protocol),
+                C::RemotePort(port),
+            ],
+            false,
+        ));
+        filters.push(spec(
+            format!(
+                "session/permit-endpoint/transport/{}/{ip}/{port}/{}",
+                config.app_path,
+                protocol.number()
+            ),
+            "session permit core endpoint transport",
+            transport_layer_for(ip),
+            WEIGHT_HARD_PERMIT,
+            A::Permit,
+            vec![
                 remote_address_condition(ip),
                 C::Protocol(protocol),
                 C::RemotePort(port),
@@ -371,7 +521,12 @@ pub fn session_rules(config: &RuleConfig) -> Vec<FilterSpec> {
     if config.mode == KillSwitchStatusMode::Locked
         && let Some(luid) = config.tun_luid
     {
-        for layer in [L::AleAuthConnectV4, L::AleAuthConnectV6] {
+        for layer in [
+            L::AleAuthConnectV4,
+            L::AleAuthConnectV6,
+            L::OutboundTransportV4,
+            L::OutboundTransportV6,
+        ] {
             filters.push(spec(
                 format!("session/permit-tunnel/{layer:?}/{luid}"),
                 "session permit tunnel interface",
@@ -388,19 +543,24 @@ pub fn session_rules(config: &RuleConfig) -> Vec<FilterSpec> {
     // again in blocked mode as the recovery channel.
     if config.mode != KillSwitchStatusMode::Locked {
         for ip in &config.api_host_ips {
-            filters.push(spec(
-                format!("session/permit-api/{ip}"),
-                "session permit bootstrap API",
-                layer_for(*ip),
-                WEIGHT_INFRA_PERMIT,
-                A::Permit,
-                vec![
-                    remote_address_condition(*ip),
-                    C::Protocol(IpProtocol::Tcp),
-                    C::RemotePort(443),
-                ],
-                false,
-            ));
+            for (surface, layer) in [
+                ("ale", ale_layer_for(*ip)),
+                ("transport", transport_layer_for(*ip)),
+            ] {
+                filters.push(spec(
+                    format!("session/permit-api/{surface}/{ip}"),
+                    "session permit bootstrap API",
+                    layer,
+                    WEIGHT_INFRA_PERMIT,
+                    A::Permit,
+                    vec![
+                        remote_address_condition(*ip),
+                        C::Protocol(IpProtocol::Tcp),
+                        C::RemotePort(443),
+                    ],
+                    false,
+                ));
+            }
         }
     }
 
@@ -422,43 +582,44 @@ pub fn session_rules(config: &RuleConfig) -> Vec<FilterSpec> {
             let Some((ip, port, protocol)) = parse_endpoint(endpoint) else {
                 continue;
             };
-            filters.push(spec(
-                format!("session/permit-direct/{ip}/{port}/{}", protocol.number()),
-                "session permit approved DIRECT",
-                layer_for(ip),
-                WEIGHT_HARD_PERMIT,
-                A::Permit,
-                vec![
-                    remote_address_condition(ip),
-                    C::Protocol(protocol),
-                    C::RemotePort(port),
-                ],
-                false,
-            ));
+            for (surface, layer) in [
+                ("ale", ale_layer_for(ip)),
+                ("transport", transport_layer_for(ip)),
+            ] {
+                filters.push(spec(
+                    format!(
+                        "session/permit-direct/{surface}/{ip}/{port}/{}",
+                        protocol.number()
+                    ),
+                    "session permit approved DIRECT",
+                    layer,
+                    WEIGHT_HARD_PERMIT,
+                    A::Permit,
+                    vec![
+                        remote_address_condition(ip),
+                        C::Protocol(protocol),
+                        C::RemotePort(port),
+                    ],
+                    false,
+                ));
+            }
         }
     }
 
-    // D: defense-in-depth hard DNS block. The floor's weight-8 loopback permit still wins for
-    // 127.0.0.1/::1, so this blocks exactly non-loopback DNS.
-    for layer in [L::AleAuthConnectV4, L::AleAuthConnectV6] {
-        for protocol in [IpProtocol::Udp, IpProtocol::Tcp] {
-            filters.push(spec(
-                format!("session/block-dns/{layer:?}/{}", protocol.number()),
-                "session block DNS",
-                layer,
-                WEIGHT_DNS_BLOCK,
-                A::Block,
-                vec![C::Protocol(protocol), C::RemotePort(53)],
-                false,
-            ));
-        }
-    }
-
-    // E: redundant block-all, always present while armed. Never persistent — persistence is
-    // reserved for the condition-free floor pair. Note non-persistent filters still outlive
+    // E: redundant block-all, always present while armed. This default-deny floor already blocks
+    // physical DNS unless a more specific permit matches. Do not add a separate port-53 block:
+    // Windows resolver traffic starts at 127.0.0.1 and can transition to the TUN address, and a
+    // terminating block action overrides the legitimate loopback/TUN path on real machines.
+    // Never persistent — persistence is
+    // reserved for the condition-free floor set. Note non-persistent filters still outlive
     // the process in BFE's runtime store (until BFE restarts); only the PERSISTENT floor
     // survives a BFE restart or reboot, and service start reconciles the rest by key.
-    for layer in [L::AleAuthConnectV4, L::AleAuthConnectV6] {
+    for layer in [
+        L::AleAuthConnectV4,
+        L::AleAuthConnectV6,
+        L::OutboundTransportV4,
+        L::OutboundTransportV6,
+    ] {
         filters.push(spec(
             format!("session/block-all/{layer:?}"),
             "session block all",
@@ -620,9 +781,14 @@ mod tests {
             KillSwitchStatusMode::Blocked,
         ] {
             let filters = expected_filters(&config(mode));
-            // The persistent floor pair and the redundant session pair both exist, so every
-            // connect layer ends in a condition-free block in every mode.
-            for layer in [LayerKind::AleAuthConnectV4, LayerKind::AleAuthConnectV6] {
+            // The persistent floor and redundant session floor both exist, so every outbound
+            // authorization and per-packet layer ends in a condition-free block in every mode.
+            for layer in [
+                LayerKind::AleAuthConnectV4,
+                LayerKind::AleAuthConnectV6,
+                LayerKind::OutboundTransportV4,
+                LayerKind::OutboundTransportV6,
+            ] {
                 let block_alls = filters
                     .iter()
                     .filter(|filter| {
@@ -634,7 +800,7 @@ mod tests {
                     .count();
                 assert_eq!(
                     block_alls, 2,
-                    "{mode:?}: missing block-all pair in {layer:?}"
+                    "{mode:?}: missing persistent/session block-all set in {layer:?}"
                 );
             }
         }
@@ -647,7 +813,7 @@ mod tests {
             .iter()
             .filter(|filter| filter.persistent)
             .collect::<Vec<_>>();
-        assert_eq!(persistent.len(), 2);
+        assert_eq!(persistent.len(), 4);
         assert!(
             persistent.iter().all(|filter| {
                 filter.action == FilterAction::Block && filter.conditions.is_empty()
@@ -691,12 +857,13 @@ mod tests {
                     .contains(&Condition::LocalInterface(0x1234_5678))
             })
             .count();
-        assert_eq!(tun_permits, 2, "tunnel permit on v4 and v6 connect layers");
+        assert_eq!(
+            tun_permits, 4,
+            "tunnel permit on v4/v6 ALE and outbound transport layers"
+        );
         assert!(
             !filters.iter().any(|filter| {
-                filter.action == FilterAction::Permit
-                    && filter.conditions.contains(&Condition::RemotePort(443))
-                    && !filter.conditions.contains(&Condition::AleAppId)
+                filter.action == FilterAction::Permit && filter.name.contains("bootstrap API")
             }),
             "locked must retract the bootstrap API channel"
         );
@@ -716,34 +883,55 @@ mod tests {
                 .flat_map(|filter| filter.conditions.iter())
                 .any(|condition| matches!(condition, Condition::LocalInterface(_)))
         );
-        // The endpoint permit (A) and DNS block (D) stay up while blocked.
+        // The endpoint permit (A) stays up while blocked; default deny covers all other traffic.
         assert!(has_condition(&filters, &Condition::AleAppId));
-        assert_eq!(
-            filters
-                .iter()
-                .filter(|filter| filter.weight == WEIGHT_DNS_BLOCK)
-                .count(),
-            4
-        );
+        assert!(!filters.iter().any(|filter| {
+            filter.action == FilterAction::Block
+                && filter.conditions.contains(&Condition::RemotePort(53))
+        }));
     }
 
     #[test]
     fn endpoint_permit_is_app_scoped_and_exact() {
         let filters = expected_filters(&config(KillSwitchStatusMode::Bootstrap));
-        let permits = filters
+        let ale_permits = filters
             .iter()
             .filter(|filter| filter.conditions.contains(&Condition::AleAppId))
             .collect::<Vec<_>>();
-        assert_eq!(permits.len(), 1, "only the selected endpoint is permitted");
-        let conditions = &permits[0].conditions;
+        assert_eq!(
+            ale_permits.len(),
+            1,
+            "only the selected endpoint is app-authorized"
+        );
+        let conditions = &ale_permits[0].conditions;
         assert!(conditions.contains(&Condition::RemoteAddressV4 {
             addr: [8, 8, 8, 8],
             prefix: 32
         }));
         assert!(conditions.contains(&Condition::RemotePort(443)));
         assert!(conditions.contains(&Condition::Protocol(IpProtocol::Tcp)));
-        assert_eq!(permits[0].weight, WEIGHT_HARD_PERMIT);
-        assert!(!permits[0].persistent);
+        assert_eq!(ale_permits[0].weight, WEIGHT_HARD_PERMIT);
+        assert!(!ale_permits[0].persistent);
+
+        let transport_permits = filters
+            .iter()
+            .filter(|filter| {
+                filter.layer == LayerKind::OutboundTransportV4
+                    && filter.name.contains("core endpoint transport")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transport_permits.len(), 1);
+        assert_eq!(
+            transport_permits[0].conditions,
+            [
+                Condition::RemoteAddressV4 {
+                    addr: [8, 8, 8, 8],
+                    prefix: 32,
+                },
+                Condition::Protocol(IpProtocol::Tcp),
+                Condition::RemotePort(443),
+            ]
+        );
     }
 
     #[test]
@@ -761,7 +949,7 @@ mod tests {
         // Upgrade safety: the key-only diff adopts anything with a matching key, so the
         // namespace must change whenever the rule tables do. Pin the current marker (see the
         // constant's doc comment); any rule-table change must bump it and this pin.
-        assert_eq!(FILTER_NAMESPACE >> 64, 0x2f7c_9e02_0000_4a6c);
+        assert_eq!(FILTER_NAMESPACE >> 64, 0x2f7c_9e06_0000_4a6c);
     }
 
     #[test]
@@ -786,8 +974,8 @@ mod tests {
             &before.iter().map(|filter| filter.key).collect::<Vec<_>>(),
             &after,
         );
-        assert_eq!(plan.install.len(), 1);
-        assert_eq!(plan.remove.len(), 1);
+        assert_eq!(plan.install.len(), 2);
+        assert_eq!(plan.remove.len(), 2);
     }
 
     #[test]
@@ -1029,6 +1217,7 @@ mod tests {
         layer: LayerKind,
         protocol: IpProtocol,
         remote_ip: IpAddr,
+        ale_loopback: bool,
         local_port: Option<u16>,
         remote_port: u16,
         icmp_type: Option<u16>,
@@ -1037,10 +1226,12 @@ mod tests {
     }
 
     fn packet(layer: LayerKind, protocol: IpProtocol, ip: &str, port: u16) -> Packet {
+        let remote_ip: IpAddr = ip.parse().unwrap();
         Packet {
             layer,
             protocol,
-            remote_ip: ip.parse().unwrap(),
+            ale_loopback: remote_ip.is_loopback(),
+            remote_ip,
             local_port: None,
             remote_port: port,
             icmp_type: None,
@@ -1083,6 +1274,7 @@ mod tests {
             Condition::IcmpV6TypeRange { min, max } => packet
                 .icmp_type
                 .is_some_and(|ty| (*min..=*max).contains(&ty)),
+            Condition::AleLoopback => packet.ale_loopback,
             Condition::AleAppId => packet.app_id_matches,
             Condition::LocalInterface(luid) => packet.local_interface == Some(*luid),
         }
@@ -1295,6 +1487,75 @@ mod tests {
     }
 
     #[test]
+    fn loopback_permits_cover_address_and_ale_paths_as_hard_actions() {
+        let filters = intent_floor();
+        let loopback_permits = filters
+            .iter()
+            .filter(|filter| filter.name.contains("permit loopback"))
+            .collect::<Vec<_>>();
+        assert_eq!(loopback_permits.len(), 6);
+        assert!(
+            loopback_permits
+                .iter()
+                .all(|filter| filter.hard_permit && filter.action == FilterAction::Permit)
+        );
+        assert_eq!(
+            loopback_permits
+                .iter()
+                .filter(|filter| filter.conditions == [Condition::AleLoopback])
+                .count(),
+            2
+        );
+        assert!(loopback_permits.iter().any(|filter| {
+            filter.conditions
+                == [Condition::RemoteAddressV4 {
+                    addr: [127, 0, 0, 0],
+                    prefix: 8,
+                }]
+        }));
+        assert!(loopback_permits.iter().any(|filter| {
+            filter.conditions
+                == [Condition::RemoteAddressV6 {
+                    addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    prefix: 128,
+                }]
+        }));
+
+        // Address matching preserves the controller path observed on real Windows.
+        let mut unclassified = packet(
+            LayerKind::AleAuthConnectV4,
+            IpProtocol::Udp,
+            "127.0.0.1",
+            53,
+        );
+        unclassified.ale_loopback = false;
+        assert_eq!(
+            arbitrate(
+                &expected_filters(&config(KillSwitchStatusMode::Locked)),
+                &unclassified
+            ),
+            FilterAction::Permit
+        );
+
+        // ALE classification independently preserves redirected/local DNS even when the
+        // address view at this layer is not a literal loopback address.
+        let mut classified = packet(
+            LayerKind::AleAuthConnectV4,
+            IpProtocol::Udp,
+            "192.168.31.1",
+            53,
+        );
+        classified.ale_loopback = true;
+        assert_eq!(
+            arbitrate(
+                &expected_filters(&config(KillSwitchStatusMode::Locked)),
+                &classified
+            ),
+            FilterAction::Permit
+        );
+    }
+
+    #[test]
     fn arbitration_endpoint_permit_requires_the_staged_app_id() {
         let filters = expected_filters(&config(KillSwitchStatusMode::Bootstrap));
         let mut packet = packet(LayerKind::AleAuthConnectV4, IpProtocol::Tcp, "8.8.8.8", 443);
@@ -1305,6 +1566,60 @@ mod tests {
             arbitrate(&filters, &packet),
             FilterAction::Block,
             "another binary must not inherit the endpoint permit"
+        );
+    }
+
+    #[test]
+    fn outbound_transport_terminates_preexisting_physical_flows() {
+        let filters = expected_filters(&config(KillSwitchStatusMode::Locked));
+
+        // This models the reported regression: Chromium opened HTTP/3 before Tono connected,
+        // so no new ALE authorization occurred after lock. Every later QUIC datagram still
+        // reaches outbound transport and must be denied on the physical interface.
+        let stale_quic = packet(
+            LayerKind::OutboundTransportV4,
+            IpProtocol::Udp,
+            "9.9.9.9",
+            443,
+        );
+        assert_eq!(
+            arbitrate(&filters, &stale_quic),
+            FilterAction::Block,
+            "a pre-authorized physical QUIC flow must not survive lock"
+        );
+
+        let mut tunneled_quic = stale_quic;
+        tunneled_quic.local_interface = Some(0x1234_5678);
+        assert_eq!(
+            arbitrate(&filters, &tunneled_quic),
+            FilterAction::Permit,
+            "the replacement flow on WinTUN must remain usable"
+        );
+
+        let core_transport = packet(
+            LayerKind::OutboundTransportV4,
+            IpProtocol::Tcp,
+            "8.8.8.8",
+            443,
+        );
+        assert_eq!(
+            arbitrate(&filters, &core_transport),
+            FilterAction::Permit,
+            "the ALE-authorized core still needs an exact transport path to its proxy"
+        );
+
+        assert!(
+            filters
+                .iter()
+                .filter(|filter| matches!(
+                    filter.layer,
+                    LayerKind::OutboundTransportV4 | LayerKind::OutboundTransportV6
+                ))
+                .all(|filter| !filter.conditions.iter().any(|condition| matches!(
+                    condition,
+                    Condition::AleAppId | Condition::AleLoopback
+                ))),
+            "ALE-only conditions must never be rendered on transport layers"
         );
     }
 
@@ -1354,6 +1669,35 @@ mod tests {
                 arbitrate(&expected_filters(&config(mode)), &packet),
                 FilterAction::Block,
                 "{mode:?}: tunnel traffic must stay blocked until lock"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_is_default_denied_physically_and_permitted_on_the_tunnel() {
+        let filters = expected_filters(&config(KillSwitchStatusMode::Locked));
+        assert!(
+            !filters.iter().any(|filter| {
+                filter.action == FilterAction::Block
+                    && filter.conditions.contains(&Condition::RemotePort(53))
+            }),
+            "a separate terminating DNS block breaks Windows' legitimate resolver path"
+        );
+
+        for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+            let physical = packet(LayerKind::AleAuthConnectV4, protocol, "8.8.8.8", 53);
+            assert_eq!(
+                arbitrate(&filters, &physical),
+                FilterAction::Block,
+                "the block-all floor must still prevent physical DNS leaks"
+            );
+
+            let mut tunneled = physical;
+            tunneled.local_interface = Some(0x1234_5678);
+            assert_eq!(
+                arbitrate(&filters, &tunneled),
+                FilterAction::Permit,
+                "DNS on the verified TUN interface is legitimate protected traffic"
             );
         }
     }
@@ -1469,7 +1813,7 @@ mod tests {
             .filter(|filter| filter.name.contains("DIRECT"))
             .map(|filter| filter.key)
             .collect::<Vec<_>>();
-        assert_eq!(direct_keys.len(), 2);
+        assert_eq!(direct_keys.len(), 4);
         let plan = diff(
             &locked.iter().map(|filter| filter.key).collect::<Vec<_>>(),
             &blocked,

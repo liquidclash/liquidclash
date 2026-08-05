@@ -16,7 +16,9 @@ pub mod node;
 pub mod policy;
 
 pub use catalog::{CatalogError, CatalogTracker, ExitCatalogResponse, InstallOutcome};
-pub use config::{DirectPlan, OwnedRuntime, build_owned_runtime, generate_controller_secret, redact_secret};
+pub use config::{
+    DirectPlan, OwnedRuntime, build_owned_runtime, generate_controller_secret, redact_secret,
+};
 pub use connection::{ConnectStage, ConnectionStatus, ReconnectBackoff, UiState};
 pub use credentials::{CredentialKey, CredentialStore};
 pub use node::{EXIT_GROUP_NAME, NodeRejection, ValidatedNode};

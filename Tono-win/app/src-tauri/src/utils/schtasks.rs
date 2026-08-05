@@ -574,7 +574,9 @@ mod tests {
 
     #[test]
     fn a_definition_without_the_flag_defaults_to_enabled() {
-        assert!(xml_task_enabled("<Task><Settings><Hidden>false</Hidden></Settings></Task>"));
+        assert!(xml_task_enabled(
+            "<Task><Settings><Hidden>false</Hidden></Settings></Task>"
+        ));
         assert!(xml_task_enabled("not xml at all"));
     }
 }

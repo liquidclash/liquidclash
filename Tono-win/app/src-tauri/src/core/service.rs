@@ -22,9 +22,9 @@ use clash_verge_logging::{Type, logging};
 #[cfg(target_os = "macos")]
 use clash_verge_service_ipc::MacosKillSwitchMode;
 use clash_verge_service_ipc::{
-    DnsProtectionStatus, KillSwitchConfig, KillSwitchLockRequest, KillSwitchStatus, MacosKillSwitchConfig,
-    MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProxyApplyOutcome, RuntimeBundle, ServiceErrorCode,
-    ServiceStatusSnapshot, StageRuntimeOutcome, StartClashRequest, StopClashOptions, WriterConfig,
+    DnsProtectionStatus, KillSwitchConfig, KillSwitchLockRequest, KillSwitchStatus, KillSwitchStatusMode,
+    MacosKillSwitchConfig, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProxyApplyOutcome, RuntimeBundle,
+    ServiceErrorCode, ServiceStatusSnapshot, StageRuntimeOutcome, StartClashRequest, StopClashOptions, WriterConfig,
 };
 use compact_str::CompactString;
 use once_cell::sync::Lazy;
@@ -41,6 +41,12 @@ use std::{
 
 static OWNER_MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SERVICE_SESSION: Lazy<Mutex<Option<ActiveServiceSession>>> = Lazy::new(|| Mutex::new(None));
+
+/// `mark verified` is session-gated but idempotent. A distant/loaded Windows machine can lose
+/// one named-pipe response immediately after the Service committed it, so reconcile and retry
+/// this one mutation explicitly instead of destroying an otherwise fully verified tunnel.
+const MARK_VERIFIED_ATTEMPTS: u32 = 3;
+const MARK_VERIFIED_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// The Service session that owns the running Core, and what that Service can do.
 ///
@@ -537,6 +543,27 @@ fn macos_service_tool_path(source: &Path) -> Result<PathBuf> {
 
 fn service_core_path(clash_core: &str, bin_ext: &str) -> Result<PathBuf> {
     let sibling = current_exe()?.with_file_name(format!("{clash_core}{bin_ext}"));
+
+    // A locally built App normally sits outside Program Files, while the production Service
+    // deliberately accepts cores only from the installed allowlist and with the build-injected
+    // SHA-256. Keep those two Service-side checks intact and expose only a feature-gated test
+    // pointer to an *already installed* core. This is the seam used by real-Windows integration
+    // tests; it grants no new path or hash to the Service.
+    #[cfg(all(target_os = "windows", feature = "windows-integration-test"))]
+    if let Some(value) = std::env::var_os("TONO_WINDOWS_INTEGRATION_CORE_PATH") {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            bail!("TONO_WINDOWS_INTEGRATION_CORE_PATH must be absolute");
+        }
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("verge-mihomo.exe"))
+        {
+            bail!("TONO_WINDOWS_INTEGRATION_CORE_PATH must name verge-mihomo.exe");
+        }
+        return Ok(path);
+    }
 
     #[cfg(all(target_os = "macos", feature = "verge-dev"))]
     {
@@ -1437,13 +1464,52 @@ pub(crate) async fn tono_lock_kill_switch() -> Result<()> {
 pub(crate) async fn tono_mark_kill_switch_verified() -> Result<()> {
     let credentials = current_owner_credentials()?;
     let session = active_service_session()?;
-    let response = clash_verge_service_ipc::mark_kill_switch_verified(&credentials, &session)
-        .await
-        .context("无法连接到Tono Service")?;
-    if response.code > 0 {
-        bail!(response.message);
+    let mut last_transport_error = None;
+    for attempt in 1..=MARK_VERIFIED_ATTEMPTS {
+        match clash_verge_service_ipc::mark_kill_switch_verified(&credentials, &session).await {
+            Ok(response) => {
+                if response.code > 0 {
+                    bail!(response.message);
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                last_transport_error = Some(error);
+
+                // The response may be the only thing that was lost. A fully locked, live,
+                // verified read-back proves the idempotent mutation committed and is stronger
+                // evidence than replaying it blindly.
+                if let Ok(status_response) = clash_verge_service_ipc::get_kill_switch_status(&credentials).await
+                    && status_response.code == 0
+                    && status_response.data.as_ref().is_some_and(mark_verified_committed)
+                {
+                    logging!(
+                        warn,
+                        Type::Service,
+                        "Tono: MarkVerified response was lost, but Service status proves it committed"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        if attempt < MARK_VERIFIED_ATTEMPTS {
+            tokio::time::sleep(MARK_VERIFIED_RETRY_DELAY).await;
+        }
     }
-    Ok(())
+
+    match last_transport_error {
+        Some(error) => Err(error).context("无法连接到Tono Service"),
+        None => bail!("MarkVerified retry loop completed without a response"),
+    }
+}
+
+fn mark_verified_committed(status: &KillSwitchStatus) -> bool {
+    status.wanted
+        && status.verified
+        && status.live
+        && status.mode == KillSwitchStatusMode::Locked
+        && status.tunnel_permit_rendered
 }
 
 /// `POST /kill-switch/restrict-bootstrap`: keep blocking, reopen only the API recovery channel.
@@ -1597,7 +1663,7 @@ pub(crate) async fn tono_release_kill_switch() -> Result<KillSwitchStatus> {
 /// Whether a live owner session exists for session-gated routes (stop-core
 /// among them). False in Protected Offline after an app restart — which is
 /// exactly why the release path is owner-gated instead (C1).
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 pub(crate) fn tono_session_live() -> bool {
     ACTIVE_SERVICE_SESSION.lock().is_some()
 }
@@ -2056,16 +2122,18 @@ pub static SERVICE_MANAGER: ServiceManager = ServiceManager;
 #[allow(clippy::expect_used, clippy::panic, reason = "tests assert by panicking")]
 mod tests {
     use super::{
-        ServiceHealth, ServiceStatus, advanced_tono_generation, capture_generation_before,
+        MARK_VERIFIED_ATTEMPTS, ServiceHealth, ServiceStatus, advanced_tono_generation, capture_generation_before,
         claim_owner_recovery_generation, generate_service_session_token, macos_install_shell,
-        mark_service_unavailable_after_owner_loss, owner_recovery_policy, service_core_path_for,
-        session_matches_status,
+        mark_service_unavailable_after_owner_loss, mark_verified_committed, owner_recovery_policy,
+        service_core_path_for, session_matches_status,
     };
     #[cfg(unix)]
     use super::{service_core_path_for_with_publisher, service_tool_path_for};
     use crate::core::runstate::{FakeEnv, OwnerRecoveryReason, PendingAction, RunStateStore};
     use anyhow::bail;
-    use clash_verge_service_ipc::OwnerSessionProof;
+    use clash_verge_service_ipc::{
+        KillSwitchStatus, KillSwitchStatusMode, OwnerSessionProof, ProxyEndpoint, ProxyProtocol,
+    };
     #[cfg(unix)]
     use std::cell::Cell;
     use std::{
@@ -2076,6 +2144,41 @@ mod tests {
     /// A Run State backed by a scripted environment, so these tests never touch the global.
     fn fake_store() -> RunStateStore<FakeEnv> {
         RunStateStore::new(FakeEnv::new())
+    }
+
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "this test pins the real-machine retry contract"
+    )]
+    fn mark_verified_reconciliation_is_bounded_and_requires_full_proof() {
+        assert!(MARK_VERIFIED_ATTEMPTS >= 3);
+        let mut status = KillSwitchStatus {
+            wanted: true,
+            verified: true,
+            live: true,
+            mode: KillSwitchStatusMode::Locked,
+            endpoints: vec![ProxyEndpoint {
+                ip: "203.0.113.7".to_string(),
+                port: 443,
+                protocol: ProxyProtocol::Tcp,
+            }],
+            tunnel_permit_rendered: true,
+            last_error: None,
+        };
+        assert!(mark_verified_committed(&status));
+
+        status.verified = false;
+        assert!(!mark_verified_committed(&status));
+        status.verified = true;
+        status.live = false;
+        assert!(!mark_verified_committed(&status));
+        status.live = true;
+        status.mode = KillSwitchStatusMode::Blocked;
+        assert!(!mark_verified_committed(&status));
+        status.mode = KillSwitchStatusMode::Locked;
+        status.tunnel_permit_rendered = false;
+        assert!(!mark_verified_committed(&status));
     }
 
     #[test]

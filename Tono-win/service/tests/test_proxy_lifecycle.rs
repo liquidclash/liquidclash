@@ -5,8 +5,8 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     AuthenticatedRequest, IpcCommand, MacosProxyConfig, OwnerSessionProof, RuntimeBundle,
-    ServiceErrorCode, ServiceOperationKind, StartClashRequest, StartClashResult, test_client,
-    get_status, run_ipc_server, set_system_proxy, start_clash, stop_clash, stop_ipc_server,
+    ServiceErrorCode, ServiceOperationKind, StartClashRequest, StartClashResult, get_status,
+    run_ipc_server, set_system_proxy, start_clash, stop_clash, stop_ipc_server, test_client,
 };
 use serde::Deserialize;
 use serial_test::serial;

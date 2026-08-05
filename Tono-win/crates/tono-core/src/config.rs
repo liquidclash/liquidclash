@@ -17,7 +17,8 @@ pub const EXTERNAL_CONTROLLER: &str = "127.0.0.1:9090";
 pub const TUN_DEVICE_NAME: &str = "Tono";
 pub const FAKE_IP_RANGE: &str = "198.18.0.1/16";
 pub const DNS_LISTEN: &str = "127.0.0.1:53";
-/// Name of the WeChat-DIRECT select group (present only with a DirectPlan).
+/// Names of the physical-interface-bound DIRECT outbounds (present only when
+/// the corresponding DirectPlan rules exist).
 pub const DIRECT_GROUP_NAME: &str = "Tono-China-Direct";
 pub const WEB_DIRECT_GROUP_NAME: &str = "Tono-China-Web-Direct";
 /// DoH resolvers pinned through the exit group; the `#Tono-Exit` fragment
@@ -46,8 +47,10 @@ pub enum ConfigError {
     RuntimePorts(String),
 }
 
-/// Per-connection loopback listeners. Tono's TUN product does not need a mixed proxy listener,
-/// so the App passes `mixed_port = 0`; the default preserves the legacy/test contract. The
+/// Per-connection loopback listeners. The App gives the mixed listener an ephemeral port used
+/// only for a post-failure cross-check: a request through that listener bypasses WinTUN while
+/// still exercising the selected node. It therefore distinguishes node/Core egress failure from
+/// a broken Windows TUN data plane without weakening the real TUN connection verdict. The
 /// controller must be non-zero because the App needs its exact authenticated endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimePorts {
@@ -232,6 +235,17 @@ fn put(mapping: &mut Mapping, key: &str, value: Value) {
     mapping.insert(string(key), value);
 }
 
+fn direct_outbound(name: &str, physical_interface: &str) -> Value {
+    let mut outbound = Mapping::new();
+    put(&mut outbound, "name", string(name));
+    put(&mut outbound, "type", string("direct"));
+    put(&mut outbound, "udp", Value::Bool(true));
+    // Current Mihomo releases remove proxy groups carrying interface-name.
+    // The supported form binds the concrete DIRECT outbound instead.
+    put(&mut outbound, "interface-name", string(physical_interface));
+    Value::Mapping(outbound)
+}
+
 fn runtime_value(
     nodes: &[ValidatedNode],
     selected: &str,
@@ -251,6 +265,10 @@ fn runtime_value(
         "mixed-port",
         Value::Number(ports.mixed_port.into()),
     );
+    // `allow-lan: false` already limits Mihomo's normal listener scope. Keep the concrete bind as
+    // a second, explicit boundary because the diagnostic port is not part of the product API and
+    // must never become reachable from another machine after a future Mihomo default changes.
+    put(&mut root, "bind-address", string("127.0.0.1"));
     put(&mut root, "allow-lan", Value::Bool(false));
     put(&mut root, "ipv6", Value::Bool(false));
     put(&mut root, "mode", string("rule"));
@@ -324,45 +342,26 @@ fn runtime_value(
     );
     put(&mut root, "tun", Value::Mapping(tun));
 
-    let proxies: Vec<Value> = nodes
+    let mut proxies: Vec<Value> = nodes
         .iter()
         .map(|node| Value::Mapping(node.to_runtime_mapping()))
         .collect();
-    put(&mut root, "proxies", Value::Sequence(proxies));
-
-    let mut groups: Vec<Value> = Vec::new();
-    // WeChat-DIRECT: a select group holding only DIRECT, bound to the
-    // physical interface (mihomo group-level interface binding). It sits
-    // before Tono-Exit; rules reference it by name.
     if let Some(plan) = direct {
         let has_wechat = !plan.tcp_wechat_rules.is_empty() || !plan.udp_wechat_rules.is_empty();
         let has_web = !plan.tcp_web_rules.is_empty();
         if has_wechat {
-            let mut direct_group = Mapping::new();
-            put(&mut direct_group, "name", string(DIRECT_GROUP_NAME));
-            put(&mut direct_group, "type", string("select"));
-            put(&mut direct_group, "proxies", strings(&["DIRECT"]));
-            put(
-                &mut direct_group,
-                "interface-name",
-                string(&plan.physical_interface),
-            );
-            groups.push(Value::Mapping(direct_group));
+            proxies.push(direct_outbound(DIRECT_GROUP_NAME, &plan.physical_interface));
         }
         if has_web {
-            let mut web_group = Mapping::new();
-            put(&mut web_group, "name", string(WEB_DIRECT_GROUP_NAME));
-            put(&mut web_group, "type", string("select"));
-            put(&mut web_group, "proxies", strings(&["DIRECT"]));
-            put(
-                &mut web_group,
-                "interface-name",
-                string(&plan.physical_interface),
-            );
-            groups.push(Value::Mapping(web_group));
+            proxies.push(direct_outbound(
+                WEB_DIRECT_GROUP_NAME,
+                &plan.physical_interface,
+            ));
         }
     }
+    put(&mut root, "proxies", Value::Sequence(proxies));
 
+    let mut groups: Vec<Value> = Vec::new();
     let mut ordered: Vec<&str> = Vec::with_capacity(nodes.len());
     ordered.push(selected);
     ordered.extend(
@@ -477,6 +476,7 @@ reality-opts:
     fn forces_top_level_control_values() {
         let value = parsed(&build());
         assert_eq!(get(&value, &["mixed-port"]).as_i64(), Some(7890));
+        assert_eq!(get(&value, &["bind-address"]).as_str(), Some("127.0.0.1"));
         assert_eq!(get(&value, &["allow-lan"]).as_bool(), Some(false));
         assert_eq!(get(&value, &["ipv6"]).as_bool(), Some(false));
         assert_eq!(get(&value, &["mode"]).as_str(), Some("rule"));
@@ -813,7 +813,7 @@ reality-opts:
     }
 
     #[test]
-    fn direct_build_renders_hosts_group_and_rules_in_order() {
+    fn direct_build_renders_hosts_outbounds_and_rules_in_order() {
         let runtime = build_owned_runtime(
             &three_nodes(),
             "JP Reality 02",
@@ -842,31 +842,35 @@ reality-opts:
             .unwrap();
         assert_eq!(qpic.len(), 1);
 
-        // The DIRECT select group comes first and binds the interface.
-        let groups = get(&value, &["proxy-groups"]).as_sequence().unwrap();
-        assert_eq!(groups.len(), 3);
+        // Current Mihomo accepts interface binding on concrete proxies, not
+        // on proxy groups. Both DIRECT rule targets are concrete outbounds.
+        let proxies = get(&value, &["proxies"]).as_sequence().unwrap();
+        assert_eq!(proxies.len(), 5);
+        let direct = &proxies[3];
+        assert_eq!(direct[string("name")].as_str(), Some("Tono-China-Direct"));
+        assert_eq!(direct[string("type")].as_str(), Some("direct"));
+        assert_eq!(direct[string("udp")].as_bool(), Some(true));
         assert_eq!(
-            groups[0][string("name")].as_str(),
-            Some("Tono-China-Direct")
-        );
-        assert_eq!(groups[0][string("type")].as_str(), Some("select"));
-        assert_eq!(
-            groups[0][string("interface-name")].as_str(),
+            direct[string("interface-name")].as_str(),
             Some("Ethernet 2")
         );
-        let direct_choices: Vec<&str> = groups[0][string("proxies")]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .map(|entry| entry.as_str().unwrap())
-            .collect();
-        assert_eq!(direct_choices, ["DIRECT"]);
-        // Tono-Exit is untouched and still carries the selected node first.
+        let web_direct = &proxies[4];
         assert_eq!(
-            groups[1][string("name")].as_str(),
+            web_direct[string("name")].as_str(),
             Some("Tono-China-Web-Direct")
         );
-        assert_eq!(groups[2][string("name")].as_str(), Some("Tono-Exit"));
+        assert_eq!(web_direct[string("type")].as_str(), Some("direct"));
+        assert_eq!(
+            web_direct[string("interface-name")].as_str(),
+            Some("Ethernet 2")
+        );
+
+        // Tono-Exit remains the only group and still carries the selected
+        // Reality node first; no deprecated group interface-name is emitted.
+        let groups = get(&value, &["proxy-groups"]).as_sequence().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0][string("name")].as_str(), Some("Tono-Exit"));
+        assert!(groups[0].get(string("interface-name")).is_none());
 
         // Rules: loopback, then TCP pins, then UDP WeChat pins, then MATCH.
         let rules: Vec<&str> = get(&value, &["rules"])
@@ -950,7 +954,7 @@ reality-opts:
     }
 
     #[test]
-    fn direct_plan_with_empty_collections_keeps_group_and_rules_stable() {
+    fn direct_plan_with_empty_collections_keeps_outbounds_groups_and_rules_stable() {
         let plan = DirectPlan {
             physical_interface: "Ethernet".to_string(),
             hosts: Vec::new(),
@@ -964,6 +968,12 @@ reality-opts:
         assert!(value.as_mapping().unwrap().get(string("hosts")).is_none());
         let groups = get(&value, &["proxy-groups"]).as_sequence().unwrap();
         assert_eq!(groups.len(), 1, "an empty plan declares no DIRECT group");
+        let proxies = get(&value, &["proxies"]).as_sequence().unwrap();
+        assert_eq!(
+            proxies.len(),
+            3,
+            "an empty plan declares no DIRECT outbound"
+        );
         let rules: Vec<&str> = get(&value, &["rules"])
             .as_sequence()
             .unwrap()

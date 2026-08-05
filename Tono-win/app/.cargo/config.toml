@@ -8,10 +8,6 @@ linker = "arm-linux-gnueabihf-gcc"
 clippy-all = "clippy --all-targets --all-features -- -D warnings"
 clippy-only = "clippy --all-targets  --features clippy -- -D warnings"
 
-[target.x86_64-pc-windows-msvc]
-linker = "lld-link"
-rustflags = [
-  "-Lnative=/Users/rw/Downloads/Project/liquidclash/Tono-win/.toolchain/xwin/xwin/crt/lib/x86_64",
-  "-Lnative=/Users/rw/Downloads/Project/liquidclash/Tono-win/.toolchain/xwin/xwin/sdk/lib/um/x86_64",
-  "-Lnative=/Users/rw/Downloads/Project/liquidclash/Tono-win/.toolchain/xwin/xwin/sdk/lib/ucrt/x86_64",
-]
+# Do not pin the Windows target linker here. Native Windows builds use the MSVC
+# environment's link.exe; the macOS release script obtains lld-link and SDK library
+# paths from `cargo xwin env`. A target-level setting cannot distinguish those hosts.

@@ -91,7 +91,10 @@ pub enum ApiError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("could not reach Tono: {message}")]
-    Transport { kind: TransportKind, message: String },
+    Transport {
+        kind: TransportKind,
+        message: String,
+    },
     #[error("your session has expired; please sign in again")]
     Unauthorized,
     #[error("this account does not have permission for that action")]
@@ -136,7 +139,11 @@ pub fn is_valid_email(raw: &str) -> bool {
 /// Trim; empty becomes the platform default; capped at 80 chars.
 pub fn normalize_device_name(raw: &str) -> String {
     let trimmed = raw.trim();
-    let base = if trimmed.is_empty() { DEFAULT_DEVICE_NAME } else { trimmed };
+    let base = if trimmed.is_empty() {
+        DEFAULT_DEVICE_NAME
+    } else {
+        trimmed
+    };
     base.chars().take(80).collect()
 }
 
@@ -520,7 +527,9 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
     }
 
     pub async fn auth_methods(&self) -> Result<AuthMethodsResponse, ApiError> {
-        let body = self.call(HttpMethod::Get, endpoints::AUTH_METHODS, None, None).await?;
+        let body = self
+            .call(HttpMethod::Get, endpoints::AUTH_METHODS, None, None)
+            .await?;
         decode_json(&body)
     }
 
@@ -541,7 +550,9 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
             installation_id: normalize_installation_id(installation_id)?,
         };
         let body = serde_json::to_string(&request).map_err(|_| ApiError::InvalidResponse)?;
-        let response = self.call(HttpMethod::Post, endpoints::EMAIL_START, Some(body), None).await?;
+        let response = self
+            .call(HttpMethod::Post, endpoints::EMAIL_START, Some(body), None)
+            .await?;
         decode_json(&response)
     }
 
@@ -556,29 +567,41 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
             code: code.to_string(),
         };
         let body = serde_json::to_string(&request).map_err(|_| ApiError::InvalidResponse)?;
-        let response = self.call(HttpMethod::Post, endpoints::EMAIL_VERIFY, Some(body), None).await?;
+        let response = self
+            .call(HttpMethod::Post, endpoints::EMAIL_VERIFY, Some(body), None)
+            .await?;
         decode_auth_response(&response)
     }
 
     pub async fn me(&self) -> Result<MeResponse, ApiError> {
-        let body = self.authorized(HttpMethod::Get, endpoints::ME, None).await?;
+        let body = self
+            .authorized(HttpMethod::Get, endpoints::ME, None)
+            .await?;
         decode_json(&body)
     }
 
     pub async fn devices(&self) -> Result<DevicesResponse, ApiError> {
-        let body = self.authorized(HttpMethod::Get, endpoints::DEVICES, None).await?;
+        let body = self
+            .authorized(HttpMethod::Get, endpoints::DEVICES, None)
+            .await?;
         decode_json(&body)
     }
 
     pub async fn exit_catalog(&self) -> Result<ExitCatalogResponse, ApiError> {
-        let body = self.authorized(HttpMethod::Get, endpoints::EXIT_CATALOG, None).await?;
+        let body = self
+            .authorized(HttpMethod::Get, endpoints::EXIT_CATALOG, None)
+            .await?;
         decode_json(&body)
     }
 
     /// `GET traffic-policy`: the cloud WeChat-DIRECT routing policy (digest
     /// + revision semantics identical to the exit catalog).
-    pub async fn traffic_policy(&self) -> Result<crate::policy::TonoTrafficPolicyResponse, ApiError> {
-        let body = self.authorized(HttpMethod::Get, endpoints::TRAFFIC_POLICY, None).await?;
+    pub async fn traffic_policy(
+        &self,
+    ) -> Result<crate::policy::TonoTrafficPolicyResponse, ApiError> {
+        let body = self
+            .authorized(HttpMethod::Get, endpoints::TRAFFIC_POLICY, None)
+            .await?;
         decode_json(&body)
     }
 
@@ -618,7 +641,8 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
     pub async fn revoke_device(&self, id: &str) -> Result<(), ApiError> {
         Uuid::parse_str(id)
             .map_err(|_| ApiError::InvalidInput("device id must be a UUID".to_string()))?;
-        self.authorized(HttpMethod::Delete, &endpoints::device(id), None).await?;
+        self.authorized(HttpMethod::Delete, &endpoints::device(id), None)
+            .await?;
         Ok(())
     }
 
@@ -639,7 +663,9 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
                 refresh_token: self.credentials.refresh_token().ok().flatten(),
             })
             .ok();
-            let _ = self.authorized(HttpMethod::Post, endpoints::LOGOUT, body).await;
+            let _ = self
+                .authorized(HttpMethod::Post, endpoints::LOGOUT, body)
+                .await;
         }
         // Wipe the persisted token while the state lock is held. Releasing it first left a
         // window in which a refresh that started after the epoch bump could read the token
@@ -705,12 +731,17 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
                 }
             }
         }
-        let refresh = self.credentials.refresh_token()?.ok_or(ApiError::Unauthorized)?;
+        let refresh = self
+            .credentials
+            .refresh_token()?
+            .ok_or(ApiError::Unauthorized)?;
         let body = serde_json::to_string(&RefreshRequest {
             refresh_token: refresh,
         })
         .map_err(|_| ApiError::InvalidResponse)?;
-        let response = self.call(HttpMethod::Post, endpoints::REFRESH, Some(body), None).await?;
+        let response = self
+            .call(HttpMethod::Post, endpoints::REFRESH, Some(body), None)
+            .await?;
         let tokens: TokenResponse = decode_json(&response)?;
         // Commit critical section: adopt()/logout() may have installed a new
         // session while this request was in flight (both bump the epoch).
@@ -750,7 +781,8 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
     ) -> Result<Vec<u8>, ApiError> {
         let first = self.send(method, path, body.clone(), bearer).await;
         match first {
-            Err(err) if matches!(err, ApiError::Transport { kind, .. } if should_retry_transport(method, kind)) => {
+            Err(err) if matches!(err, ApiError::Transport { kind, .. } if should_retry_transport(method, kind)) =>
+            {
                 tokio::time::sleep(TRANSPORT_RETRY_DELAY).await;
                 match self.send(method, path, body, bearer).await {
                     Ok(response) => Ok(response),
@@ -782,7 +814,11 @@ impl<T: HttpTransport, S: CredentialStore> ApiClient<T, S> {
 
 fn decode_json<R: DeserializeOwned>(body: &[u8]) -> Result<R, ApiError> {
     // Empty 2xx bodies decode as `{}` (macOS parity).
-    let bytes = if body.is_empty() { b"{}".as_slice() } else { body };
+    let bytes = if body.is_empty() {
+        b"{}".as_slice()
+    } else {
+        body
+    };
     serde_json::from_slice(bytes).map_err(|_| ApiError::InvalidResponse)
 }
 
@@ -850,7 +886,10 @@ fn validate_base_url(raw: &str) -> Result<String, ApiError> {
         return Err(invalid());
     }
     if is_http {
-        let loopback = matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1");
+        let loopback = matches!(
+            host.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1"
+        );
         if !(cfg!(debug_assertions) && loopback) {
             return Err(invalid());
         }
@@ -995,16 +1034,20 @@ mod tests {
             "https://api.afk.ccwu.cc:443"
         );
         for bad in [
-            "http://api.afk.ccwu.cc",            // release: https only
-            "https://api.afk.ccwu.cc:444",       // 443 only
-            "https://user@api.afk.ccwu.cc",      // no userinfo
-            "https://api.afk.ccwu.cc/path",      // no path
-            "https://api.afk.ccwu.cc?q=1",       // no query
-            "https://api.afk.ccwu.cc/#frag",     // no fragment
-            "api.afk.ccwu.cc",                   // scheme required
-            "https://",                          // host required
+            "http://api.afk.ccwu.cc",        // release: https only
+            "https://api.afk.ccwu.cc:444",   // 443 only
+            "https://user@api.afk.ccwu.cc",  // no userinfo
+            "https://api.afk.ccwu.cc/path",  // no path
+            "https://api.afk.ccwu.cc?q=1",   // no query
+            "https://api.afk.ccwu.cc/#frag", // no fragment
+            "api.afk.ccwu.cc",               // scheme required
+            "https://",                      // host required
         ] {
-            assert_eq!(validate_base_url(bad), Err(ApiError::InvalidConfiguration), "{bad}");
+            assert_eq!(
+                validate_base_url(bad),
+                Err(ApiError::InvalidConfiguration),
+                "{bad}"
+            );
         }
         // Debug builds allow loopback http for development.
         if cfg!(debug_assertions) {
@@ -1027,7 +1070,8 @@ mod tests {
     #[test]
     fn auth_response_decodes_wrapped_and_unwrapped() {
         let user = user_json();
-        let wrapped = format!(r#"{{"auth":{{"accessToken":"a1","refreshToken":"r1","user":{user}}}}}"#);
+        let wrapped =
+            format!(r#"{{"auth":{{"accessToken":"a1","refreshToken":"r1","user":{user}}}}}"#);
         let auth = decode_auth_response(wrapped.as_bytes()).unwrap();
         assert_eq!(auth.access_token, "a1");
         assert_eq!(auth.refresh_token.as_deref(), Some("r1"));
@@ -1052,15 +1096,18 @@ mod tests {
         assert_eq!(user.expires_at, Some(1_700_000_000));
         assert_eq!(user.device_limit, None);
         // Suspended accounts may be partially populated.
-        let user: User = serde_json::from_str(r#"{"id":"u","email":"e@x.co","suspended":true}"#).unwrap();
+        let user: User =
+            serde_json::from_str(r#"{"id":"u","email":"e@x.co","suspended":true}"#).unwrap();
         assert_eq!(user.suspended, Some(true));
         // Numeric-string and ISO-string timestamps degrade gracefully.
         let user: User =
-            serde_json::from_str(r#"{"id":"u","email":"e@x.co","expiresAt":"1700000000"}"#).unwrap();
-        assert_eq!(user.expires_at, Some(1_700_000_000));
-        let user: User =
-            serde_json::from_str(r#"{"id":"u","email":"e@x.co","expiresAt":"2026-01-01T00:00:00Z"}"#)
+            serde_json::from_str(r#"{"id":"u","email":"e@x.co","expiresAt":"1700000000"}"#)
                 .unwrap();
+        assert_eq!(user.expires_at, Some(1_700_000_000));
+        let user: User = serde_json::from_str(
+            r#"{"id":"u","email":"e@x.co","expiresAt":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
         assert_eq!(user.expires_at, None);
     }
 
@@ -1074,11 +1121,21 @@ mod tests {
                 serde_json::from_str(request.json_body.as_deref().unwrap()).unwrap();
             assert_eq!(body["email"], "user@example.com");
             assert_eq!(body["deviceName"], "Windows PC");
-            assert_eq!(body["installationId"], "2f5b1f2a-0000-4c81-8d2b-3f2d0a1b2c3d");
-            json(200, r#"{"challengeId":"c1","expiresIn":600,"message":"sent"}"#)
+            assert_eq!(
+                body["installationId"],
+                "2f5b1f2a-0000-4c81-8d2b-3f2d0a1b2c3d"
+            );
+            json(
+                200,
+                r#"{"challengeId":"c1","expiresIn":600,"message":"sent"}"#,
+            )
         });
         let challenge = client
-            .start_email_sign_in("  User@Example.COM ", "  ", "2F5B1F2A-0000-4C81-8D2B-3F2D0A1B2C3D")
+            .start_email_sign_in(
+                "  User@Example.COM ",
+                "  ",
+                "2F5B1F2A-0000-4C81-8D2B-3F2D0A1B2C3D",
+            )
             .await
             .unwrap();
         assert_eq!(challenge.challenge_id, "c1");
@@ -1089,7 +1146,9 @@ mod tests {
     async fn email_start_rejects_invalid_email_client_side() {
         let (client, mock, _store) = test_client(|_| unreachable!());
         assert!(matches!(
-            client.start_email_sign_in("nope", "pc", &new_installation_id()).await,
+            client
+                .start_email_sign_in("nope", "pc", &new_installation_id())
+                .await,
             Err(ApiError::InvalidInput(_))
         ));
         assert!(mock.requests().is_empty());
@@ -1114,7 +1173,10 @@ mod tests {
                 let body: serde_json::Value =
                     serde_json::from_str(request.json_body.as_deref().unwrap()).unwrap();
                 assert_eq!(body["refreshToken"], "refresh-1");
-                return json(200, r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#);
+                return json(
+                    200,
+                    r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#,
+                );
             }
             assert_eq!(request.bearer.as_deref(), Some("access-2"));
             json(200, r#"{"user":{"id":"u","email":"e@x.co"}}"#)
@@ -1134,15 +1196,24 @@ mod tests {
     async fn concurrent_401s_coalesce_into_a_single_refresh() {
         let (client, mock, store) = test_client(|request| {
             if request.url.ends_with("auth/refresh") {
-                return json(200, r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#);
+                return json(
+                    200,
+                    r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#,
+                );
             }
             match request.bearer.as_deref() {
                 Some("access-2") => json(200, r#"{"user":{"id":"u","email":"e@x.co"}}"#),
-                _ => json(401, r#"{"error":{"message":"expired","code":"UNAUTHORIZED"}}"#),
+                _ => json(
+                    401,
+                    r#"{"error":{"message":"expired","code":"UNAUTHORIZED"}}"#,
+                ),
             }
         });
         store.set_refresh_token("refresh-1").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
         let client = Arc::new(client);
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -1160,13 +1231,22 @@ mod tests {
     async fn retries_once_after_401_then_surfaces_unauthorized() {
         let (client, mock, store) = test_client(|request| {
             if request.url.ends_with("auth/refresh") {
-                return json(200, r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#);
+                return json(
+                    200,
+                    r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#,
+                );
             }
             let _ = request;
-            json(401, r#"{"error":{"message":"expired","code":"UNAUTHORIZED"}}"#)
+            json(
+                401,
+                r#"{"error":{"message":"expired","code":"UNAUTHORIZED"}}"#,
+            )
         });
         store.set_refresh_token("refresh-1").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
         assert_eq!(client.me().await.unwrap_err(), ApiError::Unauthorized);
         // Exactly one retry: /me with access-1, refresh, /me with access-2.
         assert_eq!(mock.count_to("/me"), 2);
@@ -1182,7 +1262,10 @@ mod tests {
     #[tokio::test]
     async fn device_limit_maps_to_dedicated_error() {
         let (client, _mock, _store) = test_client(|_| {
-            json(409, r#"{"error":{"message":"device limit reached","code":"DEVICE_LIMIT"}}"#)
+            json(
+                409,
+                r#"{"error":{"message":"device limit reached","code":"DEVICE_LIMIT"}}"#,
+            )
         });
         assert_eq!(
             client
@@ -1196,9 +1279,8 @@ mod tests {
     #[tokio::test]
     async fn status_and_envelope_mapping() {
         // 409 with another code stays a generic server error.
-        let (client, _mock, _store) = test_client(|_| {
-            json(409, r#"{"error":{"message":"conflict","code":"OTHER"}}"#)
-        });
+        let (client, _mock, _store) =
+            test_client(|_| json(409, r#"{"error":{"message":"conflict","code":"OTHER"}}"#));
         assert_eq!(
             client
                 .start_email_sign_in("u@x.co", "pc", &new_installation_id())
@@ -1233,7 +1315,10 @@ mod tests {
         store.set_refresh_token("r0").unwrap();
         client.adopt(&auth_response("a", None)).await.unwrap();
         assert_eq!(
-            client.revoke_device(&new_installation_id()).await.unwrap_err(),
+            client
+                .revoke_device(&new_installation_id())
+                .await
+                .unwrap_err(),
             ApiError::NotFound
         );
     }
@@ -1301,10 +1386,18 @@ mod tests {
             TransportKind::Timeout,
             TransportKind::Other,
         ] {
-            let (client, mock, _store) = test_client(fail_then_ok(kind, 200, r#"{"email":{"enabled":true},"apple":{"enabled":false},"google":{"enabled":false}}"#));
+            let (client, mock, _store) = test_client(fail_then_ok(
+                kind,
+                200,
+                r#"{"email":{"enabled":true},"apple":{"enabled":false},"google":{"enabled":false}}"#,
+            ));
             let methods = client.auth_methods().await.unwrap();
             assert!(methods.email.enabled, "{kind:?}");
-            assert_eq!(mock.count_to("auth/methods"), 2, "{kind:?} must retry exactly once");
+            assert_eq!(
+                mock.count_to("auth/methods"),
+                2,
+                "{kind:?} must retry exactly once"
+            );
         }
     }
 
@@ -1349,21 +1442,34 @@ mod tests {
             } else {
                 assert!(outcome.is_err(), "{kind:?} must not retry a POST");
             }
-            assert_eq!(mock.count_to("auth/email/start"), expected_calls, "{kind:?}");
+            assert_eq!(
+                mock.count_to("auth/email/start"),
+                expected_calls,
+                "{kind:?}"
+            );
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_and_parse_failures_never_retry() {
         // 500 with an error envelope: a status, not a transport failure.
-        let (client, mock, _store) = test_client(|_| json(500, r#"{"error":{"message":"boom","code":"X"}}"#));
+        let (client, mock, _store) =
+            test_client(|_| json(500, r#"{"error":{"message":"boom","code":"X"}}"#));
         assert!(client.auth_methods().await.is_err());
-        assert_eq!(mock.count_to("auth/methods"), 1, "HTTP statuses never retry");
+        assert_eq!(
+            mock.count_to("auth/methods"),
+            1,
+            "HTTP statuses never retry"
+        );
 
         // 200 with garbage: a parse failure, not a transport failure.
         let (client, mock, _store) = test_client(|_| json(200, "{not the schema"));
         assert!(client.auth_methods().await.is_err());
-        assert_eq!(mock.count_to("auth/methods"), 1, "parse failures never retry");
+        assert_eq!(
+            mock.count_to("auth/methods"),
+            1,
+            "parse failures never retry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1392,18 +1498,28 @@ mod tests {
                     message: "timeout".to_string(),
                 });
             }
-            json(401, r#"{"error":{"message":"expired","code":"UNAUTHORIZED"}}"#)
+            json(
+                401,
+                r#"{"error":{"message":"expired","code":"UNAUTHORIZED"}}"#,
+            )
         });
         store.set_refresh_token("refresh-1").unwrap();
         assert!(client.me().await.is_err());
-        assert_eq!(mock.count_to("auth/refresh"), 1, "refresh POST must not retry a timeout");
+        assert_eq!(
+            mock.count_to("auth/refresh"),
+            1,
+            "refresh POST must not retry a timeout"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn logout_post_never_retries_on_timeout() {
         let (client, mock, store) = test_client(|request| {
             if request.url.ends_with("auth/refresh") {
-                return json(200, r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#);
+                return json(
+                    200,
+                    r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#,
+                );
             }
             if request.url.ends_with("auth/logout") {
                 return Err(ApiError::Transport {
@@ -1416,7 +1532,11 @@ mod tests {
         store.set_refresh_token("refresh-1").unwrap();
         client.me().await.unwrap();
         client.logout().await;
-        assert_eq!(mock.count_to("auth/logout"), 1, "logout must not retry a timeout");
+        assert_eq!(
+            mock.count_to("auth/logout"),
+            1,
+            "logout must not retry a timeout"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1426,29 +1546,41 @@ mod tests {
         // send (attempt + retry), exactly 1 refresh, 1 replay.
         let (client, mock, store) = test_client(|request| {
             if request.url.ends_with("auth/refresh") {
-                return json(200, r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#);
+                return json(
+                    200,
+                    r#"{"accessToken":"access-2","refreshToken":"refresh-2"}"#,
+                );
             }
             if request.url.ends_with("/me") {
                 match request.bearer.as_deref() {
-                    Some("access-2") => return json(200, r#"{"user":{"id":"u1","email":"e@x.co"}}"#),
+                    Some("access-2") => {
+                        return json(200, r#"{"user":{"id":"u1","email":"e@x.co"}}"#);
+                    }
                     Some("access-1") => return json(401, r#"{"error":{"message":"expired"}}"#),
                     _ => {}
                 }
             }
             if request.url.ends_with("auth/methods") {
-                static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static CALLS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
                 if CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
                     return Err(ApiError::Transport {
                         kind: TransportKind::Connect,
                         message: "connect".to_string(),
                     });
                 }
-                return json(200, r#"{"email":{"enabled":true},"apple":{"enabled":false},"google":{"enabled":false}}"#);
+                return json(
+                    200,
+                    r#"{"email":{"enabled":true},"apple":{"enabled":false},"google":{"enabled":false}}"#,
+                );
             }
             unreachable!()
         });
         store.set_refresh_token("refresh-1").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
         client.auth_methods().await.unwrap(); // transport fail → retry → ok
         assert_eq!(mock.count_to("auth/methods"), 2, "one transport retry");
         client.me().await.unwrap(); // 401 → refresh → replay ok
@@ -1490,11 +1622,20 @@ mod tests {
             assert_eq!(body["report"]["schemaVersion"], 1);
             assert_eq!(body["report"]["uiState"], "protectedOffline");
             assert_eq!(body["report"]["steps"][0]["elapsedMs"], 1200);
-            json(200, r#"{"referenceCode":"TON-4F2K-9QX1","receivedAt":1712345678}"#)
+            json(
+                200,
+                r#"{"referenceCode":"TON-4F2K-9QX1","receivedAt":1712345678}"#,
+            )
         });
         store.set_refresh_token("r0").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
-        let receipt = client.upload_diagnostics_report(&sample_report()).await.unwrap();
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
+        let receipt = client
+            .upload_diagnostics_report(&sample_report())
+            .await
+            .unwrap();
         assert_eq!(receipt.reference_code, "TON-4F2K-9QX1");
         assert_eq!(receipt.received_at, Some(1_712_345_678));
         assert_eq!(mock.count_to("diagnostics/reports"), 1);
@@ -1504,9 +1645,15 @@ mod tests {
     async fn diagnostics_upload_rejects_a_receipt_without_a_code() {
         let (client, _mock, store) = test_client(|_| json(200, r#"{"referenceCode":"   "}"#));
         store.set_refresh_token("r0").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
         assert_eq!(
-            client.upload_diagnostics_report(&sample_report()).await.unwrap_err(),
+            client
+                .upload_diagnostics_report(&sample_report())
+                .await
+                .unwrap_err(),
             ApiError::InvalidResponse
         );
     }
@@ -1514,12 +1661,21 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_uploads_map_to_their_own_error() {
         let (client, _mock, store) = test_client(|_| {
-            json(429, r#"{"error":{"message":"slow down","code":"RATE_LIMITED"}}"#)
+            json(
+                429,
+                r#"{"error":{"message":"slow down","code":"RATE_LIMITED"}}"#,
+            )
         });
         store.set_refresh_token("r0").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
         assert_eq!(
-            client.upload_diagnostics_report(&sample_report()).await.unwrap_err(),
+            client
+                .upload_diagnostics_report(&sample_report())
+                .await
+                .unwrap_err(),
             ApiError::RateLimited
         );
     }
@@ -1533,8 +1689,16 @@ mod tests {
             })
         });
         store.set_refresh_token("r0").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
-        assert!(client.upload_diagnostics_report(&sample_report()).await.is_err());
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .upload_diagnostics_report(&sample_report())
+                .await
+                .is_err()
+        );
         assert_eq!(
             mock.count_to("diagnostics/reports"),
             1,
@@ -1547,7 +1711,12 @@ mod tests {
         // The wire contract, spelled out. A field added to the struct without
         // a deliberate update here fails this test — which is the point.
         let value = serde_json::to_value(sample_report()).unwrap();
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -1606,7 +1775,10 @@ mod tests {
             json(200, "{}")
         });
         store.set_refresh_token("refresh-1").unwrap();
-        client.adopt(&auth_response("access-1", None)).await.unwrap();
+        client
+            .adopt(&auth_response("access-1", None))
+            .await
+            .unwrap();
         client.logout().await;
         assert_eq!(mock.count_to("auth/logout"), 1);
         assert_eq!(store.refresh_token().unwrap(), None);
@@ -1632,7 +1804,10 @@ mod tests {
     #[tokio::test]
     async fn adopt_persists_refresh_token_when_present() {
         let (client, _mock, store) = test_client(|_| unreachable!());
-        client.adopt(&auth_response("a", Some("r-new"))).await.unwrap();
+        client
+            .adopt(&auth_response("a", Some("r-new")))
+            .await
+            .unwrap();
         assert_eq!(store.refresh_token().unwrap().as_deref(), Some("r-new"));
         // Without a refresh token the stored one survives.
         client.adopt(&auth_response("a2", None)).await.unwrap();
@@ -1642,7 +1817,10 @@ mod tests {
     #[tokio::test]
     async fn exit_catalog_decodes_response() {
         let (client, _mock, store) = test_client(|_| {
-            json(200, r#"{"revision":3,"yaml":"proxies: []","sha256":"x","updatedAt":42}"#)
+            json(
+                200,
+                r#"{"revision":3,"yaml":"proxies: []","sha256":"x","updatedAt":42}"#,
+            )
         });
         store.set_refresh_token("r0").unwrap();
         client.adopt(&auth_response("a", None)).await.unwrap();
@@ -1682,7 +1860,10 @@ mod tests {
                 }
                 // Block until the test has run adopt().
                 release_rx.recv().unwrap();
-                return json(200, r#"{"accessToken":"access-old","refreshToken":"refresh-old"}"#);
+                return json(
+                    200,
+                    r#"{"accessToken":"access-old","refreshToken":"refresh-old"}"#,
+                );
             }
             assert_eq!(request.bearer.as_deref(), Some("access-new"));
             json(200, r#"{"user":{"id":"u","email":"e@x.co"}}"#)

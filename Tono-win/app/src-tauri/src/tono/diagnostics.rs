@@ -130,7 +130,11 @@ fn scrub_text_with(raw: &str, known: &[String]) -> String {
         let run = &captures[0];
         let mixed = run.chars().any(|character| character.is_ascii_digit())
             && run.chars().any(|character| character.is_ascii_alphabetic());
-        if mixed { "<redacted>".to_string() } else { run.to_string() }
+        if mixed {
+            "<redacted>".to_string()
+        } else {
+            run.to_string()
+        }
     });
     let trimmed = text.trim();
     let mut capped: String = trimmed.chars().take(MAX_TEXT_LEN).collect();
@@ -169,7 +173,9 @@ pub fn scrub_home(path: &Path, home: Option<&Path>) -> String {
 /// The user's profile directory, for [`scrub_home`].
 pub fn home_dir() -> Option<PathBuf> {
     let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(key).map(PathBuf::from).filter(|path| !path.as_os_str().is_empty())
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 /// Classify adapter names into the fixed class tokens above: sorted, deduped,
@@ -258,9 +264,7 @@ pub fn build_report(sources: &DiagnosticsSources<'_>) -> DiagnosticsReport {
         app_version: scrub_text_with(sources.app_version, known),
         os_version: scrub_text_with(sources.os_version, known),
         os_arch: scrub_text_with(sources.os_arch, known),
-        service_protocol: sources
-            .service_protocol
-            .map(|info| info.protocol.header_value()),
+        service_protocol: sources.service_protocol.map(|info| info.protocol.header_value()),
         service_build: sources
             .service_protocol
             .map(|info| scrub_text_with(&info.build_version, known)),
@@ -412,9 +416,7 @@ mod tests {
                     enabled: false,
                     snapshot_present: true,
                     adapters: 3,
-                    last_error: Some(format!(
-                        "resolver {OTHER_NODE_IP} unreachable; token={REFRESH_TOKEN}"
-                    )),
+                    last_error: Some(format!("resolver {OTHER_NODE_IP} unreachable; token={REFRESH_TOKEN}")),
                 },
                 protocol: ProtocolInfo::current(),
                 known: [
@@ -456,9 +458,7 @@ mod tests {
                 steps: &self.steps,
                 adapter_names: &self.adapters,
                 known_secrets: &self.known,
-                audit_log_path: Path::new(
-                    r"C:\Users\Jane Doe\AppData\Roaming\io.tono\tono\logs\traffic-audit.jsonl",
-                ),
+                audit_log_path: Path::new(r"C:\Users\Jane Doe\AppData\Roaming\io.tono\tono\logs\traffic-audit.jsonl"),
                 service_log_path: Path::new(r"C:\ProgramData\Tono\logs\tono-service.log"),
                 home_dir: Some(Path::new(r"C:\Users\Jane Doe")),
                 reported_at_ms: 1_712_345_678_901,
@@ -494,16 +494,16 @@ mod tests {
 
         let serialized = serde_json::to_string(&report).unwrap();
         for secret in SECRETS {
-            assert!(
-                !serialized.contains(secret),
-                "payload leaked {secret:?}:\n{serialized}"
-            );
+            assert!(!serialized.contains(secret), "payload leaked {secret:?}:\n{serialized}");
         }
         // Node endpoints are not merely redacted — the field is never read.
         assert!(!serialized.contains("endpoints"), "{serialized}");
         // The error still reads as a useful sentence afterwards.
         let error = report.error.as_deref().unwrap();
-        assert!(error.starts_with("core start failed: node <redacted> at <redacted>:443"), "{error}");
+        assert!(
+            error.starts_with("core start failed: node <redacted> at <redacted>:443"),
+            "{error}"
+        );
         let kill_switch_error = report.kill_switch_last_error.as_deref().unwrap();
         assert!(
             kill_switch_error.starts_with("WFP permit for <redacted>:443 rejected"),
@@ -554,7 +554,10 @@ mod tests {
         assert_eq!(report.service_log_path, r"C:\ProgramData\Tono\logs\tono-service.log");
         // Case-insensitive, and a path outside the profile is left alone.
         assert_eq!(
-            scrub_home(Path::new(r"c:\users\jane doe\x.log"), Some(Path::new(r"C:\Users\Jane Doe"))),
+            scrub_home(
+                Path::new(r"c:\users\jane doe\x.log"),
+                Some(Path::new(r"C:\Users\Jane Doe"))
+            ),
             r"%USERPROFILE%\x.log"
         );
         assert_eq!(
@@ -595,7 +598,10 @@ mod tests {
 
     #[test]
     fn structural_scrubbing_leaves_versions_durations_and_prose_alone() {
-        assert_eq!(scrub_text_with("connect 10.0.0.1:443 failed", &[]), "connect <ip>:443 failed");
+        assert_eq!(
+            scrub_text_with("connect 10.0.0.1:443 failed", &[]),
+            "connect <ip>:443 failed"
+        );
         assert_eq!(
             scrub_text_with("app 0.0.3 protocol 1.14 after 4.6s: securingDNS timed out", &[]),
             "app 0.0.3 protocol 1.14 after 4.6s: securingDNS timed out"
@@ -611,7 +617,10 @@ mod tests {
     fn a_short_known_secret_is_not_substituted_into_ordinary_words() {
         // Below the minimum length the value is more likely to be a substring
         // of real text than a secret worth blanking.
-        assert_eq!(scrub_text_with("dns probe failed", &["dns".to_string()]), "dns probe failed");
+        assert_eq!(
+            scrub_text_with("dns probe failed", &["dns".to_string()]),
+            "dns probe failed"
+        );
     }
 
     #[test]

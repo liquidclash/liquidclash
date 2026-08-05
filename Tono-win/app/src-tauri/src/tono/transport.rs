@@ -88,6 +88,7 @@ fn method_of(method: HttpMethod) -> reqwest::Method {
 #[async_trait]
 impl HttpTransport for TonoTransport {
     async fn send(&self, request: ApiRequest) -> Result<ApiResponse, ApiError> {
+        crate::tono::integration_profile::delay_remote_operation().await;
         let transport = |err: &reqwest::Error| ApiError::Transport {
             kind: classify(err),
             message: err.to_string(),

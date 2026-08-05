@@ -22,15 +22,18 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_MATCH_RANGE, FWP_RANGE_TYPE, FWP_RANGE0,
-    FWP_UINT8, FWP_UINT16, FWP_UINT64, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
-    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0, FWPM_ACTION0,
-    FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_LOCAL_PORT,
-    FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT,
-    FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0,
+    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE,
+    FWP_CONDITION_FLAG_IS_APPCONTAINER_LOOPBACK, FWP_CONDITION_FLAG_IS_NON_APPCONTAINER_LOOPBACK,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_MATCH_FLAGS_ANY_SET,
+    FWP_MATCH_RANGE, FWP_RANGE_TYPE, FWP_RANGE0, FWP_UINT8, FWP_UINT16, FWP_UINT32, FWP_UINT64,
+    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0,
+    FWP_VALUE0_0, FWPM_ACTION0, FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_FLAGS,
+    FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_LOCAL_PORT, FWPM_CONDITION_IP_PROTOCOL,
+    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT,
+    FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+    FWPM_LAYER_OUTBOUND_TRANSPORT_V6, FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0,
     FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0,
     FwpmFilterAdd0, FwpmFilterCreateEnumHandle0, FwpmFilterDeleteByKey0,
     FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFilterGetByKey0, FwpmFreeMemory0,
@@ -332,6 +335,17 @@ fn build_condition(
                 },
             )
         }
+        Condition::AleLoopback => (
+            FWPM_CONDITION_FLAGS,
+            FWP_MATCH_FLAGS_ANY_SET,
+            FWP_CONDITION_VALUE0 {
+                r#type: FWP_UINT32,
+                Anonymous: FWP_CONDITION_VALUE0_0 {
+                    uint32: FWP_CONDITION_FLAG_IS_APPCONTAINER_LOOPBACK
+                        | FWP_CONDITION_FLAG_IS_NON_APPCONTAINER_LOOPBACK,
+                },
+            },
+        ),
         Condition::AleAppId => {
             if app_id.is_null() {
                 bail!("filter requires the staged core app-id, which was not resolved");
@@ -370,6 +384,8 @@ fn layer_key(layer: LayerKind) -> GUID {
         LayerKind::AleAuthConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
         LayerKind::AleAuthConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         LayerKind::AleAuthRecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+        LayerKind::OutboundTransportV4 => FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+        LayerKind::OutboundTransportV6 => FWPM_LAYER_OUTBOUND_TRANSPORT_V6,
     }
 }
 
@@ -386,17 +402,22 @@ fn add_filter(engine: &Engine, spec: &FilterSpec, app_id: *mut FWP_BYTE_BLOB) ->
     let name = wide(&spec.name);
     let description = wide("Tono kill switch filter");
     let mut provider_key = to_sys(TONO_WFP_PROVIDER_KEY);
+    let mut flags = 0;
+    if spec.persistent {
+        flags |= FWPM_FILTER_FLAG_PERSISTENT;
+    }
+    if spec.hard_permit {
+        debug_assert_eq!(spec.action, FilterAction::Permit);
+        flags |= FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT;
+    }
+
     let mut filter = FWPM_FILTER0 {
         filterKey: to_sys(spec.key),
         displayData: FWPM_DISPLAY_DATA0 {
             name: name.as_ptr().cast_mut(),
             description: description.as_ptr().cast_mut(),
         },
-        flags: if spec.persistent {
-            FWPM_FILTER_FLAG_PERSISTENT
-        } else {
-            0
-        },
+        flags,
         providerKey: &mut provider_key,
         layerKey: layer_key(spec.layer),
         subLayerKey: to_sys(TONO_WFP_SUBLAYER_KEY),

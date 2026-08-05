@@ -56,9 +56,7 @@ pub(crate) fn stop_windows_service(
 }
 
 #[cfg(windows)]
-fn stop_windows_service_gracefully(
-    service: &platform_lib::service::Service,
-) -> Result<(), Error> {
+fn stop_windows_service_gracefully(service: &platform_lib::service::Service) -> Result<(), Error> {
     use platform_lib::{Error as WindowsServiceError, service::ServiceState};
 
     const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;

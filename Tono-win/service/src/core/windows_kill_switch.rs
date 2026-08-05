@@ -225,6 +225,17 @@ fn armed_guard() -> std::sync::MutexGuard<'static, Option<Armed>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Return the live tunnel identity that the current core instance is actually permitted to use.
+/// DNS recovery uses this to ignore Tono's own WinTUN adapter while still treating the same
+/// protected resolver on every physical adapter as an orphaned, fail-closed state. Re-validating
+/// the recorded LUID against the running core is essential because Windows can reuse LUID indices.
+pub(crate) async fn protected_tunnel_luid() -> Option<u64> {
+    let current_core = current_core_instance().await;
+    armed_guard()
+        .as_ref()
+        .and_then(|armed| tunnel_permit_luid(armed, current_core))
+}
+
 fn last_error_guard() -> std::sync::MutexGuard<'static, Option<String>> {
     LAST_ERROR
         .lock()
@@ -272,6 +283,38 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+/// A durable record that means an explicit release won and startup must finish removing any
+/// provider-scoped WFP debris before it exposes IPC.
+///
+/// Keeping this record until the next Service start closes a subtle replacement race. A normal
+/// release used to delete `kill-switch.json` after proving the filters absent. On this machine,
+/// stopping that otherwise-clean Service during an in-place update made persistent filters
+/// visible again. The replacement then saw "missing intent + filters" and correctly (but
+/// disastrously for a disconnected user) installed the ownerless emergency block. `wanted:false`
+/// is the existing, fail-open recovery contract; the next arm atomically replaces it with a
+/// wanted record before touching WFP, and startup consumes it only after cleanup.
+fn disarmed_tombstone() -> IntentRecord {
+    IntentRecord {
+        wanted: false,
+        mode: KillSwitchStatusMode::Blocked,
+        verified: Some(false),
+        tunnel_interface: String::new(),
+        app_path: String::new(),
+        endpoints: Vec::new(),
+        api_host_ips: Vec::new(),
+        updated_at: now_unix(),
+        owner_key: None,
+    }
+}
+
+async fn persist_disarmed_tombstone() -> Result<()> {
+    atomic_write(
+        &intent_path(),
+        &serde_json::to_vec_pretty(&disarmed_tombstone())?,
+    )
+    .await
 }
 
 /// Whether the facade's state machine runs on this build: the real service on Windows, plus
@@ -1060,13 +1103,10 @@ async fn disarm_unlocked() -> Result<()> {
     let previous = armed_guard().clone();
     let Some(previous) = previous else {
         // Not armed: still sweep possible residuals so a half-failed earlier run cannot
-        // linger, then clear any stale intent file.
+        // linger. Persist the explicit-release tombstone *after* proving the sweep so a Service
+        // replacement cannot reinterpret late-visible persistent filters as a wanted session.
         remove_all_filters_unlocked().await?;
-        match tokio::fs::remove_file(intent_path()).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        persist_disarmed_tombstone().await?;
         // A leftover DNS snapshot must not be skipped just because nothing is armed: the
         // filters are already gone, so refusing would buy no blocking — but the resolver
         // must not stay on a dead loopback. Best-effort, surfaced via last_error.
@@ -1097,15 +1137,24 @@ async fn disarm_unlocked() -> Result<()> {
         let _ = install_unlocked(&previous).await;
         return Err(error.context("failed to remove kill-switch filters; protection restored"));
     }
-    match tokio::fs::remove_file(intent_path()).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            install_unlocked(&previous).await.context(
-                "network opened and persisted-state cleanup failed; failed to restore protection",
-            )?;
-            return Err(error).context("network opened but persisted-state cleanup failed");
-        }
+    if let Err(error) = persist_disarmed_tombstone().await {
+        // The old wanted intent is still the only durable recovery evidence if writing the
+        // replacement tombstone failed. Put it back before reinstalling the previous policy;
+        // otherwise a later Service restart could open a release that this call reports failed.
+        let restore_intent = atomic_write(
+            &intent_path(),
+            &serde_json::to_vec_pretty(&previous.intent)?,
+        )
+        .await;
+        let restore_filters = install_unlocked(&previous).await;
+        restore_intent.context(
+            "network opened and the disarmed tombstone could not be written; failed to restore the wanted intent",
+        )?;
+        restore_filters.context(
+            "network opened and the disarmed tombstone could not be written; failed to restore protection",
+        )?;
+        return Err(error)
+            .context("network opened but the disarmed tombstone could not be written");
     }
     *armed_guard() = None;
     *last_error_guard() = None;
@@ -1360,6 +1409,91 @@ pub async fn restore_on_service_start() -> Result<()> {
     }
 }
 
+/// Read-only WFP proof for the uninstaller's "nothing to clean" fast path.
+///
+/// State files are not the source of truth for persistent WFP objects: an interrupted or older
+/// uninstall can leave provider-scoped filters behind after deleting `kill-switch.json` and the
+/// SCM record. The next Service start deliberately treats that combination as armed. Therefore
+/// an uninstaller may only skip the real disarm when this probe also proves that no Tono filter
+/// exists. Errors stay on the fail-closed side and are surfaced to the caller.
+#[cfg(all(windows, not(feature = "test")))]
+pub async fn residual_filters_present() -> Result<bool> {
+    let _operation = WFP_OPERATION.lock().await;
+    engine_call(
+        "uninstall residual filter check",
+        crate::core::wfp::any_filters_exist,
+    )
+    .await
+}
+
+#[cfg(not(all(windows, not(feature = "test"))))]
+pub async fn residual_filters_present() -> Result<bool> {
+    Ok(false)
+}
+
+/// Prepare an in-place Service replacement without opening an active protected session.
+///
+/// The elevated installer calls this only after SCM reports the old Service stopped and while it
+/// holds the singleton Service-owner lock. A valid wanted intent or any active owner is durable
+/// evidence that protection must survive the replacement, so those cases are untouched. A
+/// disconnected pre-fix build, however, has neither record: synthesize the same `wanted:false`
+/// tombstone a fixed release leaves so startup removes late-visible WFP debris instead of
+/// converting it into an ownerless emergency block.
+///
+/// Corrupt wanted-state evidence stays fail-closed. It is intentionally not "repaired" into an
+/// open marker merely because an installer is running.
+pub async fn prepare_for_service_replacement() -> Result<bool> {
+    ensure_supported()?;
+
+    // Do not use `load_active_owner` here: its normal runtime contract quarantines malformed
+    // owner JSON and reports `None`, which is useful for an owner-gated release but too
+    // permissive for an installer deciding whether it may synthesize an open marker. During a
+    // replacement, unreadable or malformed owner evidence is ambiguity and ambiguity preserves
+    // protection.
+    let active_owner_path = crate::service_paths().active_owner_path();
+    match tokio::fs::read(&active_owner_path).await {
+        Ok(bytes) => {
+            if serde_json::from_slice::<crate::core::desired::ActiveOwnerState>(&bytes).is_err() {
+                tracing::warn!(
+                    "Service replacement found corrupt active-owner evidence; preserving protection fail-closed"
+                );
+            }
+            return Ok(false);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect active-owner evidence {active_owner_path:?} before Service replacement; refusing to change protection"
+                )
+            });
+        }
+    }
+
+    match tokio::fs::read(intent_path()).await {
+        Ok(bytes) => match serde_json::from_slice::<IntentRecord>(&bytes) {
+            Ok(intent) if intent.wanted => Ok(false),
+            Ok(_) => {
+                persist_disarmed_tombstone().await?;
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Service replacement found a corrupt kill-switch intent; preserving it fail-closed: {error}"
+                );
+                Ok(false)
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            persist_disarmed_tombstone().await?;
+            Ok(true)
+        }
+        Err(error) => Err(error).context(
+            "failed to inspect kill-switch intent before Service replacement; refusing to change protection",
+        ),
+    }
+}
+
 /// Finish startup recovery for an initial attempt that never crossed the durable verification
 /// barrier. This must run only *after* `reconcile_service_startup` has stopped and identified any
 /// surviving Core. The order is deliberately irreversible-safe:
@@ -1484,11 +1618,11 @@ pub fn spawn_windows_kill_switch_watchdog() {
 ///
 /// **The invariant this function exists to hold, and the one the uninstall exit codes rest on:**
 /// the WFP objects are removed before any DNS outcome is reported, and every `?` above the
-/// removal fails *without* reporting a DNS outcome. So a returned
-/// `dns::DNS_RESTORED_AUTOMATIC_PREFIX` (the ladder's rung 2) is proof that the filters are
-/// gone, and every error that does not carry it is treated by the uninstaller as "the barrier
-/// may still be installed" and blocks. Removing WFP and continuing is acceptable; removing the
-/// app and leaving WFP is not.
+/// removal fails *without* claiming the barrier is gone. Once WFP is deleted, every DNS outcome
+/// is tagged with a continue marker (`DNS_RESTORED_AUTOMATIC_PREFIX`,
+/// `DNS_UNINSTALL_STILL_ON_LOOPBACK_PREFIX`, or `WFP_REMOVED_CONTINUE_PREFIX`) so the
+/// uninstaller can never treat "filters gone, DNS messy" as result 3. Removing the app while
+/// leaving WFP armed is the only end state that must still block.
 pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     let _operation = WFP_OPERATION.lock().await;
     // This is still the fail-open escape hatch: WFP objects are removed even if protected DNS
@@ -1562,14 +1696,22 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     *armed_guard() = None;
     *last_verify_guard() = None;
     TUNNEL_PERMIT_RENDERED.store(false, Ordering::Relaxed);
+    // Intent deletion is best-effort once WFP is gone. The tombstone (wanted:false) is already
+    // on disk, so a leftover file cannot re-arm a block; refusing uninstall here recreated the
+    // "result 3 forever" deadlock for Chinese test machines whose ProgramData ACLs deny the
+    // final unlink under the elevated installer token.
     match tokio::fs::remove_file(intent_path()).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            tracing::warn!(
+                "kill-switch intent could not be deleted after WFP removal (continuing): {error:#}"
+            );
+        }
     }
-    // Everything below runs only once the WFP objects are provably gone: the two `?` above
-    // return before it. That is what makes the marker in the rung-2 error trustworthy as
-    // "the barrier is removed" and not merely "DNS is inexact".
+    // Everything below runs only once the WFP objects are provably gone: the engine_call `?`
+    // above returns before it. Every imperfect DNS outcome is therefore tagged so the
+    // uninstaller continues — the barrier that could leave a brick is already down.
     match dns_restore {
         // Rung 1: the snapshot was restored and proven. Nothing to report.
         Ok(crate::core::dns::UninstallDnsRestore::Exact) => Ok(()),
@@ -1595,16 +1737,21 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
                 adapters.len(),
             ))
         }
-        // Rung 3, or a DNS failure on the non-uninstall path: unchanged in shape and in
-        // consequence.
+        // Rung 3 or any other post-removal DNS failure: WFP is already gone. Tag with the
+        // continue marker so install/uninstall never dead-end as result 3. The inner error
+        // still names STILL_ON_LOOPBACK / snapshot paths so the detail log can tell the user
+        // how to fix DNS in Windows Settings.
         Err(error) => {
             let snapshot = crate::service_paths()
                 .persistent_state_dir()
                 .join("protected-dns.json");
             Err(anyhow::anyhow!(
-                "WFP was removed, but DNS restore could not be proven: {error:#}. \
-                 Recovery snapshot: {snapshot:?}. Restore the affected adapter DNS (usually DHCP), \
-                 then rerun the uninstaller; if the snapshot is corrupt, delete it only after DNS is verified."
+                "{}: WFP was removed, but DNS restore could not be proven: {error:#}. \
+                 Recovery snapshot: {snapshot:?}. The network barrier is gone so install and \
+                 uninstall may continue. If name resolution is still wrong, open Settings → \
+                 Network & Internet → your adapter → DNS server assignment → Automatic (DHCP) \
+                 for both IPv4 and IPv6.",
+                crate::core::dns::WFP_REMOVED_CONTINUE_PREFIX,
             ))
         }
     }
@@ -1770,12 +1917,27 @@ mod tests {
         crate::core::dns::test_hooks::set_live_dns_on_loopback(true);
     }
 
+    async fn assert_disarmed_tombstone_present() -> Result<()> {
+        let intent: IntentRecord = serde_json::from_slice(&tokio::fs::read(intent_path()).await?)?;
+        assert!(
+            !intent.wanted,
+            "explicit release must leave wanted=false evidence"
+        );
+        assert!(intent.owner_key.is_none());
+        assert!(intent.endpoints.is_empty());
+        Ok(())
+    }
+
     async fn cleanup() {
         crate::core::dns::test_hooks::set_live_dns_on_loopback(false);
         *ARMED.lock().unwrap() = None;
         *LAST_ERROR.lock().unwrap() = None;
         RESTORE_WAS_LOCKED.store(false, Ordering::Release);
-        for path in [intent_path(), dns_snapshot_path()] {
+        for path in [
+            intent_path(),
+            dns_snapshot_path(),
+            crate::service_paths().active_owner_path(),
+        ] {
             match tokio::fs::remove_file(path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1862,7 +2024,7 @@ mod tests {
         tokio::fs::remove_file(dns_snapshot_path()).await?;
         assert!(retire_unverified_on_service_start().await?);
         assert!(ARMED.lock().unwrap().is_none());
-        assert!(tokio::fs::metadata(intent_path()).await.is_err());
+        assert_disarmed_tombstone_present().await?;
         cleanup().await;
         Ok(())
     }
@@ -1941,6 +2103,118 @@ mod tests {
             "an unwanted intent record must be removed"
         );
         assert!(!status().await.wanted);
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_release_tombstone_survives_until_replacement_start_consumes_it() -> Result<()>
+    {
+        cleanup().await;
+        arm_bootstrap(&test_config(), "/opt/tono/mihomo", "owner-alice").await?;
+
+        release().await?;
+        assert_disarmed_tombstone_present().await?;
+
+        // The in-place replacement is a fresh process; only the on-disk tombstone crosses it.
+        *ARMED.lock().unwrap() = None;
+        restore_on_service_start().await?;
+
+        assert!(ARMED.lock().unwrap().is_none());
+        assert!(
+            tokio::fs::metadata(intent_path()).await.is_err(),
+            "startup consumes the tombstone only after the residual-filter cleanup"
+        );
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replacement_marks_a_pre_fix_disconnected_install_but_preserves_wanted_intent()
+    -> Result<()> {
+        cleanup().await;
+
+        assert!(prepare_for_service_replacement().await?);
+        assert_disarmed_tombstone_present().await?;
+
+        let wanted = valid_intent(KillSwitchStatusMode::Locked, true);
+        atomic_write(&intent_path(), &serde_json::to_vec_pretty(&wanted)?).await?;
+        assert!(
+            !prepare_for_service_replacement().await?,
+            "a valid wanted session must stay fail-closed across replacement"
+        );
+        let preserved: IntentRecord =
+            serde_json::from_slice(&tokio::fs::read(intent_path()).await?)?;
+        assert!(preserved.wanted);
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replacement_never_synthesizes_an_open_marker_for_an_active_owner() -> Result<()> {
+        cleanup().await;
+        let active = crate::core::desired::ActiveOwnerState {
+            owner_key: "owner-active".to_owned(),
+            identity: crate::OwnerIdentity::Windows {
+                sid: "S-1-5-21-test-owner".to_owned(),
+            },
+            app_data_root: std::env::temp_dir().to_string_lossy().into_owned(),
+            generation: 7,
+            session_token_hash: "session-hash".to_owned(),
+        };
+        atomic_write(
+            &crate::service_paths().active_owner_path(),
+            &serde_json::to_vec_pretty(&active)?,
+        )
+        .await?;
+
+        assert!(!prepare_for_service_replacement().await?);
+        assert!(
+            tokio::fs::metadata(intent_path()).await.is_err(),
+            "an active owner with missing WFP evidence is ambiguous and must not be opened"
+        );
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replacement_preserves_corrupt_active_owner_evidence_fail_closed() -> Result<()> {
+        cleanup().await;
+        atomic_write(
+            &crate::service_paths().active_owner_path(),
+            b"{ corrupt active owner evidence",
+        )
+        .await?;
+
+        assert!(!prepare_for_service_replacement().await?);
+        assert!(
+            tokio::fs::metadata(intent_path()).await.is_err(),
+            "damaged owner evidence is ambiguity, never permission to synthesize wanted=false"
+        );
+        assert_eq!(
+            tokio::fs::read(crate::service_paths().active_owner_path()).await?,
+            b"{ corrupt active owner evidence",
+            "replacement preparation must retain evidence for diagnosis"
+        );
+        cleanup().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replacement_preserves_corrupt_intent_fail_closed() -> Result<()> {
+        cleanup().await;
+        atomic_write(&intent_path(), b"{ corrupt wanted evidence").await?;
+
+        assert!(!prepare_for_service_replacement().await?);
+        assert_eq!(
+            tokio::fs::read(intent_path()).await?,
+            b"{ corrupt wanted evidence"
+        );
         cleanup().await;
         Ok(())
     }
@@ -2156,7 +2430,7 @@ mod tests {
         tokio::fs::remove_file(dns_snapshot_path()).await?;
         transition_after_stop(true).await?;
         assert!(ARMED.lock().unwrap().is_none());
-        assert!(tokio::fs::metadata(intent_path()).await.is_err());
+        assert_disarmed_tombstone_present().await?;
         assert!(!status().await.wanted);
         cleanup().await;
         Ok(())
@@ -2179,7 +2453,7 @@ mod tests {
 
         assert!(ARMED.lock().unwrap().is_none());
         assert!(tokio::fs::metadata(dns_snapshot_path()).await.is_err());
-        assert!(tokio::fs::metadata(intent_path()).await.is_err());
+        assert_disarmed_tombstone_present().await?;
         cleanup().await;
         Ok(())
     }
@@ -2199,6 +2473,10 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("WFP was removed"), "{message}");
         assert!(message.contains("protected-dns.json"), "{message}");
+        assert!(
+            message.contains(crate::core::dns::WFP_REMOVED_CONTINUE_PREFIX),
+            "post-WFP DNS failure must be tagged so uninstall cannot brick as result 3: {message}"
+        );
         assert!(ARMED.lock().unwrap().is_none());
         assert!(
             tokio::fs::metadata(intent_path()).await.is_err(),
@@ -2386,12 +2664,12 @@ mod tests {
         Ok(())
     }
 
-    /// Rung 3: the refusal survives, but only for a machine that provably cannot be taken off
-    /// the loopback resolver — and even then the WFP objects are gone, so the user is online and
-    /// one DNS change away from an uninstall that completes. Every recovery file is preserved.
+    /// Rung 3: DNS may still be stuck on Tono's resolver, but WFP is already gone. The error is
+    /// still reported (so the detail log can tell the user to flip DNS to Automatic), and it is
+    /// tagged with the continue marker so install/uninstall never dead-end as result 3.
     #[tokio::test]
     #[serial]
-    async fn uninstall_ladder_still_refuses_when_the_machine_cannot_leave_the_loopback_resolver()
+    async fn uninstall_ladder_reports_stuck_dns_but_lets_uninstall_continue_after_wfp_is_gone()
     -> Result<()> {
         cleanup().await;
         remove_superseded_snapshots().await;
@@ -2409,7 +2687,7 @@ mod tests {
 
         let error = emergency_disarm_windows_kill_switch()
             .await
-            .expect_err("a machine that is provably still redirected must not be walked away from");
+            .expect_err("stuck DNS is still reported, but as a continuable outcome");
         let message = format!("{error:#}");
 
         assert!(
@@ -2417,21 +2695,21 @@ mod tests {
             "{message}"
         );
         assert!(
-            !message.contains(crate::core::dns::DNS_RESTORED_AUTOMATIC_PREFIX),
-            "the blocking rung must never carry the marker that lets an uninstall continue: \
+            message.contains(crate::core::dns::WFP_REMOVED_CONTINUE_PREFIX),
+            "post-WFP DNS failure must carry the continue marker so result 3 cannot fire: \
              {message}"
         );
         assert!(
             message.contains("Automatic (DHCP)"),
-            "the refusal has to tell the user what to do about it: {message}"
+            "the report has to tell the user what to do about DNS: {message}"
         );
-        // Even here the barrier is removed: being unable to remove the app *and* being blocked
-        // offline is the worse end state, and the barrier is the half that makes them offline.
+        // The barrier is removed: being unable to remove the app *and* being blocked offline is
+        // the worse end state, and the barrier is the half that makes them offline.
         assert!(ARMED.lock().unwrap().is_none());
         assert!(tokio::fs::metadata(intent_path()).await.is_err());
         assert!(
             tokio::fs::metadata(dns_snapshot_path()).await.is_ok(),
-            "a refused uninstall preserves every recovery file for the retry"
+            "imperfect DNS restore preserves the snapshot so the user can recover originals"
         );
         assert!(!superseded_snapshot_exists().await);
 
@@ -2473,7 +2751,7 @@ mod tests {
 
         assert!(!status.wanted, "released status reports wanted=false");
         assert!(ARMED.lock().unwrap().is_none());
-        assert!(tokio::fs::metadata(intent_path()).await.is_err());
+        assert_disarmed_tombstone_present().await?;
         cleanup().await;
         Ok(())
     }
@@ -2487,8 +2765,10 @@ mod tests {
         // switch was never armed — the explicit release must still succeed.
         let status = release().await?;
         assert!(!status.wanted);
+        assert_disarmed_tombstone_present().await?;
         let again = release().await?;
         assert!(!again.wanted);
+        assert_disarmed_tombstone_present().await?;
         cleanup().await;
         Ok(())
     }
@@ -3022,7 +3302,8 @@ mod tests {
                 .iter()
                 .filter(|filter| filter.name.contains("DIRECT"))
                 .count(),
-            2
+            4,
+            "each approved tuple must exist at ALE and outbound transport"
         );
 
         restrict_bootstrap().await?;
