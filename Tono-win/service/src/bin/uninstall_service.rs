@@ -330,7 +330,6 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn windows_cleanup() -> CleanupOutcome {
-    use anyhow::Context as _;
     use platform_lib::{
         Error as WindowsServiceError,
         service::ServiceAccess,
@@ -372,7 +371,9 @@ fn windows_cleanup() -> CleanupOutcome {
     // branch with orphaned persistent WFP filters; this helper returned Clean, then the next
     // Service start correctly saw those filters and installed a strict emergency block, taking
     // the machine offline until the App released it. Probe the WFP engine itself before the
-    // fast path. A probe error is unknown/possibly armed and therefore blocks the uninstall.
+    // fast path. A probe *error* used to block install/uninstall as result 3 even when a full
+    // disarm would have cleared the machine — that is the worse end state for Chinese test
+    // installs. Treat probe failure as "unknown, run the full disarm" instead of aborting.
     let recovery_state_present = windows_recovery_state_present();
     if service.is_none() && !recovery_state_present {
         let residual_filters_present = match tokio::runtime::Builder::new_current_thread()
@@ -384,16 +385,19 @@ fn windows_cleanup() -> CleanupOutcome {
             {
                 Ok(present) => present,
                 Err(error) => {
-                    return CleanupOutcome::StillProtected(
-                        error.context("could not prove that orphaned Tono WFP filters are absent"),
+                    eprintln!(
+                        "Could not probe residual Tono WFP filters ({error:#}); running the full \
+                         network disarm instead of blocking install/uninstall."
                     );
+                    true
                 }
             },
             Err(error) => {
-                return CleanupOutcome::StillProtected(
-                    anyhow::Error::new(error)
-                        .context("failed to create the residual WFP verification runtime"),
+                eprintln!(
+                    "Could not create the residual WFP verification runtime ({error:#}); running \
+                     the full network disarm instead of blocking install/uninstall."
                 );
+                true
             }
         };
         if cleanup_fast_path_allowed(false, false, residual_filters_present) {
@@ -406,7 +410,8 @@ fn windows_cleanup() -> CleanupOutcome {
             };
         }
         println!(
-            "No service or recovery state remains, but orphaned Tono WFP filters exist; running the full network disarm."
+            "No service or recovery state remains, but orphaned Tono WFP filters exist (or could \
+             not be ruled out); running the full network disarm."
         );
     }
 
@@ -435,34 +440,54 @@ fn windows_cleanup() -> CleanupOutcome {
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let owner_guard = match clash_verge_service_ipc::acquire_service_owner().await? {
-                Some(guard) => Some(guard),
-                // A daemon that still answers on the pipe even though the SCM record is gone or
-                // stopped (a standalone or orphaned build) would race the disarm. Terminate it
-                // by the pid it recorded, then take the lock over.
-                None => {
-                    let pid = read_service_pid_file().context(
-                        "a running daemon holds the owner lock but left no pid file; \
-                         refusing to open the kill switch",
-                    )?;
-                    println!(
-                        "Owner lock is held by live daemon {pid}; terminating it before disarm."
+            // Prefer the owner lock so we do not race a live daemon. If lock acquisition fails
+            // after the SCM stop (ProgramData ACL damage, missing pid file, stuck lock), still
+            // attempt the disarm: the uninstall ladder removes WFP even when tombstone writes
+            // fail, and refusing here is exactly the result-3 install/uninstall deadlock.
+            let owner_guard = match clash_verge_service_ipc::acquire_service_owner().await {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => match read_service_pid_file() {
+                    Some(pid) => {
+                        println!(
+                            "Owner lock is held by live daemon {pid}; terminating it before disarm."
+                        );
+                        terminate_process_by_pid(pid)?;
+                        clash_verge_service_ipc::acquire_service_owner()
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    None => {
+                        eprintln!(
+                            "Owner lock is held but no pid file is available; attempting disarm \
+                             without the lock so install/uninstall can proceed."
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    eprintln!(
+                        "Could not acquire the service owner lock ({error:#}); attempting disarm \
+                         anyway so a stuck ProgramData ACL cannot brick install/uninstall."
                     );
-                    terminate_process_by_pid(pid)?;
-                    clash_verge_service_ipc::acquire_service_owner().await?
+                    None
                 }
             };
-            let Some(_owner_guard) = owner_guard else {
-                anyhow::bail!("service daemon is still running; refusing to open the kill switch");
-            };
+            if owner_guard.is_none() {
+                eprintln!(
+                    "Proceeding with emergency disarm without an exclusive owner lock; service \
+                     was already stopped (or never registered)."
+                );
+            }
+            let _owner_guard = owner_guard;
             clash_verge_service_ipc::emergency_disarm_windows_kill_switch().await
         })
     })();
     // The escalation ladder collapses back into two questions here: are the WFP filters gone,
     // and if the exact DNS restore failed, is the machine at least off Tono's resolver? Only
-    // the marker answers "yes" to both without an exact restore, and it can only be produced
-    // after the filters were deleted — so `RestoredToAutomatic` continues while every other
-    // failure still blocks with every recovery file preserved.
+    // post-WFP continue markers answer "yes" without an exact restore. If the disarm error is
+    // unmarked, re-probe residual filters: when the barrier is already gone, continue rather
+    // than result-3 brick (tombstone/ACL noise after a successful engine delete).
     let dns_fallback = match disarm {
         Ok(()) => None,
         Err(error) => match classify_disarm_failure(error) {
@@ -474,7 +499,32 @@ fn windows_cleanup() -> CleanupOutcome {
                 );
                 Some(error)
             }
-            blocking => return blocking,
+            CleanupOutcome::StillProtected(error) => {
+                let residual = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .and_then(|runtime| {
+                        runtime
+                            .block_on(clash_verge_service_ipc::residual_filters_present())
+                            .ok()
+                    });
+                match residual {
+                    Some(false) => {
+                        eprintln!(
+                            "Disarm reported failure ({error:#}), but no residual Tono WFP \
+                             filters remain; treating the machine as unblocked so \
+                             install/uninstall can continue."
+                        );
+                        Some(anyhow::anyhow!(
+                            "{WFP_REMOVED_CONTINUE_MARKER}: disarm reported an error but residual \
+                             WFP filters are absent: {error:#}"
+                        ))
+                    }
+                    _ => return CleanupOutcome::StillProtected(error),
+                }
+            }
+            other => return other,
         },
     };
     if dns_fallback.is_none() {

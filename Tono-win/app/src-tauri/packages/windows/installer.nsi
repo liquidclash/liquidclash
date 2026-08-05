@@ -651,6 +651,22 @@ FunctionEnd
     ; Preserve the recovery files but return control instead of hanging forever if cleanup stalls.
     nsExec::ExecToLog /TIMEOUT=180000 '"$INSTDIR\resources\tono-service-uninstall.exe"'
     Pop $0
+    ; Second chance for machines that fail the first pass (stuck owner lock, ProgramData ACL, or
+    ; a wedged first disarm): run the Service binary's emergency disarm, then retry the helper.
+    ; Exit codes 0/2/4 already mean safe to continue — do not re-run them.
+    ${If} $0 != "0"
+    ${AndIf} $0 != "2"
+    ${AndIf} $0 != "4"
+      DetailPrint "First cleanup returned $0; trying emergency disarm and a second cleanup pass..."
+      ${If} ${FileExists} "$INSTDIR\resources\tono-service.exe"
+        nsExec::ExecToLog /TIMEOUT=120000 '"$INSTDIR\resources\tono-service.exe" --emergency-disarm'
+        Pop $1
+        DetailPrint "Emergency disarm finished (result $1)."
+      ${EndIf}
+      nsExec::ExecToLog /TIMEOUT=180000 '"$INSTDIR\resources\tono-service-uninstall.exe"'
+      Pop $0
+      DetailPrint "Second cleanup finished (result $0)."
+    ${EndIf}
     ; The helper's exit-code contract (uninstall_service.rs `cleanup_exit_code`):
     ;   0 = the machine is clean (or was already clean)
     ;   2 = the network was provably restored; only cosmetic cleanup (SCM record/binary) failed

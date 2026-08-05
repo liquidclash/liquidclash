@@ -1659,9 +1659,15 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
             .map(|_| crate::core::dns::UninstallDnsRestore::Exact)
     };
 
-    // Persist fail-open intent *before* removing WFP. If deleting the intent file later fails,
-    // service-start recovery sees this tombstone and completes cleanup instead of re-arming the
-    // stale wanted policy. If writing the tombstone itself fails, leave WFP untouched.
+    // Persist fail-open intent *before* removing WFP when we can. Service-start recovery sees
+    // the tombstone and finishes cleanup instead of re-arming a stale wanted policy.
+    //
+    // **Uninstall ladder exception:** Chinese customer machines repeatedly hit
+    // `ensure_private_service_directory` / ProgramData ACL failures on this write, which used to
+    // return *before* WFP removal and brick install/uninstall as result 3 forever — with the
+    // barrier still armed. When this process opted into the uninstall ladder, a tombstone
+    // failure is logged and we still delete provider-scoped WFP objects: the alternative is an
+    // application that cannot be removed. Non-uninstall callers keep the old refuse path.
     let mut tombstone = match tokio::fs::read(intent_path()).await {
         Ok(bytes) => serde_json::from_slice::<IntentRecord>(&bytes).ok(),
         Err(_) => None,
@@ -1679,23 +1685,46 @@ pub async fn emergency_disarm_windows_kill_switch() -> Result<()> {
     });
     tombstone.wanted = false;
     tombstone.updated_at = now_unix();
-    atomic_write(&intent_path(), &serde_json::to_vec_pretty(&tombstone)?).await?;
+    let tombstone_error = match atomic_write(&intent_path(), &serde_json::to_vec_pretty(&tombstone)?)
+        .await
+    {
+        Ok(()) => None,
+        Err(error) if uninstall_ladder_requested() => {
+            tracing::error!(
+                "uninstall disarm: kill-switch tombstone could not be written ({error:#}); \
+                 still removing WFP so install/uninstall cannot dead-end as result 3"
+            );
+            Some(error)
+        }
+        Err(error) => return Err(error),
+    };
 
     // Bounded like every other engine call: an uninstaller that hangs forever on a wedged BFE
-    // is worse than one that reports why it could not finish. The `wanted: false` tombstone is
-    // already on disk, so the next service start completes the cleanup either way.
+    // is worse than one that reports why it could not finish. When the tombstone is on disk the
+    // next service start completes cleanup either way; when it is not (uninstall ladder only)
+    // the WFP delete itself is the safety proof the uninstaller needs.
     //
-    // Ordering: the tombstone goes to disk *before* the engine call (a crash mid-removal must
-    // still complete cleanup at the next service start), but the in-memory disarmed state is
+    // Ordering: prefer tombstone *before* the engine call (a crash mid-removal must still
+    // complete cleanup at the next service start), but the in-memory disarmed state is
     // published *after* it. Publishing first would make `status()` report an unprotected
     // machine while the filters are demonstrably still installed — the exact inversion of what
-    // the product promises. On failure the reported state therefore stays "armed", which is
-    // what the engine still enforces; the tombstone finishes the job on the next start.
+    // the product promises. On engine failure the reported state therefore stays "armed".
     #[cfg(all(windows, not(feature = "test")))]
     engine_call("emergency disarm", crate::core::wfp::emergency_disarm).await?;
     *armed_guard() = None;
     *last_verify_guard() = None;
     TUNNEL_PERMIT_RENDERED.store(false, Ordering::Relaxed);
+    // Best-effort tombstone after a skipped pre-write so a later Service start still prefers
+    // cleanup over emergency re-arm when ProgramData becomes writable again.
+    if tombstone_error.is_some() {
+        if let Err(error) =
+            atomic_write(&intent_path(), &serde_json::to_vec_pretty(&tombstone)?).await
+        {
+            tracing::warn!(
+                "uninstall disarm: post-WFP tombstone write still failed: {error:#}"
+            );
+        }
+    }
     // Intent deletion is best-effort once WFP is gone. The tombstone (wanted:false) is already
     // on disk, so a leftover file cannot re-arm a block; refusing uninstall here recreated the
     // "result 3 forever" deadlock for Chinese test machines whose ProgramData ACLs deny the
