@@ -182,6 +182,17 @@ pub(crate) fn emit_status(app: &AppHandle, status: &TonoStatus) {
     if let Err(err) = app.emit("tono://status", status) {
         logging!(warn, Type::Service, "Tono: 状态事件发送失败: {err}");
     }
+    // The tray is another projection of this same product state. Rebuild it asynchronously so
+    // callers may continue publishing while holding the state mutex; the tray snapshot will run
+    // after that guard is released and therefore cannot deadlock the connection transaction.
+    AsyncHandler::spawn(|| async {
+        if let Err(err) = crate::core::tray::Tray::global().update_menu().await {
+            logging!(warn, Type::Tray, "Tono: failed to refresh tray status: {err:#}");
+        }
+        if let Err(err) = crate::core::tray::Tray::global().update_tooltip().await {
+            logging!(warn, Type::Tray, "Tono: failed to refresh tray tooltip: {err:#}");
+        }
+    });
 }
 
 /// Epoch milliseconds now (F3 retry deadlines / failure timestamps).
@@ -673,6 +684,12 @@ pub async fn tono_connect_progress(state: tauri::State<'_, Arc<TonoState>>) -> R
 /// catalog choice). Connected/Connecting is a success no-op.
 #[tauri::command]
 pub async fn tono_retry_now(state: tauri::State<'_, Arc<TonoState>>, app: AppHandle) -> Result<(), String> {
+    retry_now(state.inner().clone(), app).await
+}
+
+/// Shared Protected Offline retry entry for IPC and native surfaces such as the tray. Keeping
+/// this beside the command prevents either caller from bypassing the reconnect predicate.
+pub async fn retry_now(state: Arc<TonoState>, app: AppHandle) -> Result<(), String> {
     {
         let mut inner = state.lock().await;
         if connection::retry_now_is_noop(inner.fsm.status()) {

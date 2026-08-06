@@ -56,6 +56,19 @@ launchGuard:
   ok: تأیید
 tray:
   dashboard: داشبورد
+  tono:
+    protectionValue: 'محافظت: {value}'
+    serverValue: 'سرور: {value}'
+    connect: اتصال
+    disconnect: قطع اتصال و بازیابی اینترنت
+    retry: تلاش دوباره در حالت آفلاین محافظت‌شده
+    noServer: سروری انتخاب نشده است
+    state:
+      notConnected: متصل نیست
+      connecting: در حال اتصال
+      connected: متصل
+      protectedOffline: آفلاین محافظت‌شده
+      disconnecting: در حال قطع اتصال
   ruleMode: حالت قوانین
   globalMode: حالت سراسری
   directMode: حالت مستقیم

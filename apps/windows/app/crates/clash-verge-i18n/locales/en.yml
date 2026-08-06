@@ -56,6 +56,19 @@ launchGuard:
   ok: OK
 tray:
   dashboard: Dashboard
+  tono:
+    protectionValue: 'Protection: {value}'
+    serverValue: 'Server: {value}'
+    connect: Connect
+    disconnect: Disconnect and Restore Internet
+    retry: Retry Protected Offline
+    noServer: No server selected
+    state:
+      notConnected: Not connected
+      connecting: Connecting
+      connected: Connected
+      protectedOffline: Protected Offline
+      disconnecting: Disconnecting
   ruleMode: Rule Mode
   globalMode: Global Mode
   directMode: Direct Mode

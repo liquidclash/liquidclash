@@ -56,6 +56,19 @@ launchGuard:
   ok: Ярый
 tray:
   dashboard: Идарә панеле
+  tono:
+    protectionValue: 'Яклау: {value}'
+    serverValue: 'Сервер: {value}'
+    connect: Тоташу
+    disconnect: Өзү һәм интернетны торгызу
+    retry: Якланган офлайнны кабатлау
+    noServer: Сервер сайланмаган
+    state:
+      notConnected: Тоташмаган
+      connecting: Тоташа
+      connected: Тоташкан
+      protectedOffline: Якланган офлайн
+      disconnecting: Өзелә
   ruleMode: Кагыйдә режимы
   globalMode: Глобаль режим
   directMode: Турыдан-туры режим

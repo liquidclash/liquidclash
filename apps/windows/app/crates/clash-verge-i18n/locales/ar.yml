@@ -56,6 +56,19 @@ launchGuard:
   ok: موافق
 tray:
   dashboard: لوحة التحكم
+  tono:
+    protectionValue: 'الحماية: {value}'
+    serverValue: 'الخادم: {value}'
+    connect: اتصال
+    disconnect: قطع الاتصال واستعادة الإنترنت
+    retry: إعادة محاولة وضع عدم الاتصال المحمي
+    noServer: لم يتم تحديد خادم
+    state:
+      notConnected: غير متصل
+      connecting: جارٍ الاتصال
+      connected: متصل
+      protectedOffline: عدم اتصال محمي
+      disconnecting: جارٍ قطع الاتصال
   ruleMode: وضع القواعد
   globalMode: الوضع العام
   directMode: الوضع المباشر

@@ -56,6 +56,19 @@ launchGuard:
   ok: OK
 tray:
   dashboard: Übersicht
+  tono:
+    protectionValue: 'Schutz: {value}'
+    serverValue: 'Server: {value}'
+    connect: Verbinden
+    disconnect: Trennen und Internet wiederherstellen
+    retry: „Geschützt offline“ erneut versuchen
+    noServer: Kein Server ausgewählt
+    state:
+      notConnected: Nicht verbunden
+      connecting: Verbindung wird hergestellt
+      connected: Verbunden
+      protectedOffline: Geschützt offline
+      disconnecting: Verbindung wird getrennt
   ruleMode: Regelmodus
   globalMode: Globaler Modus
   directMode: Direktmodus

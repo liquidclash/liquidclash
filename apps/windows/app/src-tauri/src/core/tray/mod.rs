@@ -3,6 +3,7 @@ use crate::core::tray::menu_def::TrayAction;
 use crate::module::lightweight;
 use crate::process::AsyncHandler;
 use crate::singleton;
+use crate::tono::{commands, connection, state::TonoState};
 use crate::utils::window_manager::WindowManager;
 use crate::{
     Type, cmd,
@@ -20,14 +21,14 @@ use anyhow::Result;
 use std::borrow::Cow;
 use std::time::Duration;
 use tauri::{
-    AppHandle, Wry,
+    AppHandle, Manager as _, Wry,
     menu::{MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 
 mod menu_def;
 #[cfg(target_os = "macos")]
 mod speed_task;
-use menu_def::{MenuIds, MenuTexts};
+use menu_def::{MenuCommand, MenuIds, MenuTexts};
 
 // TODO: 是否需要将可变菜单抽离存储起来，后续直接更新对应菜单实例，无需重新创建菜单(待考虑)
 
@@ -45,6 +46,9 @@ enum IconKind {
 
 pub struct Tray {
     limiter: SystemLimiter,
+    /// Serializes native menu/tooltip snapshots. The guard is acquired before reading TonoState,
+    /// so an older status refresh can never overwrite a newer projection after being suspended.
+    projection_lock: tokio::sync::Mutex<()>,
     #[cfg(target_os = "macos")]
     speed_controller: speed_task::TraySpeedController,
 }
@@ -118,6 +122,7 @@ impl Default for Tray {
     fn default() -> Self {
         Self {
             limiter: Limiter::new(Duration::from_millis(TRAY_CLICK_DEBOUNCE_MS), SystemClock),
+            projection_lock: tokio::sync::Mutex::new(()),
             #[cfg(target_os = "macos")]
             speed_controller: speed_task::TraySpeedController::new(),
         }
@@ -186,6 +191,7 @@ impl Tray {
     }
 
     async fn update_menu_internal(&self, app_handle: &AppHandle, _include_proxy_groups: bool) -> Result<()> {
+        let _projection = self.projection_lock.lock().await;
         let Some(tray) = app_handle.tray_by_id(TRAY_ID) else {
             logging!(warn, Type::Tray, "Failed to update tray menu: tray not found");
             return Ok(());
@@ -238,33 +244,9 @@ impl Tray {
         }
 
         let app_handle = handle::Handle::app_handle();
+        let _projection = self.projection_lock.lock().await;
 
-        let verge = Config::verge().await.latest_arc();
-        let system_proxy = verge.enable_system_proxy.unwrap_or(false);
-        let tun_mode = verge.enable_tun_mode.unwrap_or(false);
-
-        let switch_str = |flag: bool| {
-            if flag { "on" } else { "off" }
-        };
-
-        let mut current_profile_name = "None".into();
-        {
-            let profiles = Config::profiles().await;
-            let profiles = profiles.latest_arc();
-            if let Some(current_profile_uid) = profiles.get_current()
-                && let Ok(profile) = profiles.get_item(current_profile_uid)
-            {
-                current_profile_name = match &profile.name {
-                    Some(profile_name) => profile_name.to_string(),
-                    None => current_profile_name,
-                };
-            }
-        }
-
-        // Get localized strings before using them
-        let sys_proxy_text = clash_verge_i18n::t!("tray.tooltip.systemProxy");
-        let tun_text = clash_verge_i18n::t!("tray.tooltip.tun");
-        let profile_text = clash_verge_i18n::t!("tray.tooltip.profile");
+        let menu_state = tono_menu_state(app_handle).await;
 
         let v = env!("CARGO_PKG_VERSION");
         let reassembled_version = v.split_once('+').map_or_else(
@@ -273,14 +255,9 @@ impl Tray {
         );
 
         let tooltip = format!(
-            "Tono {}\n{}: {}\n{}: {}\n{}: {}",
-            reassembled_version,
-            sys_proxy_text,
-            switch_str(system_proxy),
-            tun_text,
-            switch_str(tun_mode),
-            profile_text,
-            current_profile_name
+            "Tono {reassembled_version}\n{}\n{}",
+            menu_state.protection_text(),
+            menu_state.server_text()
         );
 
         let Some(tray) = app_handle.tray_by_id(TRAY_ID) else {
@@ -366,13 +343,143 @@ impl Tray {
     }
 }
 
-/// Tono: the tray menu is reduced to safe entries (P0-5) — no modes, no
-/// proxies/profiles, no system proxy/TUN, no core restart, no lightweight
-/// mode, no env copy. Kept: dashboard, open dir/logs, version, quit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TonoMenuState {
+    account_state: String,
+    ui_state: String,
+    selected_server: Option<String>,
+    selected_server_available: bool,
+    catalog_requires_choice: bool,
+    release_in_progress: bool,
+    protection_blocked: bool,
+}
+
+impl Default for TonoMenuState {
+    fn default() -> Self {
+        Self {
+            account_state: "restoring".to_string(),
+            ui_state: "notConnected".to_string(),
+            selected_server: None,
+            selected_server_available: false,
+            catalog_requires_choice: false,
+            release_in_progress: false,
+            protection_blocked: false,
+        }
+    }
+}
+
+impl TonoMenuState {
+    fn from_status(status: commands::TonoStatus, selected_server_available: bool, release_in_progress: bool) -> Self {
+        Self {
+            account_state: status.account_state,
+            ui_state: status.ui_state,
+            selected_server: status.selected_server,
+            selected_server_available,
+            catalog_requires_choice: status.catalog_requires_choice,
+            release_in_progress,
+            protection_blocked: status.protection_blocked,
+        }
+    }
+
+    fn protection_label(&self) -> Cow<'static, str> {
+        clash_verge_i18n::t!(match self.ui_state.as_str() {
+            "connecting" => "tray.tono.state.connecting",
+            "connected" => "tray.tono.state.connected",
+            "protectedOffline" => "tray.tono.state.protectedOffline",
+            "disconnecting" => "tray.tono.state.disconnecting",
+            _ => "tray.tono.state.notConnected",
+        })
+    }
+
+    fn protection_text(&self) -> String {
+        clash_verge_i18n::t!("tray.tono.protectionValue", value = self.protection_label()).into_owned()
+    }
+
+    fn server_text(&self) -> String {
+        let value = self
+            .selected_server
+            .as_deref()
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| clash_verge_i18n::t!("tray.tono.noServer"));
+        clash_verge_i18n::t!("tray.tono.serverValue", value = value).into_owned()
+    }
+
+    fn can_connect(&self) -> bool {
+        self.account_state == "ready"
+            && self.ui_state == "notConnected"
+            && !self.protection_blocked
+            && self.selected_server_available
+            && !self.catalog_requires_choice
+            && !self.release_in_progress
+    }
+
+    fn can_disconnect(&self) -> bool {
+        self.ui_state != "disconnecting"
+            && (self.ui_state == "connected" || self.ui_state == "connecting" || self.protection_blocked)
+    }
+
+    fn can_retry(&self) -> bool {
+        self.account_state == "ready"
+            && self.ui_state == "protectedOffline"
+            && self.protection_blocked
+            && self.selected_server_available
+            && !self.catalog_requires_choice
+            && !self.release_in_progress
+    }
+}
+
+async fn tono_menu_state(app_handle: &AppHandle) -> TonoMenuState {
+    let Some(state) = app_handle.try_state::<std::sync::Arc<TonoState>>() else {
+        return TonoMenuState::default();
+    };
+    // Match the backend guard's lock order: release coordination before product state.
+    let release_in_progress = state.release_in_progress().await;
+    let inner = state.lock().await;
+    let status = commands::status_of(&inner);
+    let selected_server_available = status
+        .selected_server
+        .as_ref()
+        .is_some_and(|selected| inner.nodes.iter().any(|node| node.name == *selected));
+    TonoMenuState::from_status(status, selected_server_available, release_in_progress)
+}
+
+/// Tono-owned controls only: connection actions enter the same transaction as frontend IPC.
+/// Legacy modes, proxies/profiles, system proxy/TUN, core restart and lightweight mode remain
+/// absent. The retained directory/log/version entries are read-only diagnostics.
 async fn create_tray_menu(app_handle: &AppHandle) -> Result<tauri::menu::Menu<Wry>> {
     let version = env!("CARGO_PKG_VERSION");
     let texts = MenuTexts::new();
+    let state = tono_menu_state(app_handle).await;
 
+    let protection = &MenuItem::with_id(
+        app_handle,
+        MenuIds::PROTECTION,
+        state.protection_text(),
+        false,
+        None::<&str>,
+    )?;
+    let server = &MenuItem::with_id(app_handle, MenuIds::SERVER, state.server_text(), false, None::<&str>)?;
+    let connect = &MenuItem::with_id(
+        app_handle,
+        MenuIds::CONNECT,
+        &texts.connect,
+        state.can_connect(),
+        None::<&str>,
+    )?;
+    let disconnect = &MenuItem::with_id(
+        app_handle,
+        MenuIds::DISCONNECT,
+        &texts.disconnect,
+        state.can_disconnect(),
+        None::<&str>,
+    )?;
+    let retry = &MenuItem::with_id(
+        app_handle,
+        MenuIds::RETRY,
+        &texts.retry,
+        state.can_retry(),
+        None::<&str>,
+    )?;
     let open_window = &MenuItem::with_id(app_handle, MenuIds::DASHBOARD, &texts.dashboard, true, None::<&str>)?;
     let open_app_dir = &MenuItem::with_id(app_handle, MenuIds::CONF_DIR, &texts.conf_dir, true, None::<&str>)?;
     let open_core_dir = &MenuItem::with_id(app_handle, MenuIds::CORE_DIR, &texts.core_dir, true, None::<&str>)?;
@@ -402,7 +509,21 @@ async fn create_tray_menu(app_handle: &AppHandle) -> Result<tauri::menu::Menu<Wr
 
     let separator = &PredefinedMenuItem::separator(app_handle)?;
     let menu = tauri::menu::MenuBuilder::new(app_handle)
-        .items(&[open_window, separator, open_dir, app_version, separator, quit])
+        .items(&[
+            protection,
+            server,
+            separator,
+            connect,
+            disconnect,
+            retry,
+            separator,
+            open_window,
+            separator,
+            open_dir,
+            app_version,
+            separator,
+            quit,
+        ])
         .build()?;
     Ok(menu)
 }
@@ -446,36 +567,130 @@ fn on_menu_event(_: &AppHandle, event: MenuEvent) {
         return;
     }
     AsyncHandler::spawn(|| async move {
-        match event.id.as_ref() {
-            MenuIds::DASHBOARD => {
+        let Some(command) = MenuCommand::from_id(event.id.as_ref()) else {
+            logging!(debug, Type::Tray, "Ignored tray menu event: {:?}", event.id.as_ref());
+            return;
+        };
+        match command {
+            MenuCommand::Connect | MenuCommand::Disconnect | MenuCommand::Retry => {
+                let app = handle::Handle::app_handle().clone();
+                let Some(state) = app
+                    .try_state::<std::sync::Arc<TonoState>>()
+                    .map(|state| state.inner().clone())
+                else {
+                    logging!(
+                        warn,
+                        Type::Tray,
+                        "Tono tray action ignored: product state is unavailable"
+                    );
+                    return;
+                };
+                let result = match command {
+                    MenuCommand::Connect => connection::connect(state, app).await,
+                    MenuCommand::Disconnect => connection::disconnect(state, app).await,
+                    MenuCommand::Retry => commands::retry_now(state, app).await,
+                    _ => unreachable!(),
+                };
+                if let Err(err) = result {
+                    logging!(warn, Type::Tray, "Tono tray action {command:?} failed: {err}");
+                }
+            }
+            MenuCommand::Dashboard => {
                 logging!(info, Type::Tray, "托盘菜单点击: 打开窗口");
                 if !lightweight::exit_lightweight_mode().await {
                     WindowManager::show_main_window().await;
                 };
             }
-            MenuIds::CONF_DIR => {
+            MenuCommand::ConfDir => {
                 let _ = cmd::open_app_dir().await;
             }
-            MenuIds::CORE_DIR => {
+            MenuCommand::CoreDir => {
                 let _ = cmd::open_core_dir().await;
             }
-            MenuIds::LOGS_DIR => {
+            MenuCommand::LogsDir => {
                 let _ = cmd::open_logs_dir().await;
             }
-            MenuIds::APP_LOG => {
+            MenuCommand::AppLog => {
                 let _ = help::open_app_latest_log();
             }
-            MenuIds::CORE_LOG => {
+            MenuCommand::CoreLog => {
                 let _ = help::open_core_latest_log().await;
             }
-            MenuIds::EXIT => {
+            MenuCommand::Exit => {
                 feat::quit().await;
-            }
-            // Tono: every other (legacy) menu id is inert by construction —
-            // those items no longer exist, and stale ids do nothing (P0-5).
-            id => {
-                logging!(debug, Type::Tray, "Ignored tray menu event: {:?}", id);
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TonoMenuState;
+
+    fn state(ui_state: &str, blocked: bool) -> TonoMenuState {
+        TonoMenuState {
+            account_state: "ready".to_string(),
+            ui_state: ui_state.to_string(),
+            selected_server: Some("Seattle".to_string()),
+            selected_server_available: true,
+            catalog_requires_choice: false,
+            release_in_progress: false,
+            protection_blocked: blocked,
+        }
+    }
+
+    #[test]
+    fn disconnected_menu_offers_only_connect() {
+        let state = state("notConnected", false);
+        assert!(state.can_connect());
+        assert!(!state.can_disconnect());
+        assert!(!state.can_retry());
+    }
+
+    #[test]
+    fn connected_and_connecting_menu_offer_safe_release() {
+        for ui_state in ["connected", "connecting"] {
+            let state = state(ui_state, ui_state == "connecting");
+            assert!(!state.can_connect());
+            assert!(state.can_disconnect());
+            assert!(!state.can_retry());
+        }
+    }
+
+    #[test]
+    fn protected_offline_offers_retry_and_release_but_not_connect() {
+        let state = state("protectedOffline", true);
+        assert!(!state.can_connect());
+        assert!(state.can_disconnect());
+        assert!(state.can_retry());
+    }
+
+    #[test]
+    fn transition_and_missing_prerequisites_disable_unsafe_actions() {
+        let mut state = state("disconnecting", true);
+        assert!(!state.can_connect());
+        assert!(!state.can_disconnect());
+        assert!(!state.can_retry());
+
+        state.ui_state = "notConnected".to_string();
+        state.protection_blocked = false;
+        state.selected_server = None;
+        state.selected_server_available = false;
+        assert!(!state.can_connect());
+        state.selected_server = Some("Seattle".to_string());
+        state.selected_server_available = true;
+        state.account_state = "signedOut".to_string();
+        assert!(!state.can_connect());
+
+        state.account_state = "ready".to_string();
+        state.ui_state = "protectedOffline".to_string();
+        state.protection_blocked = true;
+        state.catalog_requires_choice = true;
+        assert!(!state.can_connect());
+        assert!(!state.can_retry());
+        state.catalog_requires_choice = false;
+        state.release_in_progress = true;
+        assert!(!state.can_connect());
+        assert!(!state.can_retry());
+    }
 }

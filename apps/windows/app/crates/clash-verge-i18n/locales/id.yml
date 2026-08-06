@@ -56,6 +56,19 @@ launchGuard:
   ok: OK
 tray:
   dashboard: Dasbor
+  tono:
+    protectionValue: 'Perlindungan: {value}'
+    serverValue: 'Server: {value}'
+    connect: Hubungkan
+    disconnect: Putuskan dan Pulihkan Internet
+    retry: Coba Lagi Offline Terlindungi
+    noServer: Tidak ada server yang dipilih
+    state:
+      notConnected: Tidak terhubung
+      connecting: Menghubungkan
+      connected: Terhubung
+      protectedOffline: Offline Terlindungi
+      disconnecting: Memutuskan
   ruleMode: Mode Aturan
   globalMode: Mode Global
   directMode: Mode Langsung

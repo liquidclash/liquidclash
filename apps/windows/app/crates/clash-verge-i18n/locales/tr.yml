@@ -56,6 +56,19 @@ launchGuard:
   ok: Tamam
 tray:
   dashboard: Gösterge Paneli
+  tono:
+    protectionValue: 'Koruma: {value}'
+    serverValue: 'Sunucu: {value}'
+    connect: Bağlan
+    disconnect: Bağlantıyı Kes ve İnterneti Geri Yükle
+    retry: Korumalı Çevrimdışını Yeniden Dene
+    noServer: Sunucu seçilmedi
+    state:
+      notConnected: Bağlı değil
+      connecting: Bağlanıyor
+      connected: Bağlı
+      protectedOffline: Korumalı Çevrimdışı
+      disconnecting: Bağlantı kesiliyor
   ruleMode: Kural Modu
   globalMode: Küresel Mod
   directMode: Doğrudan Mod

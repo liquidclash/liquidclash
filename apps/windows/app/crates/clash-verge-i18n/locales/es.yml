@@ -56,6 +56,19 @@ launchGuard:
   ok: Aceptar
 tray:
   dashboard: Panel
+  tono:
+    protectionValue: 'Protección: {value}'
+    serverValue: 'Servidor: {value}'
+    connect: Conectar
+    disconnect: Desconectar y restaurar Internet
+    retry: Reintentar sin conexión protegida
+    noServer: Ningún servidor seleccionado
+    state:
+      notConnected: Sin conexión
+      connecting: Conectando
+      connected: Conectado
+      protectedOffline: Sin conexión protegida
+      disconnecting: Desconectando
   ruleMode: Modo de reglas
   globalMode: Modo global
   directMode: Modo directo

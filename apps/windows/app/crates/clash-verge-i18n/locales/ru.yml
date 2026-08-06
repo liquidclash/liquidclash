@@ -56,6 +56,19 @@ launchGuard:
   ok: ОК
 tray:
   dashboard: Панель
+  tono:
+    protectionValue: 'Защита: {value}'
+    serverValue: 'Сервер: {value}'
+    connect: Подключиться
+    disconnect: Отключиться и восстановить интернет
+    retry: Повторить защищённое переподключение
+    noServer: Сервер не выбран
+    state:
+      notConnected: Не подключено
+      connecting: Подключение
+      connected: Подключено
+      protectedOffline: Защищённый офлайн
+      disconnecting: Отключение
   ruleMode: Режим правил
   globalMode: Глобальный режим
   directMode: Прямой режим

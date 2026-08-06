@@ -56,6 +56,19 @@ launchGuard:
   ok: OK
 tray:
   dashboard: ダッシュボード
+  tono:
+    protectionValue: '保護状態: {value}'
+    serverValue: 'サーバー: {value}'
+    connect: 接続
+    disconnect: 切断してインターネットを復元
+    retry: 保護されたオフラインを再試行
+    noServer: サーバーが選択されていません
+    state:
+      notConnected: 未接続
+      connecting: 接続中
+      connected: 接続済み
+      protectedOffline: 保護されたオフライン
+      disconnecting: 切断中
   ruleMode: ルールモード
   globalMode: グローバルモード
   directMode: ダイレクトモード

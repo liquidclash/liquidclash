@@ -56,6 +56,19 @@ launchGuard:
   ok: 好
 tray:
   dashboard: 儀表板
+  tono:
+    protectionValue: '保護狀態：{value}'
+    serverValue: '目前伺服器：{value}'
+    connect: 連線
+    disconnect: 中斷連線並恢復網際網路
+    retry: 重試「受保護的離線」
+    noServer: 尚未選擇伺服器
+    state:
+      notConnected: 未連線
+      connecting: 正在連線
+      connected: 已連線
+      protectedOffline: 受保護的離線
+      disconnecting: 正在中斷連線
   ruleMode: 規則模式
   globalMode: 全域模式
   directMode: 直連模式
