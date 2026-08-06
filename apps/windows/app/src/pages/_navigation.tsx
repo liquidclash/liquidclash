@@ -2,6 +2,7 @@ import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined
 import CloudOutlinedIcon from '@mui/icons-material/CloudOutlined'
 import DashboardOutlinedIcon from '@mui/icons-material/DashboardOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
+import SupportAgentOutlinedIcon from '@mui/icons-material/SupportAgentOutlined'
 import TimelineOutlinedIcon from '@mui/icons-material/TimelineOutlined'
 import { type ComponentType, type ReactNode } from 'react'
 
@@ -14,6 +15,7 @@ import TonoActivityPage from './tono/activity'
 import TonoDashboardPage from './tono/dashboard'
 import TonoLoginPage from './tono/login'
 import TonoServersPage from './tono/servers'
+import TonoSupportPage from './tono/support'
 
 type NavigationGroup = 'main' | 'advanced'
 
@@ -60,6 +62,15 @@ export const navItems: NavigationItem[] = [
     Component: TonoAccountPage,
   },
   {
+    ...navigationItems.support,
+    icon: [
+      <SupportAgentOutlinedIcon key="mui" />,
+      <SupportAgentOutlinedIcon key="svg" />,
+    ],
+    group: 'main',
+    Component: TonoSupportPage,
+  },
+  {
     ...navigationItems.settings,
     icon: [<SettingsOutlinedIcon key="mui" />, <SettingsSvg key="svg" />],
     group: 'main',
@@ -69,8 +80,6 @@ export const navItems: NavigationItem[] = [
 
 // Reachable by URL but not listed in the navigation: the sign-in screen,
 // which the auth guard routes through.
-export const hiddenRoutes = [
-  { path: '/login', Component: TonoLoginPage },
-]
+export const hiddenRoutes = [{ path: '/login', Component: TonoLoginPage }]
 
 export type { NavigationGroup, NavigationItem }

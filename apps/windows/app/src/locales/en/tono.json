@@ -3,7 +3,8 @@
     "dashboard": "Dashboard",
     "activity": "Activity",
     "nodes": "Nodes",
-    "account": "Account"
+    "account": "Account",
+    "support": "Support"
   },
   "activity": {
     "title": "Activity",
@@ -220,6 +221,37 @@
     "signOut": "Sign Out",
     "signOutConfirmTitle": "Sign out",
     "signOutConfirmMessage": "Signing out will disconnect the VPN and remove this device from your account. Continue?"
+  },
+  "support": {
+    "title": "Support & Diagnostics",
+    "subtitle": "Review safe local status details and contact Tono support.",
+    "refresh": "Refresh",
+    "loadFailed": "Couldn't load the diagnostics summary. Refresh to try again.",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "none": "None",
+    "detailsCopied": "Diagnostics details copied",
+    "auditPathCopied": "Audit path copied",
+    "copyFailed": "Failed to copy",
+    "summary": {
+      "title": "System summary",
+      "app": "App / Windows",
+      "service": "Tono Service",
+      "protection": "Protection",
+      "dns": "Protected DNS",
+      "node": "Current node",
+      "lastError": "Last error"
+    },
+    "audit": {
+      "title": "Local audit log",
+      "description": "This path stays on this device. The diagnostics upload includes only a redacted path, never the log contents.",
+      "copyPath": "Copy path",
+      "loadFailed": "Couldn't read the local audit path."
+    },
+    "diagnostics": {
+      "title": "Diagnostics report",
+      "description": "Copy the current redacted report, or explicitly confirm an upload to receive a support reference code. Preview and upload use the same backend report builder."
+    }
   },
   "settings": {
     "title": "Settings",

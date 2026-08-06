@@ -1700,6 +1700,7 @@ export interface TranslationResources {
         activity: string
         dashboard: string
         nodes: string
+        support: string
       }
       node: {
         activeServer: string
@@ -1835,6 +1836,37 @@ export interface TranslationResources {
           title: string
           tun: string
           tunSubtitle: string
+        }
+        title: string
+      }
+      support: {
+        audit: {
+          copyPath: string
+          description: string
+          loadFailed: string
+          title: string
+        }
+        auditPathCopied: string
+        copyFailed: string
+        detailsCopied: string
+        diagnostics: {
+          description: string
+          title: string
+        }
+        disabled: string
+        enabled: string
+        loadFailed: string
+        none: string
+        refresh: string
+        subtitle: string
+        summary: {
+          app: string
+          dns: string
+          lastError: string
+          node: string
+          protection: string
+          service: string
+          title: string
         }
         title: string
       }

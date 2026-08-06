@@ -3,7 +3,8 @@
     "dashboard": "仪表盘",
     "activity": "活动",
     "nodes": "节点",
-    "account": "账号"
+    "account": "账号",
+    "support": "支持"
   },
   "activity": {
     "title": "活动",
@@ -220,6 +221,37 @@
     "signOut": "退出登录",
     "signOutConfirmTitle": "退出登录",
     "signOutConfirmMessage": "退出登录将断开 VPN 连接，并从账号中移除此设备。是否继续？"
+  },
+  "support": {
+    "title": "支持与诊断",
+    "subtitle": "查看安全的本地状态摘要并联系 Tono 客服。",
+    "refresh": "刷新",
+    "loadFailed": "无法加载诊断摘要，请刷新重试。",
+    "enabled": "已启用",
+    "disabled": "已停用",
+    "none": "无",
+    "detailsCopied": "诊断详情已复制",
+    "auditPathCopied": "审计路径已复制",
+    "copyFailed": "复制失败",
+    "summary": {
+      "title": "系统摘要",
+      "app": "应用 / Windows",
+      "service": "Tono 服务",
+      "protection": "流量保护",
+      "dns": "受保护 DNS",
+      "node": "当前节点",
+      "lastError": "最近错误"
+    },
+    "audit": {
+      "title": "本地审计日志",
+      "description": "此路径仅在本机显示。诊断上传只包含脱敏后的路径，不包含日志内容。",
+      "copyPath": "复制路径",
+      "loadFailed": "无法读取本地审计路径。"
+    },
+    "diagnostics": {
+      "title": "诊断报告",
+      "description": "复制当前脱敏报告，或明确确认上传后获取客服 reference code。预览和上传使用同一个后端报告生成器。"
+    }
   },
   "settings": {
     "title": "设置",

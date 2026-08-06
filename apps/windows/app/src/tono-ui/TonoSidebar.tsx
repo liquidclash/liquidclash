@@ -1,20 +1,25 @@
 import { useTranslation } from 'react-i18next'
 import { useLocation, useNavigate } from 'react-router'
 
-import { version as appVersion } from '@root/package.json'
-
 import { navItems } from '@/pages/_navigation'
 import { useThemeMode } from '@/services/states'
+import { version as appVersion } from '@root/package.json'
 
 import { TONO_COLORS, tonoText } from './theme'
 import { TonoLogo } from './TonoLogo'
 
 /**
  * The Tono sidebar (SidebarView.swift): 200 wide, brand on top, Dashboard /
- * Nodes / Account in order, Settings pinned to the bottom.
+ * Nodes / Account / Support in order, Settings pinned to the bottom.
  */
 
-const SIDEBAR_MAIN_PATHS = ['/', '/activity', '/servers', '/account']
+const SIDEBAR_MAIN_PATHS = [
+  '/',
+  '/activity',
+  '/servers',
+  '/account',
+  '/support',
+]
 const SETTINGS_PATH = '/settings'
 
 export const TonoSidebar = () => {
