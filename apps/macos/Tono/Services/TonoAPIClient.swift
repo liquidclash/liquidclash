@@ -348,12 +348,21 @@ actor TonoAPIClient {
                 continue
             }
             guard (200..<300).contains(http.statusCode) else {
+                var rejectionDetails = auditDetails.merging([
+                    "duration_ms": Self.durationMilliseconds(since: requestStartedAt),
+                    "http_status": String(http.statusCode),
+                    // This event describes one HTTP exchange. In particular,
+                    // an authenticated 401 can be followed by token refresh
+                    // and a successful retry; it is not yet an operation-level
+                    // control-plane failure.
+                    "scope": "http_exchange",
+                ]) { _, new in new }
+                if http.statusCode == 401 {
+                    rejectionDetails["auth_recovery_eligible"] = String(bearer != nil)
+                }
                 LocalTrafficAudit.shared.recordEvent(
-                    "control_plane_http_failed",
-                    details: auditDetails.merging([
-                        "duration_ms": Self.durationMilliseconds(since: requestStartedAt),
-                        "http_status": String(http.statusCode),
-                    ]) { _, new in new }
+                    "control_plane_http_response_rejected",
+                    details: rejectionDetails
                 )
                 let envelope = try? TonoCoding.decoder().decode(ErrorEnvelope.self, from: data)
                 if http.statusCode == 401 { throw APIError.unauthorized }; if http.statusCode == 403 { throw APIError.forbidden }

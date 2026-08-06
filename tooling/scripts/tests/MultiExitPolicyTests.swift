@@ -219,7 +219,7 @@ struct MultiExitPolicyTests {
                 .init(
                     host: "res.wx.qq.com",
                     addresses: ["43.146.27.19"],
-                    ports: [443]
+                    ports: [80, 443]
                 ),
             ],
             webDomainPins: [
@@ -238,8 +238,26 @@ struct MultiExitPolicyTests {
             managedDirectPolicy,
             excluding: Set(sanitizedNodes.map(\.server))
         )
-        guard validatedDirectPolicy?.sessionEndpoints.count == 4 else {
+        guard validatedDirectPolicy?.sessionEndpoints.count == 5 else {
             throw TestFailure("managed direct policy did not produce exact PF tuples")
+        }
+        let fallbackTargets = ConfigPipeline.managedDirectFallbackTargets(
+            for: validatedDirectPolicy
+        )
+        guard fallbackTargets.count == 2,
+              Set(fallbackTargets.map(\.groupName)).count == 2,
+              let fallback80 = fallbackTargets.first(where: { $0.port == 80 }),
+              let fallback443 = fallbackTargets.first(where: { $0.port == 443 }),
+              fallback80.host == "res.wx.qq.com",
+              fallback80.testURL == "http://res.wx.qq.com/",
+              fallback443.host == "res.wx.qq.com",
+              fallback443.testURL == "https://res.wx.qq.com/",
+              fallbackTargets.allSatisfy({
+                  $0.groupName.hasPrefix(
+                      ConfigPipeline.managedDirectFallbackGroupPrefix
+                  )
+              }) else {
+            throw TestFailure("managed DIRECT fallback targets were not exact")
         }
         let managedDirectRuntime = try ConfigPipeline.buildOwnedTonoRuntime(
             subscriptionYAML: "proxies: []\n",
@@ -248,21 +266,55 @@ struct MultiExitPolicyTests {
             customNodes: sanitizedNodes,
             directPolicy: managedDirectPolicy
         )
-        let directRule =
-            "AND,((NETWORK,TCP),(DST-PORT,443),(DOMAIN,res.wx.qq.com),(IP-CIDR,43.146.27.19/32,no-resolve),(PROCESS-PATH,/Applications/WeChat.app/Contents/MacOS/WeChat)),Tono-China-Direct"
+        guard let weChatProcessPathRegex =
+                ConfigPipeline.managedDirectProcessPathRegexes.first else {
+            throw TestFailure("managed DIRECT omitted the standard WeChat bundle")
+        }
+        let directRule80 =
+            "AND,((NETWORK,TCP),(DST-PORT,80),(DOMAIN,res.wx.qq.com),(PROCESS-PATH-REGEX,\(weChatProcessPathRegex))),\(fallback80.groupName)"
+        let directRule443 =
+            "AND,((NETWORK,TCP),(DST-PORT,443),(DOMAIN,res.wx.qq.com),(PROCESS-PATH-REGEX,\(weChatProcessPathRegex))),\(fallback443.groupName)"
         let webDirectRule =
-            "AND,((NETWORK,TCP),(DST-PORT,443),(DOMAIN,www.bilibili.com),(IP-CIDR,120.92.78.97/32,no-resolve)),Tono-China-Web-Direct"
+            "AND,((NETWORK,TCP),(DST-PORT,443),(DOMAIN,www.bilibili.com)),Tono-China-Web-Direct"
         let mediaRule443 =
-            "AND,((NETWORK,UDP),(DST-PORT,443),(IP-CIDR,43.146.27.17/32,no-resolve),(PROCESS-PATH,/Applications/WeChat.app/Contents/MacOS/WeChat)),Tono-China-Direct"
+            "AND,((NETWORK,UDP),(DST-PORT,443),(IP-CIDR,43.146.27.17/32,no-resolve),(PROCESS-PATH-REGEX,\(weChatProcessPathRegex))),Tono-China-Direct"
         let mediaRule8000 =
-            "AND,((NETWORK,UDP),(DST-PORT,8000),(IP-CIDR,43.146.27.17/32,no-resolve),(PROCESS-PATH,/Applications/WeChat.app/Contents/MacOS/WeChat)),Tono-China-Direct"
+            "AND,((NETWORK,UDP),(DST-PORT,8000),(IP-CIDR,43.146.27.17/32,no-resolve),(PROCESS-PATH-REGEX,\(weChatProcessPathRegex))),Tono-China-Direct"
         let directRulePrecedesMatch: Bool
-        if let directRuleRange = managedDirectRuntime.range(of: directRule),
+        if let directRuleRange = managedDirectRuntime.range(of: directRule443),
            let matchRuleRange = managedDirectRuntime.range(of: "  - MATCH,Tono-Exit") {
             directRulePrecedesMatch = directRuleRange.lowerBound < matchRuleRange.lowerBound
         } else {
             directRulePrecedesMatch = false
         }
+        let claudeRules = [
+            "PROCESS-NAME,Claude,Tono-Exit",
+            "PROCESS-NAME,claude,Tono-Exit",
+            "PROCESS-NAME,claude.exe,Tono-Exit",
+        ]
+        let claudeRulesPrecedeDirect = claudeRules.allSatisfy { rule in
+            guard let claudeRange = managedDirectRuntime.range(of: rule),
+                  let directRange = managedDirectRuntime.range(of: directRule443) else {
+                return false
+            }
+            return claudeRange.lowerBound < directRange.lowerBound
+        }
+        let fallbackGroupCount = managedDirectRuntime
+            .components(separatedBy: "\n    type: fallback\n")
+            .count - 1
+        let fallback443Block = """
+          - name: "\(fallback443.groupName)"
+            type: fallback
+            proxies:
+              - REJECT
+              - "Tono-China-Direct"
+              - "Tono-Exit"
+            url: "https://res.wx.qq.com/"
+            interval: 60
+            timeout: 3500
+            lazy: false
+            hidden: true
+        """
         let managedDirectChecks = [
             ("proxy", managedDirectRuntime.contains("\n  - name: \"Tono-China-Direct\"\n")),
             ("web-proxy", managedDirectRuntime.contains("\n  - name: \"Tono-China-Web-Direct\"\n")),
@@ -280,11 +332,31 @@ struct MultiExitPolicyTests {
                     "\n  \"www.bilibili.com\":\n    - \"120.92.78.97\"\n"
                 )
             ),
-            ("tcp-rule", managedDirectRuntime.contains(directRule)),
+            ("tcp-80-fallback-rule", managedDirectRuntime.contains(directRule80)),
+            ("tcp-443-fallback-rule", managedDirectRuntime.contains(directRule443)),
             ("web-tcp-rule", managedDirectRuntime.contains(webDirectRule)),
             ("udp-443-rule", managedDirectRuntime.contains(mediaRule443)),
             ("udp-8000-rule", managedDirectRuntime.contains(mediaRule8000)),
             ("rule-order", directRulePrecedesMatch),
+            ("claude-process-rules", claudeRulesPrecedeDirect),
+            ("one-fallback-per-wechat-port", fallbackGroupCount == fallbackTargets.count),
+            ("fail-closed-fallback-order", managedDirectRuntime.contains(fallback443Block)),
+            (
+                "no-web-fallback-group",
+                !fallbackTargets.contains { $0.host == "www.bilibili.com" }
+            ),
+            (
+                "no-unchecked-wechat-direct-tcp",
+                !managedDirectRuntime.contains(
+                    "DOMAIN,res.wx.qq.com),(PROCESS-PATH-REGEX,\(weChatProcessPathRegex))),Tono-China-Direct"
+                )
+            ),
+            (
+                "no-impossible-tcp-domain-cidr-and",
+                !managedDirectRuntime.contains(
+                    "DOMAIN,res.wx.qq.com),(IP-CIDR,43.146.27.19/32"
+                )
+            ),
             ("no-name-only-identity", !managedDirectRuntime.contains("PROCESS-NAME,WeChat")),
             ("no-domain-suffix", !managedDirectRuntime.contains("DOMAIN-SUFFIX")),
             ("no-domain-keyword", !managedDirectRuntime.contains("DOMAIN-KEYWORD")),
@@ -367,6 +439,27 @@ struct MultiExitPolicyTests {
                 )
             )
             throw TestFailure("managed media DIRECT accepted TCP")
+        } catch is ConfigPipeline.TonoInjectionError {
+            // Expected.
+        }
+        for builtInName in ["DIRECT", "REJECT"] {
+            var reservedBuiltInNode = selected
+            reservedBuiltInNode.name = builtInName
+            do {
+                _ = try ConfigPipeline.validatedOwnedNodes([reservedBuiltInNode])
+                throw TestFailure(
+                    "Mihomo built-in name \(builtInName) was not reserved"
+                )
+            } catch is ConfigPipeline.TonoInjectionError {
+                // Expected.
+            }
+        }
+        var reservedFallbackNode = selected
+        reservedFallbackNode.name =
+            ConfigPipeline.managedDirectFallbackGroupPrefix + "0123456789abcdef"
+        do {
+            _ = try ConfigPipeline.validatedOwnedNodes([reservedFallbackNode])
+            throw TestFailure("managed DIRECT fallback group prefix was not reserved")
         } catch is ConfigPipeline.TonoInjectionError {
             // Expected.
         }

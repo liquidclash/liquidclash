@@ -42,6 +42,16 @@ nonisolated struct ConfigPipeline {
         let ports: [UInt16]
     }
 
+    /// One exact WeChat hostname/port route with its own reachability decision.
+    /// Keeping this descriptor in ConfigPipeline gives runtime generation and
+    /// tests one canonical mapping from a validated pin to its fallback group.
+    struct ManagedDirectFallbackTarget: Equatable, Sendable {
+        let host: String
+        let port: UInt16
+        let groupName: String
+        let testURL: String
+    }
+
     struct ManagedDirectRuntimePolicy: Equatable, Sendable {
         let physicalInterface: String
         let domainPins: [DirectDomainPin]
@@ -101,6 +111,9 @@ nonisolated struct ConfigPipeline {
     static let exitGroupName = "Tono-Exit"
     static let directProxyName = "Tono-China-Direct"
     static let webDirectProxyName = "Tono-China-Web-Direct"
+    static let managedDirectFallbackGroupPrefix = "Tono-WeChat-TCP-"
+    static let managedDirectHealthIntervalSeconds = 60
+    static let managedDirectHealthTimeoutMilliseconds = 3_500
     /// AliDNS DoH over TCP/443 with IP-literal certificates. Managed-direct
     /// domains resolve through these upstreams via the interface-bound direct
     /// outbound (nameserver-policy `#Tono-China-Direct`), which keeps pinned
@@ -157,6 +170,33 @@ nonisolated struct ConfigPipeline {
                 "managed direct bundle path unsafe for rule emission"
             )
             return pattern
+        }
+    }
+
+    /// Deterministic, bounded group names avoid exposing long policy hostnames
+    /// as Mihomo object identifiers. A separate group per port ensures an HTTPS
+    /// success cannot incorrectly mark TCP/80 direct as usable (or vice versa).
+    static func managedDirectFallbackTargets(
+        for policy: ManagedDirectRuntimePolicy?
+    ) -> [ManagedDirectFallbackTarget] {
+        guard let policy else { return [] }
+        return policy.domainPins.flatMap { pin in
+            pin.ports.map { port in
+                let identity = "\(pin.host):\(port)"
+                let digest = SHA256.hash(data: Data(identity.utf8))
+                    .prefix(8)
+                    .map { String(format: "%02x", $0) }
+                    .joined()
+                let scheme = port == 443 ? "https" : "http"
+                return ManagedDirectFallbackTarget(
+                    host: pin.host,
+                    port: port,
+                    groupName: managedDirectFallbackGroupPrefix + digest,
+                    testURL: "\(scheme)://\(pin.host)/"
+                )
+            }
+        }.sorted {
+            ($0.host, $0.port) < ($1.host, $1.port)
         }
     }
 
@@ -664,6 +704,39 @@ nonisolated struct ConfigPipeline {
         \(choiceLines)
 
         """
+        // Each exact WeChat host/port gets an independent DIRECT → protected
+        // exit decision. REJECT is deliberately first: Mihomo fallback groups
+        // choose their first member before the initial health result and when
+        // every member is down. The sentinel turns both windows into a fast,
+        // fail-closed error; after the immediate check it is unhealthy, so a
+        // reachable China DIRECT path wins and Tono-Exit is the safe fallback.
+        let directFallbackTargets = managedDirectFallbackTargets(for: directPolicy)
+        precondition(
+            Set(directFallbackTargets.map(\.groupName)).count
+                == directFallbackTargets.count,
+            "managed direct fallback group collision"
+        )
+        let directFallbackGroups = Dictionary(uniqueKeysWithValues:
+            directFallbackTargets.map {
+                ("\($0.host):\($0.port)", $0.groupName)
+            }
+        )
+        for target in directFallbackTargets {
+            yaml += """
+              - name: "\(target.groupName)"
+                type: fallback
+                proxies:
+                  - REJECT
+                  - "\(directProxyName)"
+                  - "\(exitGroupName)"
+                url: "\(yamlScalar(target.testURL))"
+                interval: \(managedDirectHealthIntervalSeconds)
+                timeout: \(managedDirectHealthTimeoutMilliseconds)
+                lazy: false
+                hidden: true
+
+            """
+        }
         yaml += "\nrules:\n"
         // Claude App/Code are permanently protected before every trial
         // exception. The native WeChat rules below additionally require an
@@ -677,6 +750,10 @@ nonisolated struct ConfigPipeline {
         // and the PF session allowlist.
         yaml += "  - PROCESS-NAME,Claude,\(exitGroupName)\n"
         yaml += "  - PROCESS-NAME,claude,\(exitGroupName)\n"
+        // The npm-distributed Claude Code launcher is observed as claude.exe
+        // even on macOS. Mihomo matches the complete basename and does not
+        // strip that suffix, so keep it explicit before every direct rule.
+        yaml += "  - PROCESS-NAME,claude.exe,\(exitGroupName)\n"
         if transport != nil {
             yaml += "  - PROCESS-NAME,tailscaled,DIRECT\n"
             yaml += "  - PROCESS-NAME,tailscale,DIRECT\n"
@@ -685,7 +762,14 @@ nonisolated struct ConfigPipeline {
             for processPathRegex in managedDirectProcessPathRegexes {
                 for pin in directPolicy.domainPins {
                     for port in pin.ports {
-                        yaml += "  - AND,((NETWORK,TCP),(DST-PORT,\(port)),(DOMAIN,\(pin.host)),(PROCESS-PATH-REGEX,\(processPathRegex))),\(directProxyName)\n"
+                        guard let groupName = directFallbackGroups[
+                            "\(pin.host):\(port)"
+                        ] else {
+                            preconditionFailure(
+                                "managed direct fallback target missing"
+                            )
+                        }
+                        yaml += "  - AND,((NETWORK,TCP),(DST-PORT,\(port)),(DOMAIN,\(pin.host)),(PROCESS-PATH-REGEX,\(processPathRegex))),\(groupName)\n"
                     }
                 }
                 // UDP media dials are raw-IP (no DNS step), so DstIP survives
@@ -729,11 +813,24 @@ nonisolated struct ConfigPipeline {
             homeNodeName,
             exitGroupName,
             directProxyName,
+            webDirectProxyName,
             "__tono_tailnet",
+            // Mihomo installs these adapters before parsing user proxies. A
+            // catalog collision would invalidate the entire owned runtime and
+            // can also corrupt the managed WeChat fallback member references.
+            "DIRECT",
+            "REJECT",
+            "REJECT-DROP",
+            "COMPATIBLE",
+            "PASS",
+            "PASS-RULE",
         ])
         var result: [ProxyNode] = []
         for node in nodes {
             let validated = try validatedOwnedNode(node)
+            guard !validated.name.hasPrefix(managedDirectFallbackGroupPrefix) else {
+                throw TonoInjectionError.duplicateNode(validated.name)
+            }
             guard names.insert(validated.name).inserted else {
                 throw TonoInjectionError.duplicateNode(validated.name)
             }

@@ -673,8 +673,8 @@ nonisolated final class LocalTrafficAudit: @unchecked Sendable {
         }
         let process = (connection.metadata.process ?? "").lowercased()
         let processPath = (connection.metadata.processPath ?? "").lowercased()
-        return process == "claude" || processPath.contains("/claude.app/")
-            || processPath.hasSuffix("/claude")
+        return Self.isClaudeCodeProcess(process: process, processPath: processPath)
+            || processPath.contains("/claude.app/")
     }
 
     private func recordClaudeTrafficResearch(_ connection: APIConnection) {
@@ -755,7 +755,7 @@ nonisolated final class LocalTrafficAudit: @unchecked Sendable {
         let client: String
         if processPath.contains("/claude.app/") {
             client = "app"
-        } else if process == "claude" || processPath.hasSuffix("/claude") {
+        } else if isClaudeCodeProcess(process: process, processPath: processPath) {
             client = "code"
         } else if [
             "safari", "google chrome", "chromium", "arc", "firefox",
@@ -801,6 +801,15 @@ nonisolated final class LocalTrafficAudit: @unchecked Sendable {
             port: port,
             route: routeClassification(connection)
         )
+    }
+
+    private static func isClaudeCodeProcess(
+        process: String,
+        processPath: String
+    ) -> Bool {
+        process == "claude" || process == "claude.exe"
+            || processPath.hasSuffix("/claude")
+            || processPath.hasSuffix("/claude.exe")
     }
 
     private static func isResearchHostname(_ host: String) -> Bool {

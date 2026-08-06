@@ -43,6 +43,13 @@ nonisolated private enum PhysicalBypassSocketResult: Sendable {
     case inconclusive
 }
 
+nonisolated private enum ManagedDirectHealthResult: Sendable {
+    case direct
+    case protectedExit
+    case unavailable
+    case controllerError(String)
+}
+
 private actor ProviderRuleLoader {
     private static let maximumProviderBytes = 8 * 1_024 * 1_024
     private static let maximumRules = 200_000
@@ -581,6 +588,9 @@ final class AppState {
     private var connectTask: Task<Void, Never>?
     private var configReloadTask: Task<Void, Never>?
     private var configReloadRequestID = 0
+    private var pendingFullConfigReload = false
+    private var pendingDirectPolicyReload:
+        ConfigPipeline.ManagedDirectRuntimePolicy?
     private var disconnectSequence: Task<Void, Never>?
     private var disconnectRequestID = 0
     private var networkInfoTask: Task<Void, Never>?
@@ -1335,6 +1345,11 @@ final class AppState {
                             )
                         try Task.checkCancellation()
                         try await api.reloadConfig(path: runtimeConfigPath)
+                        await self.primeManagedDirectFallbackGroups(
+                            policy: resolvedPolicy,
+                            api: api
+                        )
+                        try Task.checkCancellation()
                         committedDirectPolicy = resolvedPolicy
                         LocalTrafficAudit.shared.recordEvent(
                             "managed_direct_policy_activated",
@@ -1665,6 +1680,8 @@ final class AppState {
         let pendingConfigReload = configReloadTask
         pendingConfigReload?.cancel()
         configReloadTask = nil
+        pendingFullConfigReload = false
+        pendingDirectPolicyReload = nil
 
         // Cancel any in-progress connect Task. The teardown sequence waits for
         // it to leave the serialized helper actor before issuing stop/disarm.
@@ -1892,14 +1909,20 @@ final class AppState {
 
         ws.onStreamStalled = { stream in
             LocalTrafficAudit.shared.recordEvent(
-                "audit_stream_stalled",
-                details: ["stream": stream]
+                "audit_observer_stream_stalled",
+                details: [
+                    "stream": stream,
+                    "protection_impact": "none",
+                ]
             )
         }
         ws.onStreamRecovered = { stream in
             LocalTrafficAudit.shared.recordEvent(
-                "audit_stream_recovered",
-                details: ["stream": stream]
+                "audit_observer_stream_recovered",
+                details: [
+                    "stream": stream,
+                    "protection_impact": "none",
+                ]
             )
         }
 
@@ -2277,6 +2300,11 @@ final class AppState {
     /// Select a node/group by name or id.
     func selectNode(_ nameOrId: String) {
         guard !isDisconnecting, switchingNodeId == nil else { return }
+        guard configReloadTask == nil else {
+            errorMessage =
+                "Secure routing is updating. Try switching the cloud server again in a moment."
+            return
+        }
         if nameOrId == ConfigPipeline.homeNodeName,
            !AppProfile.homeExitEnabled || tonoTransport == nil {
             errorMessage = "Home-US is temporarily disabled. Choose a managed cloud server."
@@ -2331,7 +2359,10 @@ final class AppState {
         )
         nodeSwitchTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.switchingNodeId = nil }
+            defer {
+                self.switchingNodeId = nil
+                self.startPendingConfigReloadIfPossible()
+            }
             guard let api else { return }
             do {
                 let endpoints = try ConfigPipeline.dialEndpoints(for: desiredNode)
@@ -2350,6 +2381,14 @@ final class AppState {
                 try await api.selectProxy(
                     group: ConfigPipeline.exitGroupName,
                     proxy: nodeName
+                )
+                try Task.checkCancellation()
+                // Fallback health is URL-specific and may still describe the
+                // previous selected exit. Refresh every exact WeChat group now
+                // so the new node's reachability is authoritative immediately.
+                await primeManagedDirectFallbackGroups(
+                    policy: activeDirectPolicy,
+                    api: api
                 )
                 try Task.checkCancellation()
                 try await api.closeAllConnections()
@@ -2590,6 +2629,17 @@ final class AppState {
         applyingDirectPolicy pendingDirectPolicy:
             ConfigPipeline.ManagedDirectRuntimePolicy? = nil
     ) {
+        // Do not cancel a mutation after PF or Mihomo may already have accepted
+        // part of it. Coalesce behind the active transaction instead; the most
+        // recent pin set wins, while a requested full rewrite is preserved.
+        if configReloadTask != nil || switchingNodeId != nil {
+            if let pendingDirectPolicy {
+                pendingDirectPolicyReload = pendingDirectPolicy
+            } else {
+                pendingFullConfigReload = true
+            }
+            return
+        }
         let portString = AppProfile.defaults.string(forKey: SettingsKey.mixedPort) ?? "7890"
         let port = Int(portString).flatMap { (1024...65535).contains($0) ? $0 : nil } ?? 7890
         let overlay = ConfigPipeline.OverlayConfig(
@@ -2610,11 +2660,11 @@ final class AppState {
         let ownedRuntime = isOwnedTonoMode
         configReloadRequestID += 1
         let requestID = configReloadRequestID
-        configReloadTask?.cancel()
         let pinsOnlyRefresh = pendingDirectPolicy != nil
         configReloadTask = Task { [weak self] in
             guard let self else { return }
             let effectiveDirectPolicy = pendingDirectPolicy ?? activeDirectPolicy
+            var pinsRuntimeCommitted = false
             do {
                 // During a pins-only refresh, arm the union of old and new
                 // endpoints: the old config keeps dialing old pins until the
@@ -2649,9 +2699,7 @@ final class AppState {
                 )
                 try Task.checkCancellation()
                 guard let api else {
-                    if configReloadRequestID == requestID {
-                        configReloadTask = nil
-                    }
+                    finishConfigReloadRequest(requestID)
                     return
                 }
                 let runtimeConfigPath = try await PrivilegedRuntimeCoordinator.shared.syncCoreConfig(
@@ -2660,10 +2708,32 @@ final class AppState {
                 )
                 try Task.checkCancellation()
                 try await api.reloadConfig(path: runtimeConfigPath)
-                try Task.checkCancellation()
 
                 if let pendingDirectPolicy {
+                    // Mihomo has accepted the new pins, so they are now the
+                    // authoritative in-memory policy even if a later PF call
+                    // fails. Do not honor cancellation between this commit and
+                    // exact PF convergence: disconnect is the only safe exit.
                     self.activeDirectPolicy = pendingDirectPolicy
+                    pinsRuntimeCommitted = true
+                    // The pre-reload arm intentionally allowed old ∪ new so
+                    // the old runtime could keep dialing during the swap. Once
+                    // Mihomo commits the new config, immediately remove the old
+                    // tuples rather than leaving a growing root PF allowlist.
+                    try await PrivilegedRuntimeCoordinator.shared.armKillSwitch(
+                        tunnelInterfaces: [ConfigPipeline.tonoTunInterface],
+                        proxyEndpoints: try ConfigPipeline.dialEndpoints(
+                            for: selectedExit
+                        ),
+                        sessionDirectEndpoints:
+                            pendingDirectPolicy.sessionEndpoints,
+                        tailscaleBootstrapEnabled:
+                            AppProfile.homeExitEnabled && transport != nil
+                    )
+                    await primeManagedDirectFallbackGroups(
+                        policy: pendingDirectPolicy,
+                        api: api
+                    )
                     LocalTrafficAudit.shared.recordEvent(
                         "managed_direct_pins_refreshed",
                         details: [
@@ -2676,7 +2746,13 @@ final class AppState {
                             ),
                         ]
                     )
+                } else if let effectiveDirectPolicy {
+                    await primeManagedDirectFallbackGroups(
+                        policy: effectiveDirectPolicy,
+                        api: api
+                    )
                 }
+                try Task.checkCancellation()
                 if ownedRuntime, selectedExitName != nil, !pinsOnlyRefresh {
                     try await api.closeAllConnections()
                     try Task.checkCancellation()
@@ -2697,15 +2773,39 @@ final class AppState {
                         await self?.fetchNetworkInfo()
                     }
                 }
-                if configReloadRequestID == requestID {
-                    configReloadTask = nil
-                }
+                finishConfigReloadRequest(requestID)
             } catch is CancellationError {
-                return
+                guard pinsRuntimeCommitted, !isDisconnecting else { return }
+                LocalTrafficAudit.shared.recordEvent(
+                    "managed_direct_pf_convergence_cancelled"
+                )
+                disconnect(releaseKillSwitch: false)
+                errorMessage =
+                    "Secure WeChat routing was interrupted while updating; Kill Switch is blocking traffic while Tono retries."
+                scheduleProtectedReconnect(immediate: true)
             } catch {
+                // Once Mihomo accepted new pins, neither cancellation nor a
+                // superseding reload may leave PF at the temporary union. This
+                // branch must win over the ordinary stale-request guards.
+                if pinsOnlyRefresh, pinsRuntimeCommitted {
+                    guard !isDisconnecting else { return }
+                    // The core is already using the new exact pins but PF could
+                    // not converge from old ∪ new to the new set. Stop the core
+                    // and return to bootstrap-only protection; treating this as
+                    // a harmless background failure would retain stale direct
+                    // permissions indefinitely.
+                    LocalTrafficAudit.shared.recordEvent(
+                        "managed_direct_pf_convergence_failed",
+                        details: ["error": String(describing: error)]
+                    )
+                    disconnect(releaseKillSwitch: false)
+                    errorMessage =
+                        "Secure WeChat routing could not finish updating; Kill Switch is blocking traffic while Tono retries."
+                    scheduleProtectedReconnect(immediate: true)
+                    return
+                }
                 guard !Task.isCancelled, !isDisconnecting else { return }
                 guard configReloadRequestID == requestID else { return }
-                configReloadTask = nil
                 if pinsOnlyRefresh {
                     // A background pin refresh must never take the session
                     // down. The armed endpoint set is a superset of the
@@ -2715,17 +2815,127 @@ final class AppState {
                         "managed_direct_refresh_failed",
                         details: ["error": String(describing: error)]
                     )
+                    finishConfigReloadRequest(requestID)
                 } else if ownedRuntime {
+                    finishConfigReloadRequest(requestID, startPending: false)
                     disconnect(releaseKillSwitch: false)
                     errorMessage =
                         "Updated cloud route failed; Kill Switch is blocking traffic while Tono retries. \(error.localizedDescription)"
                     scheduleProtectedReconnect()
                 } else {
+                    finishConfigReloadRequest(requestID)
                     errorMessage =
                         "Failed to apply the updated core configuration: \(error.localizedDescription)"
                 }
             }
         }
+    }
+
+    /// Completes one serialized runtime mutation and starts the newest queued
+    /// request. Pin changes take precedence because a full rewrite will then
+    /// naturally include the newly committed exact direct policy.
+    private func finishConfigReloadRequest(
+        _ requestID: Int,
+        startPending: Bool = true
+    ) {
+        guard configReloadRequestID == requestID else { return }
+        configReloadTask = nil
+        guard startPending, isConnected, !isDisconnecting else {
+            if !startPending {
+                pendingDirectPolicyReload = nil
+                pendingFullConfigReload = false
+            }
+            return
+        }
+        startPendingConfigReloadIfPossible()
+    }
+
+    private func startPendingConfigReloadIfPossible() {
+        guard configReloadTask == nil, switchingNodeId == nil,
+              isConnected, !isDisconnecting else { return }
+        if let policy = pendingDirectPolicyReload {
+            pendingDirectPolicyReload = nil
+            reloadCoreConfig(applyingDirectPolicy: policy)
+        } else if pendingFullConfigReload {
+            pendingFullConfigReload = false
+            reloadCoreConfig()
+        }
+    }
+
+    /// Populate Mihomo's URL-specific fallback state before new application
+    /// connections rely on it. Tests run concurrently, so the barrier costs at
+    /// most one bounded probe timeout rather than host-count × timeout. A host
+    /// probe never fails the protected tunnel: REJECT remains the deterministic
+    /// all-down result, and controller errors are audited separately.
+    private func primeManagedDirectFallbackGroups(
+        policy: ConfigPipeline.ManagedDirectRuntimePolicy?,
+        api: ClashAPI
+    ) async {
+        let targets = ConfigPipeline.managedDirectFallbackTargets(for: policy)
+        guard !targets.isEmpty else { return }
+        let results = await withTaskGroup(
+            of: ManagedDirectHealthResult.self,
+            returning: [ManagedDirectHealthResult].self
+        ) { group in
+            for target in targets {
+                group.addTask {
+                    do {
+                        let outcome = try await api.testProxyGroupMembers(
+                            name: target.groupName,
+                            url: target.testURL,
+                            timeout: ConfigPipeline
+                                .managedDirectHealthTimeoutMilliseconds
+                        )
+                        switch outcome {
+                        case .reachableMembers(let delays):
+                            if delays[ConfigPipeline.directProxyName] != nil {
+                                return .direct
+                            }
+                            if delays[ConfigPipeline.exitGroupName] != nil {
+                                return .protectedExit
+                            }
+                            return .unavailable
+                        case .allUnavailable:
+                            return .unavailable
+                        }
+                    } catch {
+                        return .controllerError(
+                            String(error.localizedDescription.prefix(200))
+                        )
+                    }
+                }
+            }
+            var values: [ManagedDirectHealthResult] = []
+            for await value in group { values.append(value) }
+            return values
+        }
+        guard !Task.isCancelled else { return }
+        var direct = 0
+        var protectedExit = 0
+        var unavailable = 0
+        var controllerErrors: [String] = []
+        for result in results {
+            switch result {
+            case .direct: direct += 1
+            case .protectedExit: protectedExit += 1
+            case .unavailable: unavailable += 1
+            case .controllerError(let message): controllerErrors.append(message)
+            }
+        }
+        var details = [
+            "targets": String(targets.count),
+            "direct": String(direct),
+            "protected_exit": String(protectedExit),
+            "unavailable": String(unavailable),
+            "controller_errors": String(controllerErrors.count),
+        ]
+        if let firstError = controllerErrors.first {
+            details["first_error"] = firstError
+        }
+        LocalTrafficAudit.shared.recordEvent(
+            "managed_direct_health_primed",
+            details: details
+        )
     }
 
     private func requireRuntimeConfigDigest() throws -> String {

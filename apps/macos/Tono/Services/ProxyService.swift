@@ -51,6 +51,11 @@ final class ProxyService {
 
             for (name, proxy) in response.proxies {
                 guard !skipNames.contains(name) else { continue }
+                // Per-host WeChat health groups are internal routing machinery,
+                // not user-selectable exits. Keep them out of the proxy picker.
+                guard !name.hasPrefix(
+                    ConfigPipeline.managedDirectFallbackGroupPrefix
+                ) else { continue }
                 let latency = proxy.history?.last?.delay ?? 0
 
                 if groupTypes.contains(proxy.type), let members = proxy.all {

@@ -73,8 +73,9 @@ actor ClashAPI {
     }
 
     /// Query Mihomo's raw upstream resolver. Unlike the protected fake-IP DNS
-    /// listener, this controller endpoint returns real records while its DoH
-    /// transport still follows Tono-Exit.
+    /// listener, this controller endpoint returns real records. Managed-direct
+    /// policy hosts are sent by nameserver-policy through the interface-bound
+    /// China DoH path; every other host remains on the protected resolver path.
     func resolveIPv4(_ host: String) async throws -> [String] {
         var components = URLComponents(
             url: makeURL("/dns/query"),
@@ -213,6 +214,54 @@ actor ClashAPI {
         }
 
         return latest
+    }
+
+    /// Test every member of one Mihomo proxy group against the exact URL used
+    /// by that group's fallback health state. A 504 is an expected, typed
+    /// "all unavailable" result; authentication/controller failures still
+    /// throw so callers do not misclassify them as a network-path decision.
+    func testProxyGroupMembers(
+        name: String,
+        url: String,
+        timeout: Int
+    ) async throws -> APIGroupDelayOutcome {
+        let boundedTimeout = min(max(timeout, 1), 60_000)
+        let encodedName = name.addingPercentEncoding(
+            withAllowedCharacters: Self.pathSegmentAllowed
+        ) ?? name
+        var components = URLComponents(
+            url: makeURL("/group/\(encodedName)/delay"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [
+            URLQueryItem(name: "url", value: url),
+            URLQueryItem(name: "timeout", value: String(boundedTimeout)),
+        ]
+        guard let requestURL = components?.url else {
+            throw ClashAPIError.requestFailed("/group/delay")
+        }
+        var urlRequest = URLRequest(url: requestURL)
+        urlRequest.httpMethod = "GET"
+        urlRequest.timeoutInterval = TimeInterval(boundedTimeout) / 1_000 + 1
+        if !secret.isEmpty {
+            urlRequest.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response) = try await session.data(for: urlRequest)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ClashAPIError.requestFailed("/group/delay")
+        }
+        if httpResponse.statusCode == 504 {
+            return .allUnavailable
+        }
+        guard (200...299).contains(httpResponse.statusCode),
+              let delays = try? JSONDecoder().decode(
+                [String: Int].self,
+                from: data
+              ) else {
+            throw ClashAPIError.requestFailed("/group/delay")
+        }
+        return delays.isEmpty ? .allUnavailable : .reachableMembers(delays)
     }
 
     // MARK: - Health Check
@@ -400,6 +449,11 @@ nonisolated struct APIProxyHistory: Codable, Sendable {
 nonisolated struct APIDelayResponse: Codable, Sendable {
     let delay: Int?
     let message: String?
+}
+
+nonisolated enum APIGroupDelayOutcome: Sendable {
+    case reachableMembers([String: Int])
+    case allUnavailable
 }
 
 nonisolated struct APIRulesResponse: Codable, Sendable {
