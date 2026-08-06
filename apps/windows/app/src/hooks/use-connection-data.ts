@@ -40,6 +40,7 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let flushTimer: ReturnType<typeof setTimeout> | null = null
 let pendingMessageData: string | null = null
 let lastFlushAt = 0
+let connectionGeneration: number | null = null
 
 const connectionListeners = new Set<ConnectionListener>()
 const summaryListeners = new Set<ConnectionListener>()
@@ -292,16 +293,21 @@ async function connectConnectionSocket() {
 
   clearReconnectTimer()
   connectionConnecting = true
+  const targetGeneration = connectionGeneration
 
   try {
     const socket = await MihomoWebSocket.connect_connections()
-    if (!hasConnectionSubscribers()) {
+    if (
+      !hasConnectionSubscribers() ||
+      targetGeneration !== connectionGeneration
+    ) {
       await socket.close()
       return
     }
     connectionSocket = socket
     socket.addListener((message) => {
       if (connectionSocket !== socket) return
+      if (targetGeneration !== connectionGeneration) return
       if (message.type !== 'Text') return
       if (message.data.startsWith('Websocket error')) {
         void reconnectConnectionSocket()
@@ -314,6 +320,12 @@ async function connectConnectionSocket() {
     scheduleReconnect()
   } finally {
     connectionConnecting = false
+    if (
+      targetGeneration !== connectionGeneration &&
+      hasConnectionSubscribers()
+    ) {
+      void connectConnectionSocket()
+    }
   }
 }
 
@@ -336,8 +348,32 @@ const stopConnectionMonitorIfIdle = () => {
 const getConnectionSnapshot = () => connectionData
 const getConnectionSummarySnapshot = () => connectionSummary
 
-const subscribeConnectionData = (listener: ConnectionListener) => {
+const selectConnectionGeneration = (generation?: number) => {
+  if (generation == null || generation === connectionGeneration) return
+
+  connectionGeneration = generation
+  connectionData = initConnData
+  connectionSummary = initConnSummaryData
+  pendingMessageData = null
+  lastFlushAt = 0
+  if (flushTimer) {
+    window.clearTimeout(flushTimer)
+    flushTimer = null
+  }
+  // The socket captures its controller endpoint at open time. Force a new one after Tono has
+  // configured this generation's random loopback port and secret; stale listeners are also
+  // generation-guarded above in case close races an incoming frame.
+  void closeConnectionSocket().then(() => {
+    if (connectionGeneration === generation) startConnectionMonitor()
+  })
+}
+
+const subscribeConnectionData = (
+  listener: ConnectionListener,
+  generation?: number,
+) => {
   connectionListeners.add(listener)
+  selectConnectionGeneration(generation)
   startConnectionMonitor()
   return () => {
     connectionListeners.delete(listener)
@@ -373,17 +409,28 @@ const clearClosedConnectionData = () => {
   notifyConnectionListeners()
 }
 
-export const useConnectionData = (options?: { enabled?: boolean }) => {
+export const useConnectionData = (options?: {
+  enabled?: boolean
+  generation?: number
+}) => {
   const enabled = options?.enabled ?? true
+  const generation = options?.generation
   const subscribe = useCallback(
     (listener: ConnectionListener) =>
-      enabled ? subscribeConnectionData(listener) : () => {},
-    [enabled],
+      enabled ? subscribeConnectionData(listener, generation) : () => {},
+    [enabled, generation],
+  )
+  const getVersionedSnapshot = useCallback(
+    () =>
+      generation == null || generation === connectionGeneration
+        ? getConnectionSnapshot()
+        : initConnData,
+    [generation],
   )
   const data = useSyncExternalStore(
     subscribe,
-    getConnectionSnapshot,
-    getConnectionSnapshot,
+    getVersionedSnapshot,
+    getVersionedSnapshot,
   )
   const response = useMemo(() => ({ data }), [data])
   const refreshGetClashConnection = useCallback(() => {

@@ -15,6 +15,8 @@ import {
   tonoAuditLogPath,
   tonoCancelServerTests,
   tonoCatalogStatus,
+  tonoCloseAllConnections,
+  tonoCloseConnection,
   tonoRefreshCatalog,
   tonoSetAuditEnabled,
   tonoTestAvailableServers,
@@ -76,6 +78,23 @@ describe('tono server management wrappers', () => {
       ['tono_test_available_servers', undefined],
       ['tono_cancel_server_tests', undefined],
     ])
+  })
+})
+
+describe('tono activity wrappers', () => {
+  it('binds close mutations to the controller generation shown by the page', async () => {
+    invokeMock.mockResolvedValue(undefined)
+
+    await tonoCloseConnection('connection/id', 12)
+    expect(invokeMock).toHaveBeenCalledWith('tono_close_connection', {
+      id: 'connection/id',
+      controllerGeneration: 12,
+    })
+
+    await tonoCloseAllConnections(12)
+    expect(invokeMock).toHaveBeenCalledWith('tono_close_all_connections', {
+      controllerGeneration: 12,
+    })
   })
 })
 

@@ -2,6 +2,7 @@ import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined
 import CloudOutlinedIcon from '@mui/icons-material/CloudOutlined'
 import DashboardOutlinedIcon from '@mui/icons-material/DashboardOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
+import TimelineOutlinedIcon from '@mui/icons-material/TimelineOutlined'
 import { type ComponentType, type ReactNode } from 'react'
 
 import SettingsSvg from '@/assets/image/itemicon/settings.svg?react'
@@ -9,6 +10,7 @@ import SettingsSvg from '@/assets/image/itemicon/settings.svg?react'
 import { navigationItems } from './_navigation-meta'
 import SettingPage from './settings'
 import TonoAccountPage from './tono/account'
+import TonoActivityPage from './tono/activity'
 import TonoDashboardPage from './tono/dashboard'
 import TonoLoginPage from './tono/login'
 import TonoServersPage from './tono/servers'
@@ -32,6 +34,15 @@ export const navItems: NavigationItem[] = [
     ],
     group: 'main',
     Component: TonoDashboardPage,
+  },
+  {
+    ...navigationItems.activity,
+    icon: [
+      <TimelineOutlinedIcon key="mui" />,
+      <TimelineOutlinedIcon key="svg" />,
+    ],
+    group: 'main',
+    Component: TonoActivityPage,
   },
   {
     ...navigationItems.servers,

@@ -14,7 +14,7 @@ import { TonoLogo } from './TonoLogo'
  * Nodes / Account in order, Settings pinned to the bottom.
  */
 
-const SIDEBAR_MAIN_PATHS = ['/', '/servers', '/account']
+const SIDEBAR_MAIN_PATHS = ['/', '/activity', '/servers', '/account']
 const SETTINGS_PATH = '/settings'
 
 export const TonoSidebar = () => {

@@ -200,6 +200,9 @@ pub struct TonoInner {
     /// reused by the optional policy restart, so another local proxy cannot hold Tono hostage on
     /// a globally fixed 9090 listener.
     pub controller_port: Option<u16>,
+    /// Monotonic epoch of the controller endpoint adopted by the UI. Unlike the connect
+    /// transaction generation, this also advances for automatic recovery within one intent.
+    pub controller_generation: u64,
     /// Connect transaction generation. Disconnect, sign-out, and node
     /// switches bump it; an in-flight attempt re-checks it at every stage
     /// boundary and exits without side effects when it moved.
@@ -385,6 +388,7 @@ impl TonoState {
                 network_events_counter: None,
                 controller_secret: None,
                 controller_port: None,
+                controller_generation: 0,
                 connect_generation: 0,
                 connect_cancellation: CancellationToken::new(),
                 release_on_stale: false,

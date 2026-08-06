@@ -210,6 +210,8 @@ mod app_init {
             tono::commands::tono_connect,
             tono::commands::tono_disconnect,
             tono::commands::tono_status,
+            tono::commands::tono_close_connection,
+            tono::commands::tono_close_all_connections,
             tono::commands::tono_retry_restore,
             tono::commands::tono_audit_enabled,
             tono::commands::tono_set_audit_enabled,

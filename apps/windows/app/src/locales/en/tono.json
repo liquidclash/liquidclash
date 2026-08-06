@@ -1,8 +1,42 @@
 {
   "nav": {
     "dashboard": "Dashboard",
+    "activity": "Activity",
     "nodes": "Nodes",
     "account": "Account"
+  },
+  "activity": {
+    "title": "Activity",
+    "subtitle": "Live connections through the current Tono session",
+    "search": "Filter by app, domain, target, protocol, or rule",
+    "routeFilter": "Route filter",
+    "disconnected": "Connect Tono to view live activity.",
+    "empty": "No active connections.",
+    "noMatches": "No connections match these filters.",
+    "closingAll": "Closing…",
+    "closeConnection": "Close connection to {{target}}",
+    "closeFailed": "Could not close the connection.",
+    "closeAllFailed": "Could not close all connections.",
+    "connectionCount": "{{count}} active connections shown",
+    "limitNotice": "display limited to {{count}} connections",
+    "filters": {
+      "all": "All",
+      "proxied": "Proxied",
+      "direct": "Direct",
+      "rejected": "Rejected"
+    },
+    "routes": {
+      "proxied": "Proxied",
+      "direct": "Direct",
+      "rejected": "Rejected"
+    },
+    "columns": {
+      "process": "Process",
+      "target": "Domain or target",
+      "protocol": "Protocol",
+      "route": "Route",
+      "rule": "Rule"
+    }
   },
   "login": {
     "title": "Sign in to Tono",

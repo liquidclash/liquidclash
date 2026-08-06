@@ -1595,6 +1595,39 @@ export interface TranslationResources {
         signOutConfirmTitle: string
         title: string
       }
+      activity: {
+        closeAllFailed: string
+        closeConnection: string
+        closeFailed: string
+        closingAll: string
+        columns: {
+          process: string
+          protocol: string
+          route: string
+          rule: string
+          target: string
+        }
+        connectionCount: string
+        disconnected: string
+        empty: string
+        filters: {
+          all: string
+          direct: string
+          proxied: string
+          rejected: string
+        }
+        limitNotice: string
+        noMatches: string
+        routeFilter: string
+        routes: {
+          direct: string
+          proxied: string
+          rejected: string
+        }
+        search: string
+        subtitle: string
+        title: string
+      }
       dashboard: {
         catalogRequiresChoice: string
         connect: string
@@ -1664,6 +1697,7 @@ export interface TranslationResources {
       }
       nav: {
         account: string
+        activity: string
         dashboard: string
         nodes: string
       }

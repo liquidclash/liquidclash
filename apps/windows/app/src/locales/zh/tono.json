@@ -1,8 +1,42 @@
 {
   "nav": {
     "dashboard": "仪表盘",
+    "activity": "活动",
     "nodes": "节点",
     "account": "账号"
+  },
+  "activity": {
+    "title": "活动",
+    "subtitle": "当前 Tono 会话的实时连接",
+    "search": "按应用、域名、目标、协议或规则筛选",
+    "routeFilter": "路由筛选",
+    "disconnected": "连接 Tono 后即可查看实时活动。",
+    "empty": "暂无活动连接。",
+    "noMatches": "没有符合筛选条件的连接。",
+    "closingAll": "正在关闭…",
+    "closeConnection": "关闭前往 {{target}} 的连接",
+    "closeFailed": "无法关闭该连接。",
+    "closeAllFailed": "无法关闭全部连接。",
+    "connectionCount": "当前显示 {{count}} 条活动连接",
+    "limitNotice": "最多显示 {{count}} 条连接",
+    "filters": {
+      "all": "全部",
+      "proxied": "已代理",
+      "direct": "直连",
+      "rejected": "已拒绝"
+    },
+    "routes": {
+      "proxied": "已代理",
+      "direct": "直连",
+      "rejected": "已拒绝"
+    },
+    "columns": {
+      "process": "进程",
+      "target": "域名或目标",
+      "protocol": "协议",
+      "route": "路由",
+      "rule": "规则"
+    }
   },
   "login": {
     "title": "登录 Tono",

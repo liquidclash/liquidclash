@@ -41,7 +41,7 @@ const RESTORE_TRANSACTION_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// Emitted on `tono://status` after every state change.
 ///
-/// TS: `interface TonoStatus { accountState: string; uiState: string; stage: string | null; stageLabel: string | null; selectedServer: string | null; protectionBlocked: boolean; killSwitch: KillSwitchStatus | null; catalogRevision: number | null; catalogRequiresChoice: boolean }`
+/// TS: `interface TonoStatus { accountState: string; uiState: string; stage: string | null; stageLabel: string | null; selectedServer: string | null; protectionBlocked: boolean; killSwitch: KillSwitchStatus | null; catalogRevision: number | null; catalogRequiresChoice: boolean; controllerGeneration: number }`
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TonoStatus {
@@ -58,6 +58,8 @@ pub struct TonoStatus {
     pub kill_switch: Option<KillSwitchStatus>,
     pub catalog_revision: Option<i64>,
     pub catalog_requires_choice: bool,
+    /// Monotonic owner token for controller/WebSocket data. Never expose the controller secret.
+    pub controller_generation: u64,
 }
 
 /// Last published immutable UI snapshot. The status command reads this without joining the large
@@ -196,6 +198,7 @@ pub(crate) fn status_of(inner: &TonoInner) -> TonoStatus {
         kill_switch: inner.kill_switch.clone(),
         catalog_revision: (revision >= 0).then_some(revision),
         catalog_requires_choice: inner.catalog_requires_choice,
+        controller_generation: inner.controller_generation,
     }
 }
 
@@ -876,6 +879,25 @@ pub async fn tono_status(state: tauri::State<'_, Arc<TonoState>>) -> Result<Tono
     }
     let inner = state.lock().await;
     Ok(status_of(&inner))
+}
+
+/// Close one connection only on the controller generation that supplied its row.
+#[tauri::command]
+pub async fn tono_close_connection(
+    state: tauri::State<'_, Arc<TonoState>>,
+    id: String,
+    controller_generation: u64,
+) -> Result<(), String> {
+    connection::close_owned_controller_connection(&state, controller_generation, Some(&id)).await
+}
+
+/// Close all connections only on the controller generation represented by the Activity page.
+#[tauri::command]
+pub async fn tono_close_all_connections(
+    state: tauri::State<'_, Arc<TonoState>>,
+    controller_generation: u64,
+) -> Result<(), String> {
+    connection::close_owned_controller_connection(&state, controller_generation, None).await
 }
 
 /// How many times restore asks the Service about the stored barrier before giving up.

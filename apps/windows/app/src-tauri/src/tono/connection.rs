@@ -1024,6 +1024,7 @@ async fn run_stages(
             return Err(stale_after_arm(state, generation).await);
         }
         inner.kill_switch = Some(kill_status);
+        inner.controller_generation = inner.controller_generation.wrapping_add(1);
         inner.fsm.mark_session_verified();
         inner.fsm.connect_succeeded().map_err(StageFailure::error)?;
         // M4 seeds must reset on *every* success, not only on disconnect: a
@@ -2309,6 +2310,50 @@ fn controller_client(timeout: Duration) -> Result<reqwest::Client, String> {
 
 fn controller_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
+}
+
+/// Activity close mutations are generation-bound and use the copied endpoint credentials. If a
+/// recovery replaces the controller after this check, the request still targets the old loopback
+/// port and can never close a connection on the new generation.
+pub async fn close_owned_controller_connection(
+    state: &Arc<TonoState>,
+    expected_generation: u64,
+    id: Option<&str>,
+) -> Result<(), String> {
+    let (secret, port) = {
+        let inner = state.lock().await;
+        if inner.controller_generation != expected_generation || !inner.fsm.status().is_connected {
+            return Err("TONO_ACTIVITY_STALE: controller generation changed".to_string());
+        }
+        inner
+            .controller_secret
+            .clone()
+            .zip(inner.controller_port)
+            .ok_or_else(|| "TONO_ACTIVITY_UNAVAILABLE: controller is not available".to_string())?
+    };
+
+    let client = controller_client(Duration::from_secs(2))?;
+    let mut url = reqwest::Url::parse(&controller_url(port, "/connections"))
+        .map_err(|error| format!("TONO_ACTIVITY_UNAVAILABLE: invalid controller URL: {error}"))?;
+    if let Some(id) = id {
+        url.path_segments_mut()
+            .map_err(|_| "TONO_ACTIVITY_UNAVAILABLE: invalid controller URL".to_string())?
+            .push(id);
+    }
+    let response = client
+        .delete(url)
+        .bearer_auth(secret)
+        .send()
+        .await
+        .map_err(|error| format!("TONO_ACTIVITY_UNAVAILABLE: close request failed: {error}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "TONO_ACTIVITY_UNAVAILABLE: controller returned {}",
+            response.status()
+        ))
+    }
 }
 
 fn configure_owned_controller_for_ui(app: &AppHandle, secret: &str, controller_port: u16) {

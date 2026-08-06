@@ -37,6 +37,7 @@ const statusPayload = (
   killSwitch: null,
   catalogRevision: null,
   catalogRequiresChoice: false,
+  controllerGeneration: 0,
 })
 
 const {

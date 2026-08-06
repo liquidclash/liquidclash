@@ -23,6 +23,7 @@ const signedOutPayload: TonoStatus = {
   killSwitch: null,
   catalogRevision: null,
   catalogRequiresChoice: false,
+  controllerGeneration: 0,
 }
 
 const readyPayload: TonoStatus = {
@@ -43,6 +44,7 @@ const readyPayload: TonoStatus = {
   },
   catalogRevision: 7,
   catalogRequiresChoice: false,
+  controllerGeneration: 3,
 }
 
 const { tonoStatusMock, subscribeTonoStatusMock } = vi.hoisted(() => ({

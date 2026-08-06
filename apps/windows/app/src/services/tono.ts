@@ -92,6 +92,8 @@ export interface TonoStatus {
   killSwitch: TonoKillSwitch | null
   catalogRevision: number | null
   catalogRequiresChoice: boolean
+  /** Monotonic owner token for the current managed controller endpoint. */
+  controllerGeneration: number
 }
 
 export const TONO_STATUS_EVENT = 'tono://status'
@@ -113,7 +115,10 @@ const STABLE_ERROR_KEYS: Array<{ prefix: string; key: string }> = [
     prefix: 'TONO_RELEASE_RECONCILING',
     key: 'tono.dashboard.errors.releaseReconciling',
   },
-  { prefix: 'TONO_SERVICE_TOO_OLD', key: 'tono.dashboard.errors.serviceTooOld' },
+  {
+    prefix: 'TONO_SERVICE_TOO_OLD',
+    key: 'tono.dashboard.errors.serviceTooOld',
+  },
   // Diagnostics upload (`diagnostics_upload_error` in tono/commands.rs).
   {
     prefix: 'TONO_DIAG_SIGNED_OUT',
@@ -220,6 +225,12 @@ export const tonoConnect = () => call<void>('tono_connect')
 export const tonoDisconnect = () => call<void>('tono_disconnect')
 
 export const tonoStatus = () => call<TonoStatus>('tono_status')
+
+export const tonoCloseConnection = (id: string, controllerGeneration: number) =>
+  call<void>('tono_close_connection', { id, controllerGeneration })
+
+export const tonoCloseAllConnections = (controllerGeneration: number) =>
+  call<void>('tono_close_all_connections', { controllerGeneration })
 
 export const tonoRetryRestore = () => call<void>('tono_retry_restore')
 
@@ -377,7 +388,9 @@ export const formatTonoDiagnostics = (
     ...report.steps.map(
       (step) =>
         `  - ${step.key}: ${step.state}${
-          step.elapsedMs != null ? ` (${formatTonoElapsed(step.elapsedMs)})` : ''
+          step.elapsedMs != null
+            ? ` (${formatTonoElapsed(step.elapsedMs)})`
+            : ''
         }`,
     ),
     `Audit log: ${report.auditLogPath}`,
