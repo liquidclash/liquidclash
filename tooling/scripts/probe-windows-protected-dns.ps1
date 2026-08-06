@@ -9,14 +9,50 @@ param(
 $ErrorActionPreference = 'Stop'
 $deadline = [DateTimeOffset]::UtcNow.AddSeconds($WaitSeconds)
 $ready = $false
+$protectedDnsV4 = '198.18.0.2'
+
+function Get-PhysicalDnsState {
+    $physicalIndexes = @(
+        Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+            Where-Object Status -ne 'Disabled' |
+            ForEach-Object ifIndex
+    )
+
+    @(
+        Get-DnsClientServerAddress -ErrorAction SilentlyContinue |
+            Where-Object { $physicalIndexes -contains $_.InterfaceIndex } |
+            Sort-Object InterfaceIndex, AddressFamily |
+            ForEach-Object {
+                [ordered]@{
+                    alias = $_.InterfaceAlias
+                    index = $_.InterfaceIndex
+                    family = [string]$_.AddressFamily
+                    servers = @($_.ServerAddresses)
+                }
+            }
+    )
+}
+
+function Test-ProtectedDnsState {
+    param([object[]]$DnsState)
+
+    $ipv4 = @($DnsState | Where-Object family -eq 'IPv4')
+    $ipv6 = @($DnsState | Where-Object family -eq 'IPv6')
+    if ($ipv4.Count -eq 0) {
+        return $false
+    }
+
+    $ipv4Protected = @($ipv4 | Where-Object {
+        $_.servers.Count -eq 1 -and $_.servers[0] -eq $protectedDnsV4
+    }).Count -eq $ipv4.Count
+    $ipv6Protected = @($ipv6 | Where-Object { $_.servers.Count -eq 0 }).Count -eq $ipv6.Count
+    $ipv4Protected -and $ipv6Protected
+}
 
 while ([DateTimeOffset]::UtcNow -lt $deadline) {
     $listener = netstat.exe -ano | Where-Object { $_ -match '^\s*(TCP|UDP)\s+127\.0\.0\.1:53\s' }
-    $ethernetDns = @(
-        Get-DnsClientServerAddress -InterfaceAlias 'Ethernet' -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            ForEach-Object ServerAddresses
-    )
-    if ($listener -and $ethernetDns -contains '127.0.0.1') {
+    $physicalDns = @(Get-PhysicalDnsState)
+    if ($listener -and (Test-ProtectedDnsState -DnsState $physicalDns)) {
         $ready = $true
         break
     }
@@ -61,6 +97,21 @@ function Invoke-DnsProbe {
     }
 }
 
+function Test-FakeIpAnswers {
+    param([object]$Probe)
+
+    if (-not $Probe.ok -or $Probe.addresses.Count -eq 0) {
+        return $false
+    }
+    @($Probe.addresses | Where-Object {
+        $parsed = $null
+        [Net.IPAddress]::TryParse([string]$_, [ref]$parsed) -and
+            $parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+            $parsed.GetAddressBytes()[0] -eq 198 -and
+            $parsed.GetAddressBytes()[1] -eq 18
+    }).Count -eq $Probe.addresses.Count
+}
+
 $result = if (-not $ready) {
     [ordered]@{
         ready = $false
@@ -68,13 +119,23 @@ $result = if (-not $ready) {
     }
 }
 else {
+    $tunQuery = Invoke-DnsProbe -Server $protectedDnsV4
+    $loopbackQuery = Invoke-DnsProbe -Server '127.0.0.1'
+    $systemQuery = Invoke-DnsProbe
+    $proofOk = (Test-FakeIpAnswers -Probe $tunQuery) -and
+        (Test-FakeIpAnswers -Probe $systemQuery) -and
+        -not $loopbackQuery.ok
     [ordered]@{
         ready = $true
+        proof_ok = $proofOk
         captured_at = [DateTimeOffset]::Now.ToString('o')
         listeners = @(netstat.exe -ano | Where-Object { $_ -match '^\s*(TCP|UDP)\s+127\.0\.0\.1:53\s' })
-        dns = @(
+        # Supporting evidence only. The authenticated Service status and fake-IP system query are
+        # authoritative because active virtual adapters may also be owned by Windows DNS.
+        physical_dns = @(Get-PhysicalDnsState)
+        all_dns = @(
             Get-DnsClientServerAddress -ErrorAction SilentlyContinue |
-                Where-Object { $_.ServerAddresses.Count -gt 0 } |
+                Sort-Object InterfaceIndex, AddressFamily |
                 ForEach-Object {
                     [ordered]@{
                         alias = $_.InterfaceAlias
@@ -84,9 +145,9 @@ else {
                     }
                 }
         )
-        tun_query = Invoke-DnsProbe -Server '198.18.0.2'
-        loopback_query = Invoke-DnsProbe -Server '127.0.0.1'
-        system_query = Invoke-DnsProbe
+        tun_query = $tunQuery
+        loopback_query = $loopbackQuery
+        system_query = $systemQuery
     }
 }
 
@@ -97,3 +158,6 @@ if ($directory) {
 }
 $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fullPath -Encoding utf8NoBOM
 Write-Output $fullPath
+if (-not $result.ready -or -not $result.proof_ok) {
+    exit 1
+}

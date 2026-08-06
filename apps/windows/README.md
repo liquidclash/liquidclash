@@ -309,6 +309,47 @@ or choose another value from 0 through 5000 ms. Acceptance still requires a
 real connect, ordinary App/browser traffic, disconnect, and exact DNS restore;
 the synthetic delay supplements that loop and never replaces it.
 
+### Real-Windows QA harness
+
+Run the leak/fail-closed harness from an elevated PowerShell after installing
+the candidate and connecting Tono. Build the read-only Service diagnosis
+driver first:
+
+```powershell
+cargo build --manifest-path apps/windows/service/Cargo.toml --release `
+  --features client --bin tono-service-integration-driver
+
+# Evidence-only baseline. This never injects a fault. Replace the example
+# address with the VPN exit observed while Tono is Connected.
+.\tooling\scripts\test-windows-qa.ps1 `
+  -AllowedProtectedEgressIp 203.0.113.10
+
+# Explicit disruptive run. Supply the VPN egress observed before the test;
+# any different reachable public IP is a hard failure. AdapterFlap is omitted
+# until the physical adapter name has been reviewed on that machine.
+.\tooling\scripts\test-windows-qa.ps1 `
+  -Faults CoreCrash,ServiceCrash `
+  -AllowedProtectedEgressIp 203.0.113.10 `
+  -ConfirmDisruptive
+
+Get-NetAdapter -Physical
+.\tooling\scripts\test-windows-qa.ps1 `
+  -Faults AdapterFlap `
+  -AdapterName 'Wi-Fi' `
+  -AllowedProtectedEgressIp 203.0.113.10 `
+  -ConfirmDisruptive
+```
+
+Results are durable under `C:\ProgramData\Tono\qa\<timestamp>` by default:
+`events.jsonl`, `summary.json`, and mandatory `pktmon` evidence in
+`packets.pcapng`. The continuous egress observer is a detached local process,
+so temporary loss of the Amp runner connection does not stop that evidence
+stream. Adapter flap installs a one-shot SYSTEM recovery task before disabling
+the reviewed default-route adapter, and the harness verifies re-enablement; it
+deliberately never disarms WFP or rewrites DNS. A clean automated run reports
+`PENDING_CAPTURE_REVIEW`, not `PASS`. Review the packet capture for physical
+DNS/IPv6/DoH evidence before declaring the release leak-free.
+
 ## Status
 
 Foundation implemented (see `REPORT.md` for evidence and the remaining
