@@ -46,8 +46,8 @@ jobs:
       - name: Verify release version and updater signing configuration
         shell: pwsh
         run: |
-          if ($env:RELEASE_VERSION -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
-            throw "Requested version is not SemVer: $env:RELEASE_VERSION"
+          if ($env:RELEASE_VERSION -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "Requested Windows stable version is not a release SemVer: $env:RELEASE_VERSION"
           }
           $packageVersion = node -p "require('./package.json').version"
           $tauriVersion = node -p "require('./src-tauri/tauri.conf.json').version"
@@ -110,6 +110,6 @@ jobs:
           args: --config src-tauri/tauri.updater.conf.json
           tagName: v__VERSION__
           releaseName: Tono Windows v__VERSION__
-          releaseBody: See the committed changelog and attached signed Windows artifacts.
+          releaseBody: After review and publication, run Promote Windows update channel for this exact version.
           releaseDraft: true
           prerelease: false

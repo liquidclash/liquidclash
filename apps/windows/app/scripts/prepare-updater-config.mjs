@@ -1,11 +1,35 @@
-import { createPublicKey, verify } from 'node:crypto'
+import { createHash, createPublicKey, verify } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export const TONO_UPDATER_ENDPOINT =
-  'https://github.com/raydocs/tono/releases/latest/download/latest.json'
+  'https://raw.githubusercontent.com/raydocs/tono/windows-updates/latest.json'
+
+function decodeBase64(value, label) {
+  const encoded = String(value)
+  if (
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      encoded,
+    )
+  ) {
+    throw new Error(`${label} is not valid Base64`)
+  }
+  const decoded = Buffer.from(encoded, 'base64')
+  if (decoded.toString('base64') !== encoded) {
+    throw new Error(`${label} is not canonical Base64`)
+  }
+  return decoded
+}
+
+function decodeUtf8(value, label) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(value)
+  } catch {
+    throw new Error(`${label} is not valid UTF-8`)
+  }
+}
 
 export function validateUpdaterPublicKey(value) {
   const publicKey = String(value ?? '').trim()
@@ -18,21 +42,20 @@ export function validateUpdaterPublicKey(value) {
     )
   }
 
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(publicKey)) {
-    throw new Error('TONO_UPDATER_PUBLIC_KEY is not valid Base64')
-  }
-
-  const decodedPublicKey = Buffer.from(publicKey, 'base64').toString('utf8')
-  const encodedKey = decodedPublicKey
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.startsWith('RW'))
-  if (!encodedKey || !/^RW[A-Za-z0-9+/]+={0,2}$/.test(encodedKey)) {
+  const decodedPublicKey = decodeUtf8(
+    decodeBase64(publicKey, 'TONO_UPDATER_PUBLIC_KEY'),
+    'TONO_UPDATER_PUBLIC_KEY',
+  )
+  const publicKeyLines = decodedPublicKey.split(/\r?\n/)
+  if (publicKeyLines.at(-1) === '') publicKeyLines.pop()
+  if (publicKeyLines.length !== 2 || !publicKeyLines[1].startsWith('RW')) {
     throw new Error(
       'TONO_UPDATER_PUBLIC_KEY is not a Tauri/minisign public key',
     )
   }
-  if (Buffer.from(encodedKey, 'base64').byteLength !== 42) {
+  if (
+    decodeBase64(publicKeyLines[1], 'minisign public key').byteLength !== 42
+  ) {
     throw new Error(
       'TONO_UPDATER_PUBLIC_KEY does not contain a 42-byte minisign public key',
     )
@@ -42,23 +65,45 @@ export function validateUpdaterPublicKey(value) {
 }
 
 export function verifyUpdaterSignature(publicKey, encodedSignature, payload) {
-  validateUpdaterPublicKey(publicKey)
-  const publicKeyText = Buffer.from(publicKey, 'base64').toString('utf8')
-  const signatureText = Buffer.from(
-    String(encodedSignature).trim(),
-    'base64',
-  ).toString('utf8')
-  const publicKeyBytes = Buffer.from(
-    publicKeyText.split(/\r?\n/).find((line) => line.startsWith('RW')) ?? '',
-    'base64',
+  const normalizedPublicKey = validateUpdaterPublicKey(publicKey)
+  const publicKeyText = decodeUtf8(
+    decodeBase64(normalizedPublicKey, 'TONO_UPDATER_PUBLIC_KEY'),
+    'TONO_UPDATER_PUBLIC_KEY',
   )
-  const signatureBytes = Buffer.from(
-    signatureText.split(/\r?\n/).find((line) => /^R[A-Za-z0-9+/]/.test(line)) ??
-      '',
-    'base64',
+  const signatureText = decodeUtf8(
+    decodeBase64(encodedSignature, 'updater signature'),
+    'updater signature',
   )
-  if (signatureBytes.byteLength !== 74) {
+  const signatureLines = signatureText.split(/\r?\n/)
+  if (signatureLines.at(-1) === '') signatureLines.pop()
+  if (
+    signatureLines.length !== 4 ||
+    !signatureLines[0].startsWith('untrusted comment: ') ||
+    !signatureLines[2].startsWith('trusted comment: ')
+  ) {
+    throw new Error(
+      'updater signature is not a complete minisign signature box',
+    )
+  }
+  const publicKeyBytes = decodeBase64(
+    publicKeyText.split(/\r?\n/)[1],
+    'minisign public key',
+  )
+  const signatureBytes = decodeBase64(signatureLines[1], 'minisign signature')
+  const globalSignature = decodeBase64(
+    signatureLines[3],
+    'minisign global signature',
+  )
+  if (signatureBytes.byteLength !== 74 || globalSignature.byteLength !== 64) {
     throw new Error('updater signature is not a minisign signature')
+  }
+  const publicKeyAlgorithm = publicKeyBytes.subarray(0, 2).toString('ascii')
+  if (publicKeyAlgorithm !== 'ED' && publicKeyAlgorithm !== 'Ed') {
+    throw new Error('updater public key uses an unsupported minisign algorithm')
+  }
+  const algorithm = signatureBytes.subarray(0, 2).toString('ascii')
+  if (algorithm !== 'ED' && algorithm !== 'Ed') {
+    throw new Error('updater signature uses an unsupported minisign algorithm')
   }
   if (!publicKeyBytes.subarray(2, 10).equals(signatureBytes.subarray(2, 10))) {
     throw new Error(
@@ -72,10 +117,25 @@ export function verifyUpdaterSignature(publicKey, encodedSignature, payload) {
     format: 'der',
     type: 'spki',
   })
-  if (!verify(null, payload, verificationKey, signatureBytes.subarray(10))) {
+  const signedPayload =
+    algorithm === 'ED'
+      ? createHash('blake2b512').update(payload).digest()
+      : payload
+  if (
+    !verify(null, signedPayload, verificationKey, signatureBytes.subarray(10))
+  ) {
     throw new Error(
       'updater private key does not match TONO_UPDATER_PUBLIC_KEY',
     )
+  }
+
+  const trustedComment = Buffer.from(signatureLines[2].slice(17))
+  const globalPayload = Buffer.concat([
+    signatureBytes.subarray(10),
+    trustedComment,
+  ])
+  if (!verify(null, globalPayload, verificationKey, globalSignature)) {
+    throw new Error('updater signature trusted comment authentication failed')
   }
 }
 

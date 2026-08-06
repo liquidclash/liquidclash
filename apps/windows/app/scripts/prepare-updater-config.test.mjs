@@ -8,9 +8,14 @@ import {
   verifyUpdaterSignature,
 } from './prepare-updater-config.mjs'
 
-const TEST_PUBLIC_KEY_TEXT = `untrusted comment: minisign public key for updater tests
-RWQBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB`
+const TEST_PUBLIC_KEY_TEXT = `untrusted comment: minisign public key E7620F1842B4E81F
+RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3`
 const TEST_PUBLIC_KEY = Buffer.from(TEST_PUBLIC_KEY_TEXT).toString('base64')
+const TEST_SIGNATURE_TEXT = `untrusted comment: signature from minisign secret key
+RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=
+trusted comment: timestamp:1556193335\tfile:test
+y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==`
+const TEST_SIGNATURE = Buffer.from(TEST_SIGNATURE_TEXT).toString('base64')
 
 test('creates a Tono-only signed Windows updater configuration', () => {
   const config = createUpdaterConfig(TEST_PUBLIC_KEY)
@@ -28,30 +33,71 @@ test('rejects missing, malformed, placeholder, and legacy public keys', () => {
 })
 
 test('verifies that an updater signature belongs to the configured public key', () => {
-  // RFC 8032 Ed25519 test vector 1 (empty payload); no private key is stored or generated here.
-  const keyId = Buffer.from('0102030405060708', 'hex')
-  const publicKey = Buffer.from(
-    'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a',
-    'hex',
-  )
-  const signature = Buffer.from(
-    'e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155' +
-      '5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b',
-    'hex',
-  )
-  const publicKeyText = `untrusted comment: RFC 8032 test key\n${Buffer.concat([Buffer.from('Ed'), keyId, publicKey]).toString('base64')}`
-  const signatureText = `untrusted comment: RFC 8032 test signature\n${Buffer.concat([Buffer.from('Ed'), keyId, signature]).toString('base64')}`
-  const encodedPublicKey = Buffer.from(publicKeyText).toString('base64')
-  const encodedSignature = Buffer.from(signatureText).toString('base64')
-
   assert.doesNotThrow(() =>
-    verifyUpdaterSignature(encodedPublicKey, encodedSignature, Buffer.alloc(0)),
+    verifyUpdaterSignature(
+      TEST_PUBLIC_KEY,
+      TEST_SIGNATURE,
+      Buffer.from('test'),
+    ),
   )
   assert.throws(() =>
     verifyUpdaterSignature(
-      encodedPublicKey,
-      encodedSignature,
+      TEST_PUBLIC_KEY,
+      TEST_SIGNATURE,
       Buffer.from('changed'),
+    ),
+  )
+
+  for (const line of [2, 3]) {
+    const tampered = TEST_SIGNATURE_TEXT.split('\n')
+    tampered[line] =
+      line === 2 ? `${tampered[line]}x` : `A${tampered[line].slice(1)}`
+    assert.throws(() =>
+      verifyUpdaterSignature(
+        TEST_PUBLIC_KEY,
+        Buffer.from(tampered.join('\n')).toString('base64'),
+        Buffer.from('test'),
+      ),
+    )
+  }
+})
+
+test('rejects updater encodings that Tauri cannot decode canonically', () => {
+  assert.throws(() =>
+    verifyUpdaterSignature(
+      TEST_PUBLIC_KEY,
+      ` ${TEST_SIGNATURE}`,
+      Buffer.from('test'),
+    ),
+  )
+
+  const noncanonicalLines = TEST_SIGNATURE_TEXT.split('\n')
+  const canonicalInnerSignature = noncanonicalLines[1]
+  noncanonicalLines[1] = `${canonicalInnerSignature.slice(0, -2)}p=`
+  assert.equal(
+    Buffer.from(noncanonicalLines[1], 'base64').toString('base64'),
+    canonicalInnerSignature,
+  )
+  const noncanonicalSignature = Buffer.from(
+    noncanonicalLines.join('\n'),
+  ).toString('base64')
+  assert.throws(() =>
+    verifyUpdaterSignature(
+      TEST_PUBLIC_KEY,
+      noncanonicalSignature,
+      Buffer.from('test'),
+    ),
+  )
+
+  const invalidUtf8Signature = Buffer.concat([
+    Buffer.from(TEST_SIGNATURE_TEXT),
+    Buffer.from([0xff]),
+  ]).toString('base64')
+  assert.throws(() =>
+    verifyUpdaterSignature(
+      TEST_PUBLIC_KEY,
+      invalidUtf8Signature,
+      Buffer.from('test'),
     ),
   )
 })

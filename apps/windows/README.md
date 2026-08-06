@@ -41,13 +41,26 @@ non-TUN modes, LAN exposure, streaming-unlock checkers, WebDAV backup.
 ## Signed Windows updates
 
 Release builds use only the Tono-owned static updater feed at
-`https://github.com/raydocs/tono/releases/latest/download/latest.json`. The
-normal developer build does not configure an updater endpoint. The manually
-dispatched `Windows release` workflow builds the App and all three Windows
-Service binaries from the same commit, generates signed NSIS updater
-artifacts, runs the release preflight, and creates a **draft** GitHub Release.
-Publishing the reviewed draft makes its generated `latest.json` available to
-installed clients.
+`https://raw.githubusercontent.com/raydocs/tono/windows-updates/latest.json`.
+This is the `latest.json` file on the dedicated, auditable `windows-updates`
+branch; it does not use GitHub's repository-wide “latest release”, so macOS
+tags and releases cannot move the Windows channel. The normal developer build
+does not configure an updater endpoint.
+
+The manually dispatched `Windows release` workflow builds the App and all
+three Windows Service binaries from the same commit, generates signed NSIS
+updater artifacts, runs the release preflight, and creates a **draft** GitHub
+Release. After an operator reviews, publishes, and locks that stable Release as
+immutable, they dispatch `Promote Windows update channel` for the exact version.
+Promotion rejects draft/prerelease releases, non-Windows entries, mutable or
+cross-version asset URLs, and any artifact that fails the configured Tauri
+signature.
+
+Only the final fast-forward update of the `windows-updates` Git ref publishes
+the new pointer. Any validation, download, commit, or push failure leaves the
+previous branch tip—and therefore the previous valid `latest.json`—unchanged.
+Rollback is an audited fast-forward revert commit restoring an earlier
+`latest.json`; already-updated clients still refuse downgrades.
 
 Before the first updater-enabled release, an operator must generate one Tauri
 updater signing keypair outside this repository and configure:

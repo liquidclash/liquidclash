@@ -1,0 +1,80 @@
+name: Promote Windows update channel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published stable Windows Release SemVer to promote
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-update-channel
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      TONO_UPDATER_PUBLIC_KEY: ${{ vars.TONO_UPDATER_PUBLIC_KEY }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+
+      - name: Require a published stable immutable Windows Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${RELEASE_VERSION}")
+          test "$(jq -r .draft <<<"$release")" = false
+          test "$(jq -r .prerelease <<<"$release")" = false
+          test "$(jq -r .immutable <<<"$release")" = true
+          test "$(jq -r .tag_name <<<"$release")" = "v${RELEASE_VERSION}"
+          printf '%s' "$release" > "$RUNNER_TEMP/windows-release.json"
+          mkdir -p "$RUNNER_TEMP/windows-channel-candidate"
+          gh release download "v${RELEASE_VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern latest.json \
+            --dir "$RUNNER_TEMP/windows-channel-candidate"
+
+      - name: Verify every channel artifact with the configured updater public key
+        run: |
+          node apps/windows/app/scripts/validate-windows-channel.mjs \
+            "$RUNNER_TEMP/windows-channel-candidate/latest.json" \
+            "$RUNNER_TEMP/windows-release.json" \
+            "$RELEASE_VERSION" \
+            "$RUNNER_TEMP/windows-latest.json"
+
+      - name: Atomically advance the audited Windows channel branch
+        run: |
+          set -euo pipefail
+          if git fetch origin refs/heads/windows-updates:refs/remotes/origin/windows-updates; then
+            git switch --detach refs/remotes/origin/windows-updates
+          else
+            git switch --orphan windows-updates
+            git rm -rf --ignore-unmatch .
+          fi
+          cp "$RUNNER_TEMP/windows-latest.json" latest.json
+          git add latest.json
+          if git diff --cached --quiet; then
+            echo "Windows channel already points to v${RELEASE_VERSION}"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "release(windows): promote v${RELEASE_VERSION}"
+          # A fast-forward ref update is the only publication point. Validation, download,
+          # commit, or push failure leaves the previous branch tip and latest.json untouched.
+          git push origin HEAD:refs/heads/windows-updates
