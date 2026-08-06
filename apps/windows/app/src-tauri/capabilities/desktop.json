@@ -9,6 +9,7 @@
     "autostart:allow-is-enabled",
     "core:window:allow-set-theme",
     "notification:default",
-    "mihomo:default"
+    "mihomo:default",
+    "updater:default"
   ]
 }

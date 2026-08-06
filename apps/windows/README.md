@@ -38,6 +38,28 @@ the fork; every security decision comes from Tono.
 Non-goals: third-party subscriptions, user-defined nodes, scripting/merge,
 non-TUN modes, LAN exposure, streaming-unlock checkers, WebDAV backup.
 
+## Signed Windows updates
+
+Release builds use only the Tono-owned static updater feed at
+`https://github.com/raydocs/tono/releases/latest/download/latest.json`. The
+normal developer build does not configure an updater endpoint. The manually
+dispatched `Windows release` workflow builds the App and all three Windows
+Service binaries from the same commit, generates signed NSIS updater
+artifacts, runs the release preflight, and creates a **draft** GitHub Release.
+Publishing the reviewed draft makes its generated `latest.json` available to
+installed clients.
+
+Before the first updater-enabled release, an operator must generate one Tauri
+updater signing keypair outside this repository and configure:
+
+- repository variable `TONO_UPDATER_PUBLIC_KEY` with the complete outer-Base64
+  public-key value emitted by Tauri (copy the generated `.pub` content unchanged);
+- repository secrets `TAURI_SIGNING_PRIVATE_KEY` and
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+
+Never commit the private key. Losing or rotating it without a signed migration
+release prevents already-installed clients from accepting future updates.
+
 ## Architecture
 
 ```text

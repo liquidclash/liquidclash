@@ -7,14 +7,12 @@ import {
 import { version as appVersion } from '@root/package.json'
 
 type VersionParts = {
-  main: number[]
-  pre: (number | string)[]
+  main: bigint[]
+  pre: (bigint | string)[]
 }
 
 const SEMVER_FULL_REGEX =
-  /^\d+(?:\.\d+){1,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
-const SEMVER_SEARCH_REGEX =
-  /v?\d+(?:\.\d+){1,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/i
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 
 const normalizeVersion = (input: string | null | undefined): string | null => {
   if (typeof input !== 'string') return null
@@ -29,25 +27,15 @@ const ensureSemver = (input: string | null | undefined): string | null => {
   return SEMVER_FULL_REGEX.test(normalized) ? normalized : null
 }
 
-const extractSemver = (input: string | null | undefined): string | null => {
-  if (typeof input !== 'string') return null
-  const match = input.match(SEMVER_SEARCH_REGEX)
-  if (!match) return null
-  return normalizeVersion(match[0])
-}
-
 const splitVersion = (version: string | null): VersionParts | null => {
   if (!version) return null
-  const [mainPart, preRelease] = version.split('-')
-  const main = mainPart
-    .split('.')
-    .map((part) => Number.parseInt(part, 10))
-    .map((num) => (Number.isNaN(num) ? 0 : num))
+  const withoutBuildMetadata = version.split('+', 1)[0]
+  const [mainPart, preRelease] = withoutBuildMetadata.split('-', 2)
+  const main = mainPart.split('.').map((part) => BigInt(part))
 
   const pre =
     preRelease?.split('.').map((token) => {
-      const numeric = Number.parseInt(token, 10)
-      return Number.isNaN(numeric) ? token : numeric
+      return /^\d+$/.test(token) ? BigInt(token) : token
     }) ?? []
 
   return { main, pre }
@@ -56,8 +44,9 @@ const splitVersion = (version: string | null): VersionParts | null => {
 const compareVersionParts = (a: VersionParts, b: VersionParts): number => {
   const length = Math.max(a.main.length, b.main.length)
   for (let i = 0; i < length; i += 1) {
-    const diff = (a.main[i] ?? 0) - (b.main[i] ?? 0)
-    if (diff !== 0) return diff > 0 ? 1 : -1
+    const aPart = a.main[i] ?? 0n
+    const bPart = b.main[i] ?? 0n
+    if (aPart !== bPart) return aPart > bPart ? 1 : -1
   }
 
   if (a.pre.length === 0 && b.pre.length === 0) return 0
@@ -71,14 +60,14 @@ const compareVersionParts = (a: VersionParts, b: VersionParts): number => {
     if (aToken === undefined) return -1
     if (bToken === undefined) return 1
 
-    if (typeof aToken === 'number' && typeof bToken === 'number') {
+    if (typeof aToken === 'bigint' && typeof bToken === 'bigint') {
       if (aToken > bToken) return 1
       if (aToken < bToken) return -1
       continue
     }
 
-    if (typeof aToken === 'number') return -1
-    if (typeof bToken === 'number') return 1
+    if (typeof aToken === 'bigint') return -1
+    if (typeof bToken === 'bigint') return 1
 
     if (aToken > bToken) return 1
     if (aToken < bToken) return -1
@@ -87,43 +76,25 @@ const compareVersionParts = (a: VersionParts, b: VersionParts): number => {
   return 0
 }
 
-const compareVersions = (a: string | null, b: string | null): number | null => {
-  const partsA = splitVersion(a)
-  const partsB = splitVersion(b)
+export const compareVersions = (
+  a: string | null,
+  b: string | null,
+): number | null => {
+  const partsA = splitVersion(ensureSemver(a))
+  const partsB = splitVersion(ensureSemver(b))
   if (!partsA || !partsB) return null
   return compareVersionParts(partsA, partsB)
 }
 
 const resolveRemoteVersion = (update: Update): string | null => {
-  const primary = ensureSemver(update.version)
-  if (primary) return primary
-
-  const fallbackPrimary = extractSemver(update.version)
-  if (fallbackPrimary) return fallbackPrimary
-
-  const raw = update.rawJson ?? {}
-  const rawVersion = ensureSemver(
-    typeof raw.version === 'string' ? raw.version : null,
-  )
-  if (rawVersion) return rawVersion
-
-  const tagVersion = extractSemver(
-    typeof raw.tag_name === 'string' ? raw.tag_name : null,
-  )
-  if (tagVersion) return tagVersion
-
-  const nameVersion = extractSemver(
-    typeof raw.name === 'string' ? raw.name : null,
-  )
-  if (nameVersion) return nameVersion
-
-  return null
+  return ensureSemver(update.version)
 }
 
-const localVersionNormalized = normalizeVersion(appVersion)
-// Tono must never query or accept the inherited Clash Verge update channel. Re-enable only
-// together with a Tono-owned endpoint and signing key in tauri.conf.json.
-const TONO_UPDATES_CONFIGURED = false
+const localVersionNormalized = ensureSemver(appVersion)
+// Release builds set this only after prepare-updater-config.mjs has injected the Tono-owned
+// endpoint and public key. Developer builds therefore never query any inherited channel.
+export const TONO_UPDATES_CONFIGURED =
+  import.meta.env.VITE_TONO_UPDATES_CONFIGURED === 'true'
 
 export const checkUpdateSafe = async (
   options?: CheckOptions,
@@ -135,7 +106,9 @@ export const checkUpdateSafe = async (
   const remoteVersion = resolveRemoteVersion(result)
   const comparison = compareVersions(remoteVersion, localVersionNormalized)
 
-  if (comparison !== null && comparison <= 0) {
+  // A signed feed is still required to name a strict SemVer newer than this App. Do not let a
+  // malformed response bypass the downgrade check.
+  if (comparison === null || comparison <= 0) {
     try {
       await result.close()
     } catch (err) {

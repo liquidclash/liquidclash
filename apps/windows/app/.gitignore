@@ -19,3 +19,4 @@ CLAUDE.md
 .claude
 AGENTS.md
 .zed
+src-tauri/tauri.updater.conf.json

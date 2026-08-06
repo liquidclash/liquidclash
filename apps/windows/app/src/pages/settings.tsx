@@ -1,9 +1,12 @@
 import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded'
 import { useLockFn } from 'ahooks'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import type { DialogRef } from '@/components/base'
+import { UpdateViewer } from '@/components/setting/mods/update-viewer'
 import { useI18n } from '@/hooks/use-i18n'
+import { useUpdate } from '@/hooks/use-update'
 import { useVerge } from '@/hooks/use-verge'
 import { supportedLanguages } from '@/services/i18n'
 import { showNotice } from '@/services/notice-service'
@@ -426,32 +429,60 @@ const AboutCard = () => {
   const { t } = useTranslation()
   const dark = useThemeMode() !== 'light'
   const text = tonoText(dark)
+  const updateRef = useRef<DialogRef>(null)
+  const { checkUpdate, loading } = useUpdate()
+
+  const onCheckUpdate = useLockFn(async () => {
+    try {
+      const result = await checkUpdate()
+      if (result.data?.available) {
+        updateRef.current?.open()
+      } else {
+        showNotice.success(
+          'settings.components.verge.advanced.notifications.latestVersion',
+        )
+      }
+    } catch (error) {
+      showNotice.error(error)
+    }
+  })
 
   return (
-    <GlassCard
-      style={{
-        background: `linear-gradient(135deg, ${TONO_COLORS.accent}1A 0%, ${TONO_COLORS.protectedOffline}1A 100%), ${
-          dark ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.4)'
-        }`,
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        textAlign: 'center',
-        gap: 10,
-        justifyContent: 'center',
-      }}
-    >
-      <TonoLogo connected compact={false} size={56} />
-      <span style={{ fontSize: 15, fontWeight: 600, color: text.primary }}>
-        Tono v{version}
-      </span>
-      <span style={{ fontSize: 12, fontWeight: 500, color: text.secondary }}>
-        {t('tono.settings.about.tagline')}
-      </span>
-      <span style={{ fontSize: 11, color: text.tertiary, maxWidth: 260 }}>
-        {t('tono.settings.about.description')}
-      </span>
-    </GlassCard>
+    <>
+      <UpdateViewer ref={updateRef} />
+      <GlassCard
+        style={{
+          background: `linear-gradient(135deg, ${TONO_COLORS.accent}1A 0%, ${TONO_COLORS.protectedOffline}1A 100%), ${
+            dark ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.4)'
+          }`,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          textAlign: 'center',
+          gap: 10,
+          justifyContent: 'center',
+        }}
+      >
+        <TonoLogo connected compact={false} size={56} />
+        <span style={{ fontSize: 15, fontWeight: 600, color: text.primary }}>
+          Tono v{version}
+        </span>
+        <span style={{ fontSize: 12, fontWeight: 500, color: text.secondary }}>
+          {t('tono.settings.about.tagline')}
+        </span>
+        <span style={{ fontSize: 11, color: text.tertiary, maxWidth: 260 }}>
+          {t('tono.settings.about.description')}
+        </span>
+        <button
+          type="button"
+          className="tono-link"
+          disabled={loading}
+          onClick={() => void onCheckUpdate()}
+        >
+          {t('settings.components.verge.advanced.fields.checkUpdates')}
+        </button>
+      </GlassCard>
+    </>
   )
 }
 
