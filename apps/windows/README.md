@@ -67,8 +67,19 @@ updater signing keypair outside this repository and configure:
 
 - repository variable `TONO_UPDATER_PUBLIC_KEY` with the complete outer-Base64
   public-key value emitted by Tauri (copy the generated `.pub` content unchanged);
-- repository secrets `TAURI_SIGNING_PRIVATE_KEY` and
-  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+- protected GitHub Environment `windows-release`, restricted to `main` with a
+  required reviewer and self-approval/bypass disabled where supported;
+- `windows-release` Environment secrets `TAURI_SIGNING_PRIVATE_KEY` and
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`;
+- protected GitHub Environment `windows-update-channel`, also restricted to
+  reviewed deployments from `main`;
+- branch protection for `windows-updates` that forbids direct pushes, force
+  pushes, and deletion while allowing only the reviewed promotion workflow to
+  fast-forward the branch.
+
+Both workflows also reject dispatches whose ref is not `main`. The Environment
+deployment-branch restrictions remain the security boundary because a branch
+can otherwise modify its own workflow definition before dispatch.
 
 Never commit the private key. Losing or rotating it without a signed migration
 release prevents already-installed clients from accepting future updates.

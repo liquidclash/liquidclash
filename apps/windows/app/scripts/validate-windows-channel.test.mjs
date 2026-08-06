@@ -140,3 +140,27 @@ test('promotion validates before one non-forced atomic channel ref update', asyn
       workflow.indexOf('git push origin HEAD:refs/heads/windows-updates'),
   )
 })
+
+test('signing and channel write jobs require protected main-only environments', async () => {
+  const [releaseWorkflow, promotionWorkflow] = await Promise.all([
+    readFile(
+      new URL(
+        '../../../../.github/workflows/windows-release.yml',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+    readFile(
+      new URL(
+        '../../../../.github/workflows/windows-update-promote.yml',
+        import.meta.url,
+      ),
+      'utf8',
+    ),
+  ])
+
+  assert.match(releaseWorkflow, /if: github\.ref == 'refs\/heads\/main'/)
+  assert.match(releaseWorkflow, /environment: windows-release/)
+  assert.match(promotionWorkflow, /if: github\.ref == 'refs\/heads\/main'/)
+  assert.match(promotionWorkflow, /environment: windows-update-channel/)
+})
