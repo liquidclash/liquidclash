@@ -10,6 +10,7 @@ nonisolated enum KillSwitchService {
         case installFailed(String)
         case notInstalled
         case commandFailed(String)
+        case helperRejected
         case userDenied
 
         var errorDescription: String? {
@@ -20,10 +21,22 @@ nonisolated enum KillSwitchService {
                 "The authenticated network helper is unavailable."
             case .commandFailed(let message):
                 "Kill Switch command failed: \(message)"
+            case .helperRejected:
+                "The installed network helper rejected this copy of Tono."
             case .userDenied:
                 "Administrator privileges were denied for the Kill Switch."
             }
         }
+    }
+
+    /// An authenticated status response is authoritative, while transport
+    /// failure and peer rejection must preserve the app's local fail-closed
+    /// intent. Keep rejection distinct so the UI can stop retrying and offer a
+    /// signed helper repair instead of treating it as weak-network noise.
+    enum StatusObservation: Sendable, Equatable {
+        case unavailable
+        case rejected
+        case confirmed(requiresProtectionRecovery: Bool)
     }
 
     private static let stateKey = "Tono_killSwitchArmed"
@@ -70,6 +83,8 @@ nonisolated enum KillSwitchService {
                 throw Error.commandFailed("The PF rules did not become active.")
             }
             isArmed = true
+        } catch HelperIPCError.forbidden {
+            throw Error.helperRejected
         } catch let error as Error {
             throw error
         } catch {
@@ -140,6 +155,8 @@ nonisolated enum KillSwitchService {
             _ = try HelperManager.restoreProtectedDNSIfConfigured()
             try HelperManager.disarmKillSwitch()
             isArmed = false
+        } catch HelperIPCError.forbidden {
+            throw Error.helperRejected
         } catch {
             throw Error.commandFailed(error.localizedDescription)
         }
@@ -157,15 +174,21 @@ nonisolated enum KillSwitchService {
         set { reassertLock.withLock { reassertNeeded = newValue } }
     }
 
-    /// Returns effective PF state. An unavailable helper never clears persisted
-    /// fail-closed intent.
-    static func refreshStatus() -> Bool {
-        guard let status = try? HelperManager.killSwitchStatus() else {
-            return false
+    /// Observes effective helper-owned protection without mutating local intent.
+    /// AppState commits a confirmed result only after checking that no newer
+    /// connect/disconnect operation raced this IPC round trip.
+    static func refreshStatus() -> StatusObservation {
+        do {
+            let status = try HelperManager.killSwitchStatus()
+            if status.healed { needsSessionExceptionReassert = true }
+            return .confirmed(
+                requiresProtectionRecovery: status.armed || status.wanted
+            )
+        } catch HelperIPCError.forbidden {
+            return .rejected
+        } catch {
+            return .unavailable
         }
-        if status.healed { needsSessionExceptionReassert = true }
-        isArmed = status.armed || status.wanted
-        return status.armed && status.live
     }
 
     /// After an app crash, re-supply control-plane metadata while keeping the

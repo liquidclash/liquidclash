@@ -593,6 +593,9 @@ final class AppState {
         ConfigPipeline.ManagedDirectRuntimePolicy?
     private var disconnectSequence: Task<Void, Never>?
     private var disconnectRequestID = 0
+    /// Invalidates helper-status observations when a newer protected network
+    /// transition starts while the IPC request is in flight.
+    private var protectionOperationGeneration: UInt64 = 0
     private var networkInfoTask: Task<Void, Never>?
     private var nodeSwitchTask: Task<Void, Never>?
     private var protectedDNSService: String?
@@ -697,6 +700,7 @@ final class AppState {
             details: auditProtectionDetails()
         )
         guard shouldResume else { return }
+        protectionOperationGeneration &+= 1
         wakeRecoveryTask?.cancel()
         wakeRecoveryTask = nil
         networkEnvironmentTask?.cancel()
@@ -730,6 +734,7 @@ final class AppState {
             details: auditProtectionDetails()
         )
         guard shouldResume else { return }
+        protectionOperationGeneration &+= 1
         networkEnvironmentTask?.cancel()
         networkEnvironmentTask = nil
         wakeRecoveryTask?.cancel()
@@ -1074,6 +1079,7 @@ final class AppState {
             errorMessage = "No protected Tono cloud exit is ready."
             return
         }
+        protectionOperationGeneration &+= 1
         isProtectionBlocked = false
         connectionStage = .preparing
         completedConnectionStages = []
@@ -1628,6 +1634,7 @@ final class AppState {
     /// intentional logout / user "turn off protection" so a crash or health failure
     /// leaves the host fail-closed via Kill Switch.
     func disconnect(releaseKillSwitch: Bool = false) {
+        protectionOperationGeneration &+= 1
         LocalTrafficAudit.shared.recordEvent(
             "disconnect_requested",
             details: [
@@ -1635,7 +1642,14 @@ final class AppState {
                 "was_connected": String(isConnected),
             ]
         )
-        isProtectionBlocked = !releaseKillSwitch
+        let protectionMayBeActive = isProtectionBlocked
+            || isConnected
+            || isConnecting
+            || KillSwitchService.isArmed
+        // An explicit release can spend up to 180 seconds on the administrator
+        // repair prompt. Keep the UI protected/offline until core stop, DNS
+        // restoration, and PF disarm have all committed.
+        isProtectionBlocked = !releaseKillSwitch || protectionMayBeActive
         let runtimeMayOwnNetwork =
             KillSwitchService.isArmed
                 || AppProfile.defaults.bool(forKey: SettingsKey.didStartCore)
@@ -1729,37 +1743,63 @@ final class AppState {
             _ = await pendingNodeSwitch?.value
             _ = await pendingConfigReload?.value
 
+            var transitionError: String?
+            var helperReadyForRelease = true
+            if releaseKillSwitch {
+                do {
+                    // A helper that rejects this GUI will also reject core stop,
+                    // DNS restoration, and disarm. Repair once, while PF remains
+                    // fail-closed, before attempting any release operation.
+                    try await PrivilegedRuntimeCoordinator.shared
+                        .repairRejectingHelperForExplicitReleaseIfNeeded()
+                } catch {
+                    helperReadyForRelease = false
+                    transitionError =
+                        "The installed network helper rejected Tono, so network protection was not released. Tap Protected Offline again and approve the administrator repair. If repair cannot run, quit Tono, run `sudo /Library/PrivilegedHelperTools/tono-core-helper --emergency-reset`, then reopen Tono. \(error.localizedDescription)"
+                    LocalTrafficAudit.shared.recordEvent(
+                        "helper_release_repair_failed",
+                        details: ["error": error.localizedDescription]
+                    )
+                }
+            }
+
             await MainActor.run {
                 self?.disconnectionStage = .stoppingTunnel
             }
-            let stopped = shouldStopCore ? await clashManager.stopAsync() : true
-            let coreStillRunning = shouldStopCore
+            let stopped = helperReadyForRelease
+                ? (shouldStopCore ? await clashManager.stopAsync() : true)
+                : false
+            let coreStillRunning = helperReadyForRelease && shouldStopCore
                 ? await PrivilegedRuntimeCoordinator.shared.coreStatus().running
                 : false
-            let coreStopped = stopped || !coreStillRunning
+            // A failed identity repair aborts the privileged release sequence.
+            // Do not infer "stopped" from an unauthorized status endpoint.
+            let coreStopped = helperReadyForRelease
+                && (stopped || !coreStillRunning)
             if coreStopped {
                 RuntimeCleanup.clearCoreStarted()
             }
 
-            var transitionError: String?
             var protectedDNSRestored = !releaseKillSwitch
             if releaseKillSwitch {
                 await MainActor.run {
                     self?.disconnectionStage = .restoringDNS
                 }
-                do {
-                    _ = try await PrivilegedRuntimeCoordinator.shared
-                        .restoreProtectedDNSIfConfigured()
-                    protectedDNSRestored = true
-                } catch {
-                    // A first-run user may cancel the administrator prompt
-                    // before any helper, PF rule, core, or DNS snapshot exists.
-                    // Only that provably pristine case can treat an absent
-                    // helper as "nothing to restore."
-                    protectedDNSRestored = !runtimeMayOwnNetwork
-                    if !protectedDNSRestored {
-                        transitionError =
-                            "Protected DNS restore failed; Kill Switch remains active. \(error.localizedDescription)"
+                if helperReadyForRelease {
+                    do {
+                        _ = try await PrivilegedRuntimeCoordinator.shared
+                            .restoreProtectedDNSIfConfigured()
+                        protectedDNSRestored = true
+                    } catch {
+                        // A first-run user may cancel the administrator prompt
+                        // before any helper, PF rule, core, or DNS snapshot exists.
+                        // Only that provably pristine case can treat an absent
+                        // helper as "nothing to restore."
+                        protectedDNSRestored = !runtimeMayOwnNetwork
+                        if !protectedDNSRestored {
+                            transitionError =
+                                "Protected DNS restore failed; Kill Switch remains active. \(error.localizedDescription)"
+                        }
                     }
                 }
             } else {
@@ -1769,7 +1809,7 @@ final class AppState {
             }
             var transitionLeavesProtectionBlocked =
                 !releaseKillSwitch || !coreStopped || !protectedDNSRestored
-            if !coreStopped {
+            if !coreStopped, transitionError == nil {
                 transitionError =
                     "The protected core could not be stopped. Kill Switch remains active; retry disconnecting."
             }
@@ -1786,17 +1826,21 @@ final class AppState {
                     self?.disconnectionStage = .restoringNetwork
                 }
             }
-            do {
-                if releaseKillSwitch, coreStopped, protectedDNSRestored {
-                    try await PrivilegedRuntimeCoordinator.shared.disarmKillSwitch()
-                    transitionLeavesProtectionBlocked = false
-                } else {
-                    try await PrivilegedRuntimeCoordinator.shared.restrictKillSwitchToBootstrap()
+            if helperReadyForRelease {
+                do {
+                    if releaseKillSwitch, coreStopped, protectedDNSRestored {
+                        try await PrivilegedRuntimeCoordinator.shared.disarmKillSwitch()
+                        transitionLeavesProtectionBlocked = false
+                    } else {
+                        try await PrivilegedRuntimeCoordinator.shared.restrictKillSwitchToBootstrap()
+                        transitionLeavesProtectionBlocked = true
+                    }
+                } catch {
                     transitionLeavesProtectionBlocked = true
+                    transitionError = "Kill switch transition failed: \(error.localizedDescription)"
                 }
-            } catch {
+            } else {
                 transitionLeavesProtectionBlocked = true
-                transitionError = "Kill switch transition failed: \(error.localizedDescription)"
             }
 
             await MainActor.run {
@@ -2159,6 +2203,87 @@ final class AppState {
         }
     }
 
+    /// Non-prompting foreground reconciliation for the documented root
+    /// emergency recovery path. Only an authenticated helper response that
+    /// confirms both armed=false and wanted=false may clear Protected Offline.
+    func reconcileExternalProtectionState() {
+        guard isProtectionBlocked, !isConnected, !isConnecting,
+              !isDisconnecting else { return }
+        Task { [weak self] in
+            _ = await self?.reconcileConfirmedExternalProtectionRelease()
+        }
+    }
+
+    /// Returns true only when a confirmed external release was accepted. Every
+    /// unavailable, malformed, or rejecting response remains fail-closed.
+    @discardableResult
+    private func reconcileConfirmedExternalProtectionRelease() async -> Bool {
+        guard isProtectionBlocked, !isConnected, !isConnecting,
+              !isDisconnecting else { return false }
+        let observedGeneration = protectionOperationGeneration
+        let observation = await PrivilegedRuntimeCoordinator.shared
+            .refreshKillSwitchStatus()
+        guard !Task.isCancelled,
+              protectionOperationGeneration == observedGeneration,
+              isProtectionBlocked, !isConnected, !isConnecting,
+              !isDisconnecting else { return false }
+
+        switch observation {
+        case .unavailable:
+            return false
+        case .rejected:
+            // No automatic retry can make an identity/UID rejection succeed.
+            // Do not prompt on activation; the explicit Protected Offline
+            // action owns the one administrator repair attempt.
+            protectedReconnectPausedForUserAction = true
+            protectedReconnectPauseLiftsOnNetworkChange = false
+            protectedReconnectTask?.cancel()
+            protectedReconnectTask = nil
+            protectedReconnectID = nil
+            isProtectedReconnectScheduled = false
+            protectedReconnectNextAttemptAt = nil
+            errorMessage =
+                "The installed network helper rejected Tono. Automatic retries are paused. Tap Protected Offline and approve the administrator repair. If repair cannot run, quit Tono, run `sudo /Library/PrivilegedHelperTools/tono-core-helper --emergency-reset`, then reopen Tono."
+            return false
+        case .confirmed(let requiresProtectionRecovery):
+            KillSwitchService.isArmed = requiresProtectionRecovery
+            guard !requiresProtectionRecovery else { return false }
+            acceptConfirmedExternalProtectionRelease()
+            return true
+        }
+    }
+
+    private func acceptConfirmedExternalProtectionRelease() {
+        protectionOperationGeneration &+= 1
+        KillSwitchService.isArmed = false
+        KillSwitchService.needsSessionExceptionReassert = false
+        protectedReconnectTask?.cancel()
+        protectedReconnectTask = nil
+        protectedReconnectID = nil
+        lastProtectedReconnectKick = nil
+        isProtectedReconnectScheduled = false
+        protectedReconnectAttempt = 0
+        protectedReconnectNextAttemptAt = nil
+        protectedReconnectPausedForUserAction = false
+        protectedReconnectPauseLiftsOnNetworkChange = false
+        lastProtectedFailureSignature = nil
+        consecutiveProtectedFailureCount = 0
+        wakeRecoveryTask?.cancel()
+        wakeRecoveryTask = nil
+        resumeProtectionAfterWake = false
+        autoConnectRequested = false
+        connectionStartedAt = nil
+        connectionStageStartedAt = nil
+        completedConnectionStages = []
+        lastConnectionFailure = nil
+        protectedDNSService = nil
+        isProtectionBlocked = false
+        errorMessage = nil
+        LocalTrafficAudit.shared.recordEvent(
+            "external_protection_release_confirmed"
+        )
+    }
+
     /// Failures the automatic reconnect loop can never resolve: repeating the
     /// identical transaction would re-raise the same administrator prompt or
     /// fail installation the same way. Weak-network and transient helper
@@ -2167,9 +2292,11 @@ final class AppState {
         switch error {
         case KillSwitchService.Error.userDenied,
              KillSwitchService.Error.installFailed,
+             KillSwitchService.Error.helperRejected,
              HelperInstallError.userDenied,
              HelperInstallError.resourceNotFound,
-             HelperInstallError.installFailed:
+             HelperInstallError.installFailed,
+             HelperIPCError.forbidden:
             true
         default:
             false
@@ -2249,6 +2376,15 @@ final class AppState {
 
                 await self.finishPendingDisconnect()
                 guard !Task.isCancelled, !self.isConnected else { return }
+                // Root emergency recovery may have released helper-owned PF
+                // state while this loop was sleeping. Accept only an
+                // authenticated unarmed status and exit before connect can
+                // re-arm it; rejection pauses for explicit helper repair.
+                if await self.reconcileConfirmedExternalProtectionRelease() {
+                    return
+                }
+                guard !Task.isCancelled,
+                      !self.protectedReconnectPausedForUserAction else { return }
                 if self.catalogSelectionRequiresChoice {
                     return
                 }

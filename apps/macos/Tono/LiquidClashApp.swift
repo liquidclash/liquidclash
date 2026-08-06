@@ -155,12 +155,22 @@ enum RuntimeCleanup {
             }
         }
         let localProtectionIntent = KillSwitchService.isArmed
-        let helperProtectionWasLive =
+        let helperProtectionObservation =
             await PrivilegedRuntimeCoordinator.shared.refreshKillSwitchStatus()
-        let shouldResumeProtection =
-            localProtectionIntent
-                || helperProtectionWasLive
-                || KillSwitchService.isArmed
+        let shouldResumeProtection: Bool
+        switch helperProtectionObservation {
+        case .confirmed(let requiresProtectionRecovery):
+            // An authenticated helper status is authoritative. In particular,
+            // root emergency recovery clears helper-owned PF state but cannot
+            // update this user's defaults; do not let that stale local bit
+            // immediately re-arm the machine on reopen.
+            KillSwitchService.isArmed = requiresProtectionRecovery
+            shouldResumeProtection = requiresProtectionRecovery
+        case .unavailable, .rejected:
+            // Timeout, malformed status, and 403 are never evidence that PF is
+            // open. Preserve the last local fail-closed intent.
+            shouldResumeProtection = localProtectionIntent
+        }
 
         if shouldResumeProtection {
             // Remove stale TUN/proxy exceptions and retain the persisted exact
@@ -341,6 +351,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.start()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        _ = notification
+        // A user may have run the documented root recovery while Tono was in
+        // the background. Reconcile only an authenticated, confirmed unarmed
+        // helper state; this callback never raises an administrator prompt.
+        appState?.reconcileExternalProtectionState()
+    }
+
     @objc private func systemWillSleep(_ notification: Notification) {
         _ = notification
         appState?.prepareForSystemSleep()
@@ -513,14 +531,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Window Configurator (NSWindow-level safety net)
 
 struct WindowConfigurator: NSViewRepresentable {
-    let onVisibilityChange: @MainActor (Bool) -> Void
+    let onVisibilityChange: @MainActor @Sendable (Bool) -> Void
 
     @MainActor
     final class Coordinator: NSObject {
-        let onVisibilityChange: @MainActor (Bool) -> Void
+        let onVisibilityChange: @MainActor @Sendable (Bool) -> Void
         weak var window: NSWindow?
 
-        init(onVisibilityChange: @escaping @MainActor (Bool) -> Void) {
+        init(onVisibilityChange: @escaping @MainActor @Sendable (Bool) -> Void) {
             self.onVisibilityChange = onVisibilityChange
         }
 
@@ -573,7 +591,9 @@ struct WindowConfigurator: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onVisibilityChange: onVisibilityChange)
+        Coordinator { visible in
+            onVisibilityChange(visible)
+        }
     }
 
     func makeNSView(context: Context) -> NSView {

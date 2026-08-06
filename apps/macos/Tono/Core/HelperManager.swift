@@ -591,6 +591,9 @@ nonisolated struct HelperManager {
         if result.status == 404 {
             return false
         }
+        if result.status == 403 {
+            throw HelperIPCError.forbidden
+        }
         guard result.status == 200,
               let envelope = try? JSONDecoder().decode(
                 Envelope.self,
@@ -665,6 +668,12 @@ nonisolated struct HelperManager {
         _ result: (status: Int, body: Data),
         operation: String
     ) throws -> Envelope {
+        // Peer rejection is an identity/UID repair condition, not a transient
+        // command failure. Classify it from the authenticated HTTP boundary so
+        // even an empty or malformed 403 body cannot turn into invalidResponse.
+        if result.status == 403 {
+            throw HelperIPCError.forbidden
+        }
         guard let envelope = try? JSONDecoder().decode(Envelope.self, from: result.body) else {
             throw HelperIPCError.invalidResponse
         }
@@ -846,6 +855,7 @@ enum HelperIPCError: LocalizedError {
     case connectFailed
     case emptyResponse
     case invalidResponse
+    case forbidden
     case commandFailed(String)
 
     var errorDescription: String? {
@@ -854,6 +864,8 @@ enum HelperIPCError: LocalizedError {
         case .connectFailed: "The authenticated network helper is unavailable."
         case .emptyResponse: "The network helper closed the connection."
         case .invalidResponse: "The network helper returned an invalid response."
+        case .forbidden:
+            "The installed network helper rejected this copy of Tono."
         case .commandFailed(let message): message
         }
     }
