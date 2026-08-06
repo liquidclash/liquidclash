@@ -2,11 +2,12 @@
 //! for the frontend; status changes are pushed via the `tono://status`
 //! event (Tauri Emitter).
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwapOption;
 use clash_verge_logging::{Type, logging};
 use clash_verge_service_ipc::KillSwitchStatus;
+use futures::{StreamExt as _, stream};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter as _, Manager as _};
@@ -132,6 +133,27 @@ pub struct TonoServer {
     /// False when the exit is known blocked (e.g. GFW); still listed so users see status.
     pub available: bool,
 }
+
+/// Account-scoped catalog metadata. A refresh failure never clears the verified revision/nodes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TonoCatalogStatus {
+    pub revision: Option<i64>,
+    pub node_count: usize,
+    pub last_synced_at_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TonoServerTestResult {
+    pub name: String,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+const SERVER_TEST_CONCURRENCY: usize = 4;
+const SERVER_TEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Stable wire key for a connect stage (`TonoStatus.stage`).
 pub fn stage_key(stage: ConnectStage) -> &'static str {
@@ -383,6 +405,8 @@ pub async fn tono_sign_in_verify(
         client.adopt(&auth).await.map_err(|err| err.to_string())?;
         inner.challenge_id = None;
         inner.account = Some(auth.user.clone());
+        inner.catalog_last_synced_at_ms = None;
+        inner.catalog_sync_error = None;
         inner.account_state = if info.suspended {
             AccountState::Suspended
         } else {
@@ -427,6 +451,7 @@ pub async fn tono_sign_out(state: tauri::State<'_, Arc<TonoState>>, app: AppHand
         inner.invalidate_connection(true);
         inner.sign_in_generation = inner.sign_in_generation.wrapping_add(1);
         inner.tasks.abort_catalog_sync();
+        inner.cancel_server_tests();
         (inner.client.clone(), inner.sign_in_generation)
     };
 
@@ -476,6 +501,8 @@ pub async fn tono_sign_out(state: tauri::State<'_, Arc<TonoState>>, app: AppHand
     inner.controller_port = None;
     inner.kill_switch = None;
     inner.network_events_counter = None;
+    inner.catalog_last_synced_at_ms = None;
+    inner.catalog_sync_error = None;
     emit_status(&app, &status_of(&inner));
     drop(inner);
     state.audit().log(AuditEvent::SignOut);
@@ -537,6 +564,145 @@ pub async fn tono_servers(state: tauri::State<'_, Arc<TonoState>>) -> Result<Vec
                 })
         })
         .collect())
+}
+
+fn catalog_status_of(inner: &TonoInner) -> TonoCatalogStatus {
+    let revision = inner.catalog_tracker.current_revision();
+    TonoCatalogStatus {
+        revision: (revision >= 0).then_some(revision),
+        node_count: inner.nodes.len(),
+        last_synced_at_ms: inner.catalog_last_synced_at_ms,
+        error: inner.catalog_sync_error.clone(),
+    }
+}
+
+#[tauri::command]
+pub async fn tono_catalog_status(state: tauri::State<'_, Arc<TonoState>>) -> Result<TonoCatalogStatus, String> {
+    let inner = state.lock().await;
+    Ok(catalog_status_of(&inner))
+}
+
+/// User-initiated account-scoped refresh. This deliberately reuses catalog_sync's verified
+/// fetch/install path; the command cannot install unverified bytes or bypass rollback checks.
+#[tauri::command]
+pub async fn tono_refresh_catalog(
+    state: tauri::State<'_, Arc<TonoState>>,
+    app: AppHandle,
+) -> Result<TonoCatalogStatus, String> {
+    let generation = {
+        let inner = state.lock().await;
+        if !matches!(inner.account_state, AccountState::Ready) {
+            return Err("sign in before refreshing cloud servers".to_string());
+        }
+        inner.sign_in_generation
+    };
+    let result = catalog_sync::sync_with_retries_for_auth_generation(state.inner(), &app, generation).await;
+    let inner = state.lock().await;
+    if inner.sign_in_generation != generation {
+        return Err("catalog refresh was superseded by an account change".to_string());
+    }
+    result?;
+    Ok(catalog_status_of(&inner))
+}
+
+async fn test_server_endpoint(
+    name: String,
+    address: SocketAddr,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> TonoServerTestResult {
+    let started = std::time::Instant::now();
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err("cancelled".to_string()),
+        result = tokio::time::timeout(SERVER_TEST_TIMEOUT, tokio::net::TcpStream::connect(address)) => {
+            match result {
+                Ok(Ok(stream)) => {
+                    drop(stream);
+                    Ok(started.elapsed().as_millis().max(1).min(u64::MAX as u128) as u64)
+                }
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("timeout".to_string()),
+            }
+        }
+    };
+    match result {
+        Ok(latency_ms) => TonoServerTestResult {
+            name,
+            latency_ms: Some(latency_ms),
+            error: None,
+        },
+        Err(error) => TonoServerTestResult {
+            name,
+            latency_ms: None,
+            error: Some(error),
+        },
+    }
+}
+
+/// Measure each usable catalog endpoint without selecting it. This is allowed only while fully
+/// disconnected and unarmed: connected WFP intentionally permits only the selected endpoint,
+/// and widening that permit for a UI test would weaken the connection safety contract.
+#[tauri::command]
+pub async fn tono_test_available_servers(
+    state: tauri::State<'_, Arc<TonoState>>,
+) -> Result<Vec<TonoServerTestResult>, String> {
+    let (generation, auth_generation, catalog_revision, cancellation, nodes) = {
+        let mut inner = state.lock().await;
+        if !matches!(inner.account_state, AccountState::Ready) {
+            return Err("sign in before testing servers".to_string());
+        }
+        if inner.fsm.status().is_connected || inner.fsm.status().is_connecting || inner.fsm.kill_switch_armed() {
+            return Err("disconnect before testing all servers".to_string());
+        }
+        if inner.server_test_cancellation.is_some() {
+            return Err("a server test is already running".to_string());
+        }
+        let nodes = inner
+            .nodes
+            .iter()
+            .filter(|node| !catalog_sync::is_exit_blocked(&node.name))
+            .map(|node| (node.name.clone(), SocketAddr::new(node.server.into(), node.port)))
+            .collect::<Vec<_>>();
+        inner.server_test_generation = inner.server_test_generation.wrapping_add(1);
+        let generation = inner.server_test_generation;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        inner.server_test_cancellation = Some(cancellation.clone());
+        (
+            generation,
+            inner.sign_in_generation,
+            inner.catalog_tracker.current_revision(),
+            cancellation,
+            nodes,
+        )
+    };
+
+    let mut results = stream::iter(nodes)
+        .map(|(name, address)| test_server_endpoint(name, address, cancellation.clone()))
+        .buffer_unordered(SERVER_TEST_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut inner = state.lock().await;
+    let owns_slot = inner.server_test_generation == generation;
+    let stale = cancellation.is_cancelled()
+        || !owns_slot
+        || inner.sign_in_generation != auth_generation
+        || inner.catalog_tracker.current_revision() != catalog_revision;
+    if owns_slot {
+        inner.server_test_cancellation = None;
+    }
+    if stale {
+        return Err("server test cancelled or superseded".to_string());
+    }
+    Ok(results)
+}
+
+#[tauri::command]
+pub async fn tono_cancel_server_tests(state: tauri::State<'_, Arc<TonoState>>) -> Result<(), String> {
+    let mut inner = state.lock().await;
+    inner.cancel_server_tests();
+    Ok(())
 }
 
 /// Select a server. Persists the choice (L4). What happens next is decided
@@ -1338,6 +1504,7 @@ pub async fn resync_after_cancelled_quit(app: AppHandle) {
     let mut inner = state.lock().await;
     match kill_switch {
         Some(status) if status.wanted => {
+            inner.cancel_server_tests();
             // Still armed (the release failed or never ran): reflect it.
             if status.verified {
                 inner.fsm.mark_session_verified();
@@ -1367,7 +1534,7 @@ pub async fn resync_after_cancelled_quit(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenProbe, stage_key, token_probe, ui_state_key, unknown_protection_message};
+    use super::{TokenProbe, stage_key, test_server_endpoint, token_probe, ui_state_key, unknown_protection_message};
     use tono_core::connection::{ConnectStage, UiState};
 
     #[test]
@@ -1418,5 +1585,36 @@ mod tests {
         assert_eq!(token_probe(Some(&error), None), TokenProbe::StoreError);
         assert_eq!(token_probe(None, Some(&token)), TokenProbe::HasToken);
         assert_eq!(token_probe(None, None), TokenProbe::NoToken);
+    }
+
+    #[tokio::test]
+    async fn server_endpoint_test_reports_a_real_tcp_handshake() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let result = test_server_endpoint(
+            "US Test".to_string(),
+            address,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(result.name, "US Test");
+        assert!(result.latency_ms.is_some());
+        assert!(result.error.is_none());
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_endpoint_test_honors_cancellation() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let result = test_server_endpoint("JP Test".to_string(), "192.0.2.1:443".parse().unwrap(), cancellation).await;
+
+        assert_eq!(result.latency_ms, None);
+        assert_eq!(result.error.as_deref(), Some("cancelled"));
     }
 }

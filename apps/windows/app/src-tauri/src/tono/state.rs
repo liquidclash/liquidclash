@@ -182,6 +182,13 @@ pub struct TonoInner {
     /// The selected node vanished from a newer catalog: auto-reconnect stays
     /// blocked until the user picks a surviving node (§3).
     pub catalog_requires_choice: bool,
+    /// Wall-clock time of the latest successful account-scoped verified catalog fetch.
+    pub catalog_last_synced_at_ms: Option<i64>,
+    /// Latest catalog fetch/verification failure. The last verified catalog remains installed.
+    pub catalog_sync_error: Option<String>,
+    /// Read-only server reachability batch. It never changes selection or connection state.
+    pub server_test_generation: u64,
+    pub server_test_cancellation: Option<CancellationToken>,
     pub fsm: ConnectionFsm,
     /// Last observed kill switch aggregate.
     pub kill_switch: Option<KillSwitchStatus>,
@@ -253,6 +260,13 @@ pub struct TonoInner {
 }
 
 impl TonoInner {
+    pub fn cancel_server_tests(&mut self) {
+        if let Some(cancellation) = self.server_test_cancellation.take() {
+            cancellation.cancel();
+            self.server_test_generation = self.server_test_generation.wrapping_add(1);
+        }
+    }
+
     /// Retire the current connection generation and wake every stage waiting on its cancellation
     /// token. `release_on_stale` preserves the existing late-commit contract: releasing flows
     /// patch a late arm; protected reconnect/switch flows keep the barrier.
@@ -313,6 +327,8 @@ impl TonoInner {
 pub struct TonoState {
     inner: tokio::sync::Mutex<TonoInner>,
     audit: Arc<crate::tono::audit::Audit>,
+    /// Serializes login, periodic, and user-initiated catalog fetches for one account session.
+    catalog_sync_operation: tokio::sync::Mutex<()>,
     release_operation: tokio::sync::Mutex<Option<Arc<ReleaseOperation>>>,
     /// A late StartClash or DNS-enable commit must settle before explicit release reaches the
     /// Service. Connect mutations hold a read guard inside their detached reconciliation task;
@@ -360,6 +376,10 @@ impl TonoState {
                 nodes: Vec::new(),
                 selected_node: None,
                 catalog_requires_choice: false,
+                catalog_last_synced_at_ms: None,
+                catalog_sync_error: None,
+                server_test_generation: 0,
+                server_test_cancellation: None,
                 fsm: ConnectionFsm::new(),
                 kill_switch: None,
                 network_events_counter: None,
@@ -384,6 +404,7 @@ impl TonoState {
                 tasks: TaskRegistry::default(),
             }),
             audit,
+            catalog_sync_operation: tokio::sync::Mutex::new(()),
             release_operation: tokio::sync::Mutex::new(None),
             privileged_transition: Arc::new(tokio::sync::RwLock::new(())),
             next_release_id: AtomicU64::new(1),
@@ -396,6 +417,10 @@ impl TonoState {
 
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, TonoInner> {
         self.inner.lock().await
+    }
+
+    pub async fn lock_catalog_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.catalog_sync_operation.lock().await
     }
 
     /// Start one release or join the already-running one. The boolean is true only for the caller

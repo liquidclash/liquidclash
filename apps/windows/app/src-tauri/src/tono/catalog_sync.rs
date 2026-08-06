@@ -102,6 +102,7 @@ async fn sync_once_inner(state: &Arc<TonoState>, app: &AppHandle, auth_generatio
         let (installed, emit) = match install_and_persist(&inner.catalog_tracker, &inner.catalog_cache(), &response) {
             Ok(effect) if effect.installed => {
                 let node_count = effect.nodes.len();
+                inner.cancel_server_tests();
                 inner.catalog_tracker = effect.tracker;
                 inner.nodes = effect.nodes;
                 enforce_selection_survival(&mut inner);
@@ -144,10 +145,24 @@ pub(crate) async fn sync_with_retries_for_auth_generation(
 }
 
 async fn sync_with_retries_inner(state: &Arc<TonoState>, app: &AppHandle, auth_generation: u64) -> Result<(), String> {
+    let _operation = state.lock_catalog_sync().await;
+    if state.lock().await.sign_in_generation != auth_generation {
+        return Ok(());
+    }
     let mut last_error = String::new();
     for attempt in 0..=MAX_RETRIES {
+        if state.lock().await.sign_in_generation != auth_generation {
+            return Ok(());
+        }
         match sync_once_inner(state, app, auth_generation).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                let mut inner = state.lock().await;
+                if inner.sign_in_generation == auth_generation {
+                    inner.catalog_last_synced_at_ms = Some(unix_time_ms());
+                    inner.catalog_sync_error = None;
+                }
+                return Ok(());
+            }
             Err(err) => {
                 last_error = err;
                 if attempt < MAX_RETRIES {
@@ -156,10 +171,24 @@ async fn sync_with_retries_inner(state: &Arc<TonoState>, app: &AppHandle, auth_g
             }
         }
     }
+    let mut inner = state.lock().await;
+    if inner.sign_in_generation != auth_generation {
+        return Ok(());
+    }
+    inner.catalog_sync_error = Some(last_error.clone());
+    drop(inner);
     state.audit().log(crate::tono::audit::AuditEvent::SyncFail {
         error: last_error.clone(),
     });
     Err(last_error)
+}
+
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 /// Start the 300 s periodic sync (§3) for one authenticated session. The task stops on sign-out
@@ -243,15 +272,12 @@ pub fn default_usable_exit(nodes: &[ValidatedNode]) -> Option<String> {
         if let Some(node) = nodes.iter().find(|node| {
             !is_exit_blocked(&node.name)
                 && (node.name == *preferred
-                    || node.name.replace('·', "-").replace('–', "-")
-                        == preferred.replace('·', "-").replace('–', "-"))
+                    || node.name.replace('·', "-").replace('–', "-") == preferred.replace('·', "-").replace('–', "-"))
         }) {
             return Some(node.name.clone());
         }
     }
-    sort_server_names(nodes)
-        .into_iter()
-        .find(|name| !is_exit_blocked(name))
+    sort_server_names(nodes).into_iter().find(|name| !is_exit_blocked(name))
 }
 
 /// If selection is missing or points at a blocked exit, move the user to a usable default
@@ -315,9 +341,7 @@ pub fn region_rank(name: &str) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        default_usable_exit, install_and_persist, is_exit_blocked, region_rank, sort_server_names,
-    };
+    use super::{default_usable_exit, install_and_persist, is_exit_blocked, region_rank, sort_server_names};
     use std::net::Ipv4Addr;
     use std::path::{Path, PathBuf};
     use tono_core::catalog::{CatalogCache, catalog_digest};
@@ -395,10 +419,7 @@ mod tests {
             ]
         );
         // Preferred default still picks Salt Lake even though sort rank is "other".
-        assert_eq!(
-            default_usable_exit(&nodes).as_deref(),
-            Some("Salt Lake City · Summit")
-        );
+        assert_eq!(default_usable_exit(&nodes).as_deref(), Some("Salt Lake City · Summit"));
         // With only the blocked node, no usable default.
         assert_eq!(default_usable_exit(&[node("US-VLESS-Reality")]), None);
     }

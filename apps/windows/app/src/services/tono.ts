@@ -51,6 +51,19 @@ export interface TonoServer {
   available: boolean
 }
 
+export interface TonoCatalogStatus {
+  revision: number | null
+  nodeCount: number
+  lastSyncedAtMs: number | null
+  error: string | null
+}
+
+export interface TonoServerTestResult {
+  name: string
+  latencyMs: number | null
+  error: string | null
+}
+
 export interface TonoKillSwitchEndpoint {
   ip: string
   port: number
@@ -184,11 +197,23 @@ export const tonoRevokeDevice = (id: string) =>
 
 export const tonoServers = () => call<TonoServer[]>('tono_servers')
 
+export const tonoCatalogStatus = () =>
+  call<TonoCatalogStatus>('tono_catalog_status')
+
+export const tonoRefreshCatalog = () =>
+  call<TonoCatalogStatus>('tono_refresh_catalog')
+
 export const tonoSelectServer = (name: string) =>
   call<void>('tono_select_server', { name })
 
 export const tonoTestCurrentServer = () =>
   call<number>('tono_test_current_server')
+
+export const tonoTestAvailableServers = () =>
+  call<TonoServerTestResult[]>('tono_test_available_servers')
+
+export const tonoCancelServerTests = () =>
+  call<void>('tono_cancel_server_tests')
 
 export const tonoConnect = () => call<void>('tono_connect')
 

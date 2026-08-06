@@ -141,11 +141,32 @@
   "nodes": {
     "title": "Nodes",
     "testCurrent": "Test Current",
+    "testAll": "Test All",
+    "cancelTest": "Cancel Test",
+    "refresh": "Refresh",
+    "refreshing": "Refreshing…",
+    "refreshSuccess": "Cloud servers are up to date.",
     "cloudServers": "Cloud Servers",
     "empty": "No servers available",
     "timeout": "Timeout",
+    "testFailed": "Failed",
+    "tcpLatency": "TCP {{latency}}ms",
+    "exitLatency": "Exit {{latency}}ms",
+    "cachedLatency": "Cached {{latency}}ms",
     "unavailable": "Unavailable",
-    "unavailableHint": "This server is currently unavailable (network blocked). Pick another exit."
+    "unavailableHint": "This server is currently unavailable (network blocked). Pick another exit.",
+    "catalogRevision": "Catalog v{{revision}}",
+    "catalogNodes": "{{count}} cloud servers",
+    "lastSynced": "Last verified sync: {{time}}",
+    "waitingForSync": "Waiting for first verified sync",
+    "verifiedSyncHint": "Automatic sync runs every 5 minutes. Invalid updates never replace the last verified copy. Test All is available while disconnected.",
+    "catalogError": "Latest refresh failed: {{error}}",
+    "regions": {
+      "us": "United States",
+      "jp": "Japan",
+      "other": "Other regions",
+      "unavailable": "Unavailable"
+    }
   },
   "servers": {
     "title": "Servers",

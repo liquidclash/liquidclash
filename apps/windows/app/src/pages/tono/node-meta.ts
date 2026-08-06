@@ -21,3 +21,13 @@ export const nodeFlag = (wireName: string) => {
 
 export const nodeProtocol = (wireName: string) =>
   /vless/i.test(wireName) ? 'VLESS · Reality' : 'Tono Cloud'
+
+export type NodeRegion = 'us' | 'jp' | 'other'
+
+/** Keep the UI's groups aligned with the backend's whole-token region ranking. */
+export const nodeRegion = (wireName: string): NodeRegion => {
+  const tokens = wireName.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+  if (tokens.some((token) => token.toLowerCase() === 'us')) return 'us'
+  if (tokens.some((token) => token.toLowerCase() === 'jp')) return 'jp'
+  return 'other'
+}

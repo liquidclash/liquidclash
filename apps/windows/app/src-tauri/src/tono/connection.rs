@@ -588,6 +588,10 @@ async fn attempt_inner(state: &Arc<TonoState>, app: &AppHandle) -> Attempt {
             }
             return Attempt::GuardRejected(TRANSITION_IN_FLIGHT_REJECTION.to_string());
         }
+        // A disconnected-only endpoint batch cannot overlap WFP/Core startup. Cancel it in the
+        // same critical section that atomically moves the FSM to Connecting, leaving no new-test
+        // admission window between the two operations.
+        inner.cancel_server_tests();
         // F3: a fresh attempt resets the step record and clears the last
         // failure details (retry bookkeeping persists across attempts).
         inner.connect_steps = crate::tono::steps::initial_steps();

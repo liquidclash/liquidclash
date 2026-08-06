@@ -13,7 +13,11 @@ import {
   subscribeTonoStatus,
   tonoAuditEnabled,
   tonoAuditLogPath,
+  tonoCancelServerTests,
+  tonoCatalogStatus,
+  tonoRefreshCatalog,
   tonoSetAuditEnabled,
+  tonoTestAvailableServers,
   type TonoStatus,
 } from './tono'
 
@@ -54,6 +58,24 @@ describe('tono audit wrappers', () => {
     await expect(tonoSetAuditEnabled(true)).rejects.toThrow(
       'kill switch still armed',
     )
+  })
+})
+
+describe('tono server management wrappers', () => {
+  it('uses dedicated backend commands without frontend catalog data', async () => {
+    invokeMock.mockResolvedValue({ revision: 8, nodeCount: 3 })
+
+    await tonoCatalogStatus()
+    await tonoRefreshCatalog()
+    await tonoTestAvailableServers()
+    await tonoCancelServerTests()
+
+    expect(invokeMock.mock.calls).toEqual([
+      ['tono_catalog_status', undefined],
+      ['tono_refresh_catalog', undefined],
+      ['tono_test_available_servers', undefined],
+      ['tono_cancel_server_tests', undefined],
+    ])
   })
 })
 

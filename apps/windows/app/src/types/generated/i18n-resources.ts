@@ -1674,13 +1674,34 @@ export interface TranslationResources {
         switch: string
       }
       nodes: {
+        cachedLatency: string
+        cancelTest: string
+        catalogError: string
+        catalogNodes: string
+        catalogRevision: string
         cloudServers: string
         empty: string
+        exitLatency: string
+        lastSynced: string
+        refresh: string
+        refreshing: string
+        refreshSuccess: string
+        regions: {
+          jp: string
+          other: string
+          unavailable: string
+          us: string
+        }
+        tcpLatency: string
+        testAll: string
         testCurrent: string
+        testFailed: string
         timeout: string
         title: string
         unavailable: string
         unavailableHint: string
+        verifiedSyncHint: string
+        waitingForSync: string
       }
       pill: {
         statusProtected: string

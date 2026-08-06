@@ -141,11 +141,32 @@
   "nodes": {
     "title": "节点",
     "testCurrent": "测试当前节点",
+    "testAll": "测试全部",
+    "cancelTest": "取消测试",
+    "refresh": "刷新",
+    "refreshing": "正在刷新…",
+    "refreshSuccess": "云服务器已是最新。",
     "cloudServers": "云服务器",
     "empty": "暂无可用节点",
     "timeout": "超时",
+    "testFailed": "失败",
+    "tcpLatency": "TCP {{latency}}ms",
+    "exitLatency": "出口 {{latency}}ms",
+    "cachedLatency": "缓存 {{latency}}ms",
     "unavailable": "不可用",
-    "unavailableHint": "该节点当前不可用（线路被干扰），请选择其他服务器。"
+    "unavailableHint": "该节点当前不可用（线路被干扰），请选择其他服务器。",
+    "catalogRevision": "目录版本 v{{revision}}",
+    "catalogNodes": "{{count}} 个云服务器",
+    "lastSynced": "上次验证同步：{{time}}",
+    "waitingForSync": "正在等待首次验证同步",
+    "verifiedSyncHint": "每 5 分钟自动同步；无效更新不会替换上次验证副本。断开连接时可测试全部节点。",
+    "catalogError": "最近一次刷新失败：{{error}}",
+    "regions": {
+      "us": "美国",
+      "jp": "日本",
+      "other": "其他地区",
+      "unavailable": "不可用"
+    }
   },
   "servers": {
     "title": "服务器",
