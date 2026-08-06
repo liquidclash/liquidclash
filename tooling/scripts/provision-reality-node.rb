@@ -187,14 +187,14 @@ end
 
 def verify_installation(repo_root, output_path, node_name, expected_ipv4)
   checks = [
-    [File.join(repo_root, "scripts/test-multi-exit-policy.sh"), output_path],
+    [File.join(repo_root, "tooling/scripts/test-multi-exit-policy.sh"), output_path],
     [
-      File.join(repo_root, "scripts/test-isolated-data-plane.sh"),
+      File.join(repo_root, "tooling/scripts/test-isolated-data-plane.sh"),
       output_path,
       node_name,
       *([expected_ipv4].compact),
     ],
-    [RbConfig.ruby, File.join(repo_root, "scripts/publish-managed-catalog.rb"), "--dry-run", output_path],
+    [RbConfig.ruby, File.join(repo_root, "tooling/scripts/publish-managed-catalog.rb"), "--dry-run", output_path],
   ]
   checks.each do |command|
     fail!("Post-install verification failed: #{File.basename(command.first)}") unless system(*command)
@@ -249,8 +249,8 @@ begin
     "#{slug}.yaml",
   )
   output_path = private_output_path!(options[:output] || default_output)
-  repo_root = File.expand_path("..", __dir__)
-  remote_script_path = File.join(repo_root, "scripts/remote/manage-tono-reality-node.sh")
+  repo_root = File.expand_path("../..", __dir__)
+  remote_script_path = File.join(repo_root, "tooling/scripts/remote/manage-tono-reality-node.sh")
   remote_script = File.binread(remote_script_path)
 
   preflight = run_remote(ssh_target, remote_script, "preflight", [options[:port], target])

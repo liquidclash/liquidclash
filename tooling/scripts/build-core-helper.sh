@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-source_file="$repo_dir/scripts/core-helper/main.swift"
-kill_switch_source="$repo_dir/scripts/core-helper/KillSwitchManager.swift"
-protected_dns_source="$repo_dir/scripts/core-helper/ProtectedDNSManager.swift"
-peer_authorization_source="$repo_dir/scripts/helper-shared/PeerAuthorization.swift"
-protocol_version_source="$repo_dir/Tono/Core/HelperProtocolVersion.swift"
-output_file="$repo_dir/Tono/Resources/liquidclash-helper"
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+source_file="$repo_dir/tooling/scripts/core-helper/main.swift"
+kill_switch_source="$repo_dir/tooling/scripts/core-helper/KillSwitchManager.swift"
+protected_dns_source="$repo_dir/tooling/scripts/core-helper/ProtectedDNSManager.swift"
+peer_authorization_source="$repo_dir/tooling/scripts/helper-shared/PeerAuthorization.swift"
+protocol_version_source="$repo_dir/apps/macos/Tono/Core/HelperProtocolVersion.swift"
+output_file="$repo_dir/apps/macos/Tono/Resources/liquidclash-helper"
 temporary_file="$output_file.new"
 module_cache_dir=$(mktemp -d /tmp/tono-helper-module-cache.XXXXXX)
 

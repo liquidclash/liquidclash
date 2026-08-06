@@ -22,8 +22,9 @@ LiquidClash/design/
 .serena/
 .spec-workflow/
 
-# Docs (plans, specs)
-docs/
+# Pre-existing local Windows notes (not part of the tracked source tree)
+/apps/windows/docs/
+/apps/windows/app/docs/
 
 # Local dev scripts
 script/

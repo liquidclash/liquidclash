@@ -37,6 +37,7 @@ import {
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const appRoot = path.resolve(scriptDir, '..')
 const windowsRoot = path.resolve(appRoot, '..')
+const repositoryRoot = path.resolve(windowsRoot, '..', '..')
 const tauriConfPath = path.resolve(appRoot, 'src-tauri/tauri.conf.json')
 const cargoManifestPath = path.resolve(appRoot, 'src-tauri/Cargo.toml')
 const nsisTemplatePath = path.resolve(
@@ -329,7 +330,10 @@ if (!tag || !installerArgument) {
 const installer = path.resolve(process.cwd(), installerArgument)
 const manifestPath = manifestArgument
   ? path.resolve(process.cwd(), manifestArgument)
-  : path.resolve(windowsRoot, '..', 'cloudflare/public/releases/manifest.json')
+  : path.resolve(
+      repositoryRoot,
+      'services/control-plane/public/releases/manifest.json',
+    )
 const service = path.resolve(appRoot, 'src-tauri/resources/tono-service.exe')
 const mihomo = path.resolve(
   appRoot,

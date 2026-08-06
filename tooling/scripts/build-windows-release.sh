@@ -1,8 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-repo_root=${0:A:h:h}
-windows_root="$repo_root/tono-win"
+repo_root=${0:A:h:h:h}
+windows_root="$repo_root/apps/windows"
 app_root="$windows_root/app"
 toolchain_root="$windows_root/.toolchain"
 version=${1:-}
@@ -14,7 +14,7 @@ fi
 if [[ ! -x "$toolchain_root/cargo/bin/cargo" ||
       ! -x "$toolchain_root/cargo/bin/cargo-xwin" ||
       ! -x "$toolchain_root/bin/pnpm" ]]; then
-  echo "the pinned tono-win toolchain is incomplete" >&2
+  echo "the pinned Windows toolchain is incomplete" >&2
   exit 1
 fi
 
@@ -31,7 +31,7 @@ export PATH="$CARGO_HOME/bin:$toolchain_root/xwin:/opt/homebrew/opt/llvm/bin:$PA
   "$toolchain_root/bin/pnpm" release:preflight --config-only
 )
 
-"$repo_root/scripts/build-mihomo-adaptive.sh" --install-adaptive-windows
+"$repo_root/tooling/scripts/build-mihomo-adaptive.sh" --install-adaptive-windows
 
 # The Service refuses to start a core whose SHA-256 does not match a pin, so the pin must be
 # taken from the very binary this build ships. The sidecar is what Tauri installs as

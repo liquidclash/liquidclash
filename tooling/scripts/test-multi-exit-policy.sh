@@ -13,8 +13,8 @@ for fixture in "$@"; do
   fi
 done
 
-repo_root=${0:A:h:h}
-mihomo_path=${TONO_TEST_MIHOMO_PATH:-"$repo_root/Tono/Resources/mihomo"}
+repo_root=${0:A:h:h:h}
+mihomo_path=${TONO_TEST_MIHOMO_PATH:-"$repo_root/apps/macos/Tono/Resources/mihomo"}
 if [[ $mihomo_path != /* || ! -x $mihomo_path ]]; then
   echo "TONO_TEST_MIHOMO_PATH must be an absolute executable path" >&2
   exit 2
@@ -25,12 +25,12 @@ trap 'rm -rf "$test_dir"' EXIT
 tono_developer_dir=/Applications/Xcode.app/Contents/Developer
 DEVELOPER_DIR="$tono_developer_dir" /usr/bin/xcrun swiftc \
   -module-cache-path "$test_dir/module-cache" \
-  "$repo_root/Tono/Models/ProxyNode.swift" \
-  "$repo_root/Tono/Models/RuleEntry.swift" \
-  "$repo_root/Tono/Services/ConfigParser.swift" \
-  "$repo_root/Tono/Core/HelperProtocolVersion.swift" \
-  "$repo_root/Tono/Core/ConfigPipeline.swift" \
-  "$repo_root/scripts/tests/MultiExitPolicyTests.swift" \
+  "$repo_root/apps/macos/Tono/Models/ProxyNode.swift" \
+  "$repo_root/apps/macos/Tono/Models/RuleEntry.swift" \
+  "$repo_root/apps/macos/Tono/Services/ConfigParser.swift" \
+  "$repo_root/apps/macos/Tono/Core/HelperProtocolVersion.swift" \
+  "$repo_root/apps/macos/Tono/Core/ConfigPipeline.swift" \
+  "$repo_root/tooling/scripts/tests/MultiExitPolicyTests.swift" \
   -o "$test_dir/test-multi-exit"
 
 runtime_dir="$test_dir/runtimes"

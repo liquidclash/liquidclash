@@ -4,7 +4,7 @@
 <dict>
 	<!-- Enable the "Sign in with Apple" capability in Xcode after the App ID
 	     and development/distribution signing are configured. Xcode will merge
-	     this entitlement into Tono/LiquidClash.entitlements. -->
+	     this entitlement into apps/macos/Tono/LiquidClash.entitlements. -->
 	<key>com.apple.developer.applesignin</key>
 	<array>
 		<string>Default</string>

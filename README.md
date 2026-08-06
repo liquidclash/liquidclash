@@ -1,24 +1,29 @@
 # Tono
 
-Cloud-managed VPN clients.
+Cloud-managed VPN clients and services.
 
-| Directory | Platform |
-|-----------|----------|
-| [`tono-win/`](./tono-win/) | Windows (Tauri + Service + WFP) |
-| [`tono-mac/`](./tono-mac/) | macOS (SwiftUI + privileged helper) |
+| Directory | Purpose |
+|-----------|---------|
+| [`apps/macos/`](./apps/macos/) | macOS client (SwiftUI + privileged helper) |
+| [`apps/windows/`](./apps/windows/) | Windows client (Tauri + Service + WFP) |
+| [`services/control-plane/`](./services/control-plane/) | Cloudflare Worker, static assets, and D1 migrations |
+| [`services/home-agent/`](./services/home-agent/) | Home exit-node usage reporter |
+| [`tooling/scripts/`](./tooling/scripts/) | Build, release, test, and operations tooling |
+| [`docs/`](./docs/) | Screenshots and archived project handoffs |
 
-Other top-level folders (`cloudflare/`, `scripts/`, …) are shared backend, tooling, and docs.
+The repository is organized by deployable application, service, and shared tooling.
 
 ## Windows quick start
 
 ```powershell
-cd tono-win
-# see tono-win/README.md and scripts/build-windows-release.ps1
+cd apps/windows
+# see apps/windows/README.md and tooling/scripts/build-windows-release.ps1
 ```
 
 ## macOS quick start
 
-Open `tono-mac/LiquidClash.xcodeproj` in Xcode. App sources live in `tono-mac/Tono/`.
+Open `apps/macos/LiquidClash.xcodeproj` in Xcode. App sources live in
+`apps/macos/Tono/`.
 
 ## Releases
 

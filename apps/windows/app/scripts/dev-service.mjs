@@ -10,15 +10,11 @@ const developmentServiceInstallerEnvironment =
   'CLASH_VERGE_DEV_SERVICE_INSTALLER'
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
-const repositoryRoot = resolve(scriptDirectory, '..')
-const serviceRepository = resolve(
-  repositoryRoot,
-  '..',
-  'clash-verge-service-ipc',
-)
+const appRoot = resolve(scriptDirectory, '..')
+const serviceRepository = resolve(appRoot, '..', 'service')
 const serviceManifest = join(serviceRepository, 'Cargo.toml')
 const developmentReceipt = join(
-  repositoryRoot,
+  appRoot,
   'target',
   'development-service.json',
 )
@@ -142,7 +138,7 @@ export async function prepareDevelopmentService({
     '--bins',
   ])
 
-  const service = executable('clash-verge-service', platform)
+  const service = executable('tono-service', platform)
   await access(service)
   return dirname(service)
 }
@@ -153,19 +149,19 @@ export async function ensureDevelopmentService({
   const serviceDirectory = await prepareDevelopmentService({ platform })
   const service = join(
     serviceDirectory,
-    platform === 'win32' ? 'clash-verge-service.exe' : 'clash-verge-service',
+    platform === 'win32' ? 'tono-service.exe' : 'tono-service',
   )
   const installer = join(
     serviceDirectory,
     platform === 'win32'
-      ? 'clash-verge-service-install.exe'
-      : 'clash-verge-service-install',
+      ? 'tono-service-install.exe'
+      : 'tono-service-install',
   )
   const driver = join(
     serviceDirectory,
     platform === 'win32'
-      ? 'service-integration-driver.exe'
-      : 'service-integration-driver',
+      ? 'tono-service-integration-driver.exe'
+      : 'tono-service-integration-driver',
   )
   const fingerprint = await hashFiles([service, installer])
   const installedFingerprint = await readInstalledFingerprint()

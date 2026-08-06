@@ -6,7 +6,7 @@ authors = ["Tunglies"]
 license = "GPL-3.0"
 
 # This crate is a self-contained fork with its own lockfile; keep it out of the
-# parent repository workspace (`Tono-win/Cargo.toml`).
+# parent repository workspace (`apps/windows/Cargo.toml`).
 [workspace]
 
 [lib]

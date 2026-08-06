@@ -48,7 +48,7 @@ Use this only when the user explicitly asks to operate a fresh VPS and no key wo
 Use the private provisioner for a fresh supported VPS. It performs this bounded preflight by default and makes no remote changes:
 
 ```sh
-ruby scripts/provision-reality-node.rb \
+ruby tooling/scripts/provision-reality-node.rb \
   --ssh SSH_ALIAS \
   --name 'UNIQUE NAME' \
   --server PUBLIC_ENDPOINT \
@@ -101,9 +101,9 @@ Set mode `0600` immediately. Never show this completed file in the response.
 The provisioner automatically runs the new node's policy/config validation and isolated data-plane test. Before catalog publication, also validate all authoritative private sources when doing a full replacement:
 
 ```sh
-scripts/test-multi-exit-policy.sh /absolute/private/catalog.d/*.yaml
-scripts/test-isolated-data-plane.sh /absolute/private/catalog.d/new-node.yaml 'UNIQUE NAME' EXPECTED_EGRESS_IPV4
-ruby scripts/publish-managed-catalog.rb --dry-run /absolute/private/catalog.d/*.yaml
+tooling/scripts/test-multi-exit-policy.sh /absolute/private/catalog.d/*.yaml
+tooling/scripts/test-isolated-data-plane.sh /absolute/private/catalog.d/new-node.yaml 'UNIQUE NAME' EXPECTED_EGRESS_IPV4
+ruby tooling/scripts/publish-managed-catalog.rb --dry-run /absolute/private/catalog.d/*.yaml
 ```
 
 The isolated test starts a temporary loopback-only Mihomo process and changes no TUN, PF, route, or system DNS. Require its authenticated Reality handshake, protected fake-IP DNS, Google/YouTube HTTPS, and proxied public egress-IP checks to pass. Do not treat ping or an open port as success.
@@ -137,7 +137,7 @@ Summarize the node name, pinned server version, non-secret config digest, health
 For a newly added uniquely named node, preserve the deployed catalog and append only the tested source:
 
 ```sh
-ruby scripts/publish-managed-catalog.rb --append /absolute/private/catalog.d/new-node.yaml
+ruby tooling/scripts/publish-managed-catalog.rb --append /absolute/private/catalog.d/new-node.yaml
 ```
 
 `--append` needs the matching Worker, whose authenticated admin GET returns the encrypted catalog only after server-side decryption. It rejects a duplicate name and publishes with optimistic revision control. To deliberately replace the entire catalog, use `--publish` with every authoritative source only after reviewing the removal set.
@@ -159,16 +159,16 @@ Users are created only after verified email OTP. Do not insert directly into D1 
 The local helper defaults to dry-run for mutations:
 
 ```sh
-ruby scripts/manage-tono-user.rb allow person@example.com
-ruby scripts/manage-tono-user.rb allow person@example.com --apply
+ruby tooling/scripts/manage-tono-user.rb allow person@example.com
+ruby tooling/scripts/manage-tono-user.rb allow person@example.com --apply
 ```
 
 Then have the user complete email OTP in Tono. Once the account exists:
 
 ```sh
-ruby scripts/manage-tono-user.rb show person@example.com
-ruby scripts/manage-tono-user.rb set person@example.com --device-limit 2 --quota-bytes unlimited
-ruby scripts/manage-tono-user.rb set person@example.com --device-limit 2 --quota-bytes unlimited --apply
+ruby tooling/scripts/manage-tono-user.rb show person@example.com
+ruby tooling/scripts/manage-tono-user.rb set person@example.com --device-limit 2 --quota-bytes unlimited
+ruby tooling/scripts/manage-tono-user.rb set person@example.com --device-limit 2 --quota-bytes unlimited --apply
 ```
 
 Disabling a user revokes sessions/devices and can require asynchronous cleanup. Show the planned effect and obtain explicit approval before `--status disabled --apply`. Removing signup authorization does not disable an existing account.
@@ -176,7 +176,7 @@ Disabling a user revokes sessions/devices and can require asynchronous cleanup. 
 The managed signup API requires migration `0012_signup_allowlist.sql` and the matching Worker version. If they are not deployed, stop and request approval for this shared-infrastructure sequence:
 
 ```sh
-cd cloudflare
+cd services/control-plane
 npm test && npm run typecheck
 npx wrangler d1 migrations apply tono-control-plane --remote
 npx wrangler deploy

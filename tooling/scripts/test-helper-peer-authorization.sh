@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 temporary_dir=$(mktemp -d "/tmp/tono-peer-auth.XXXXXX")
 case "$temporary_dir" in
   /tmp/tono-peer-auth.*) ;;
@@ -20,13 +20,13 @@ server="$temporary_dir/auth-server"
 client="$temporary_dir/auth-client"
 xcrun swiftc \
   -module-cache-path "$temporary_dir/module-cache" \
-  "$repo_dir/scripts/helper-tests/auth-server/main.swift" \
-  "$repo_dir/scripts/helper-shared/PeerAuthorization.swift" \
+  "$repo_dir/tooling/scripts/helper-tests/auth-server/main.swift" \
+  "$repo_dir/tooling/scripts/helper-shared/PeerAuthorization.swift" \
   -framework Security \
   -o "$server"
 xcrun swiftc \
   -module-cache-path "$temporary_dir/module-cache" \
-  "$repo_dir/scripts/helper-tests/auth-client/main.swift" \
+  "$repo_dir/tooling/scripts/helper-tests/auth-client/main.swift" \
   -o "$client"
 
 identity=$(

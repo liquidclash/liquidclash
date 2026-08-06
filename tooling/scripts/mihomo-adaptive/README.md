@@ -15,15 +15,15 @@ SDK, binding layer, Network Extension lifecycle, or other fork changes.
 Build and install the experiment:
 
 ```sh
-scripts/build-mihomo-adaptive.sh --install-adaptive
-scripts/build-mihomo-adaptive.sh --install-adaptive-windows
+tooling/scripts/build-mihomo-adaptive.sh --install-adaptive
+tooling/scripts/build-mihomo-adaptive.sh --install-adaptive-windows
 ```
 
 Restore the exact official MetaCubeX release:
 
 ```sh
-scripts/build-mihomo-adaptive.sh --restore-stock
-scripts/build-mihomo-adaptive.sh --restore-stock-windows
+tooling/scripts/build-mihomo-adaptive.sh --restore-stock
+tooling/scripts/build-mihomo-adaptive.sh --restore-stock-windows
 ```
 
 The script pins the Mihomo tag and commit, requires Go 1.26.5, tests the live

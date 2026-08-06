@@ -7,8 +7,8 @@ if [[ ($# -lt 1 || $# -gt 3) || $1 != /* || ! -f $1 ]]; then
   exit 2
 fi
 
-repo_root=${0:A:h:h}
-mihomo_path=${TONO_TEST_MIHOMO_PATH:-"$repo_root/Tono/Resources/mihomo"}
+repo_root=${0:A:h:h:h}
+mihomo_path=${TONO_TEST_MIHOMO_PATH:-"$repo_root/apps/macos/Tono/Resources/mihomo"}
 if [[ $mihomo_path != /* || ! -x $mihomo_path ]]; then
   echo "TONO_TEST_MIHOMO_PATH must be an absolute executable path" >&2
   exit 2
@@ -39,12 +39,12 @@ done
 tono_developer_dir=/Applications/Xcode.app/Contents/Developer
 DEVELOPER_DIR="$tono_developer_dir" /usr/bin/xcrun swiftc \
   -module-cache-path "$test_dir/module-cache" \
-  "$repo_root/Tono/Models/ProxyNode.swift" \
-  "$repo_root/Tono/Models/RuleEntry.swift" \
-  "$repo_root/Tono/Services/ConfigParser.swift" \
-  "$repo_root/Tono/Core/HelperProtocolVersion.swift" \
-  "$repo_root/Tono/Core/ConfigPipeline.swift" \
-  "$repo_root/scripts/tests/IsolatedDataPlaneRuntime.swift" \
+  "$repo_root/apps/macos/Tono/Models/ProxyNode.swift" \
+  "$repo_root/apps/macos/Tono/Models/RuleEntry.swift" \
+  "$repo_root/apps/macos/Tono/Services/ConfigParser.swift" \
+  "$repo_root/apps/macos/Tono/Core/HelperProtocolVersion.swift" \
+  "$repo_root/apps/macos/Tono/Core/ConfigPipeline.swift" \
+  "$repo_root/tooling/scripts/tests/IsolatedDataPlaneRuntime.swift" \
   -o "$test_dir/isolated-runtime"
 
 preferred_node=${2:-"US Reality"}
